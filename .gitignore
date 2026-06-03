@@ -1,1 +1,11 @@
 /20260529/*
+/task2-开合跳优化/*
+/task3-高抬腿识别/*
+/task4-深蹲识别/*
+/task5-后端和运动记录保存/*
+/task6-历史统计面板/*
+/task7-项目启动优化/*
+
+node_modules/
+frontend/node_modules/
+frontend/dist/

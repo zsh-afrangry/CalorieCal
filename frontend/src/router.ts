@@ -6,7 +6,7 @@ import FaceView from "./views/FaceView.vue";
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: "/", redirect: "/pose" },
+    { path: "/", redirect: "/gesture" },
     { path: "/pose", name: "pose", component: PoseView },
     { path: "/gesture", name: "gesture", component: GestureView },
     { path: "/face", name: "face", component: FaceView },

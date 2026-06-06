@@ -1,0 +1,184 @@
+# Task2 多运动证据评分 — 实施清单
+
+> 状态：进行中。  
+> 目标：将 /#/gesture 从“单一当前动作”改成“多运动证据评分”，重点解决挥手被“握拳 / 手前移 / 手后移 / 出拳”等状态抢占，导致挥手计数中断或漏计的问题。  
+> 原则：继续使用前端 MediaPipe Hand Landmarker + 规则算法；不引入后端、不训练模型、不追求商业级 kcal 精准估算。  
+> 关键判断：Task2 成功标准不是“准确识别所有手势”，而是“挥手计数和热量估算不再被单一动作标签轻易打断，并且调试信息能解释为什么计数或不计数”。  
+
+---
+
+## Phase 1: 基线确认和范围锁定
+
+- [x] 1.1 确认当前 /#/gesture 单标签识别路径
+      → 文件: frontend/src/views/GestureView.vue
+      → 当前问题: updateGestureAnalysis 中“出拳 / 手向前 / 手向后”先于“挥手”返回
+      → 当前问题: updateWaveCounter 依赖 gesture === "挥手"
+      → 目标: 明确需要拆分展示标签和计数信号
+      → 已完成: 确认 Task2 问题可在前端规则层解决，不需要后端
+
+- [x] 1.2 记录 Task2 不解决的边界
+      → 不做“手势大全”
+      → 不训练模型
+      → 不引入 LSTM / Transformer / ST-GCN
+      → 不要求快速挥手和严重残影全部解决
+      → kcal 仍偏演示可解释
+      → 已完成: 本阶段继续使用前端 MediaPipe Hand Landmarker + 规则算法
+
+- [x] 1.3 保留 Task1 的可用链路
+      → 不破坏摄像头启动 / 关闭
+      → 不破坏手部关键点绘制
+      → 不破坏开始 / 结束 / 重置
+      → 不破坏 waveCount / waveElapsedMs / waveFrequencyPerMin / waveCalories
+      → 已完成: 本轮改造保留原有摄像头、绘制、计时、MET 和 kcal 字段
+
+## Phase 2: 多运动证据数据结构
+
+- [x] 2.1 新增 motionEvidence 数据结构
+      → 建议字段:
+        - horizontalSwingScore: 横向摆动证据
+        - depthMoveScore: 前后移动证据
+        - fingerCurlScore: 手指弯曲 / 握拳证据
+        - waveCycleScore: 挥手周期证据
+        - stabilityScore: 关键点稳定性证据
+      → 取值: 每项 0 - 100，互相独立，不共享 100 分
+      → 已完成: GestureView 新增 motionEvidence
+
+- [x] 2.2 新增 gestureCandidates 展示结构
+      → 候选项示例: 挥手 / 手向前 / 手向后 / 握拳或招手 / 静止
+      → 每个候选项有 label、score、reason
+      → 用于页面展示和调试，不直接决定计数
+      → 已完成: GestureView 新增 gestureCandidates 和候选状态展示
+
+- [x] 2.3 新增 waveCounterSignal
+      → 目标: 专门服务挥手周期计数
+      → 输入: 横向摆动证据、换向次数、时间窗口、关键点稳定性
+      → 要求: 允许短暂“手向前 / 手向后 / 握拳”与挥手共存
+      → 已完成: updateWaveCounter 改为接收 waveCounterSignal
+
+## Phase 3: 多证据评分算法
+
+- [x] 3.1 计算横向摆动证据
+      → 输入: handMotionHistory 中 centerX 序列
+      → 指标: xRange、xDirectionChanges、最近方向
+      → 输出: horizontalSwingScore
+      → 说明: 横向摆动是挥手计数的核心证据
+      → 已完成: 基于 xRange 和 xDirectionChanges 计算
+
+- [x] 3.2 计算前后移动证据
+      → 输入: handMotionHistory 中 scale 序列
+      → 指标: scaleChange、scaleRange
+      → 输出: depthMoveScore
+      → 说明: 手部变大 / 变小可以作为手向前 / 手向后的候选证据，但不应直接打断挥手计数
+      → 已完成: 基于 scaleChange 计算
+
+- [x] 3.3 计算手指弯曲 / 握拳证据
+      → 输入: fingerCurl 序列
+      → 指标: curlRange、当前 fingerCurl
+      → 输出: fingerCurlScore
+      → 说明: 可作为握拳、招手或手指变化的候选证据
+      → 已完成: 基于 curlRange 计算
+
+- [x] 3.4 计算挥手周期证据
+      → 输入: xDirectionChanges、xRange、最近换向时间
+      → 输出: waveCycleScore
+      → 说明: 该分数用于 waveCounterSignal，不等同于 currentGesture
+      → 已完成: 基于 horizontalSwingScore 和换向次数计算
+
+- [x] 3.5 计算关键点稳定性证据
+      → 输入: handCount、采样帧数量、最近帧连续性
+      → 输出: stabilityScore
+      → 说明: 用于降低残影、丢手、采样不足时的置信度
+      → 已完成: 基于手部历史采样帧数计算
+
+## Phase 4: 挥手计数逻辑改造
+
+- [x] 4.1 修改 updateWaveCounter 入参
+      → 当前: updateWaveCounter(now, gesture, sample)
+      → 目标: updateWaveCounter(now, waveCounterSignal, sample)
+      → 要求: 不再依赖 currentGesture === "挥手"
+      → 已完成: updateWaveCounter 已改为 signal 驱动
+
+- [x] 4.2 允许短暂冲突状态不中断计数
+      → 当 waveCycleScore 足够高时，即使 depthMoveScore 或 fingerCurlScore 同时较高，也继续记录挥手周期
+      → 当连续多帧 waveCycleScore 较低时，再认为挥手中断
+      → 已完成: 增加 WAVE_SIGNAL_GRACE_FRAMES 短暂低信号宽容
+
+- [x] 4.3 保留真实前后移动识别
+      → 手真正向前 / 向后且横向摆动不足时，展示标签仍可显示“手向前 / 手向后”
+      → 计数逻辑不应把纯前后移动误计为挥手
+      → 已完成: currentGesture 继续由候选状态最高分决定，计数独立使用挥手证据
+
+- [x] 4.4 调整挥手置信度原因
+      → 从“当前是否稳定识别为挥手”改为“挥手证据是否稳定”
+      → 低置信度时说明原因: 横向幅度不足 / 换向不足 / 手部丢失 / 冲突证据较高
+      → 已完成: 调试面板增加计数信号和多证据原因
+
+## Phase 5: 页面展示和调试面板
+
+- [x] 5.1 展示多运动证据评分
+      → 页面显示横向摆动、前后移动、手指弯曲、挥手周期、关键点稳定性分数
+      → 分数以 0 - 100 展示
+      → 已完成: 指标卡和调试面板展示证据分数
+
+- [x] 5.2 展示多个候选状态
+      → 示例: 挥手 72 / 手向前 45 / 握拳 38
+      → 不要求候选项分数相加为 100
+      → 已完成: 页面展示候选状态前三项
+
+- [x] 5.3 保留当前动作展示
+      → currentGesture 仍用于展示“当前最像的动作”
+      → 页面文案避免让用户误解为唯一真实动作
+      → 已完成: currentGesture 保留为展示标签
+
+- [x] 5.4 增加规则冲突调试字段
+      → 展示当前命中的主要证据
+      → 展示被抑制或共存的候选规则
+      → 展示 waveCounterSignal 的原因
+      → 已完成: 调试面板展示候选状态、证据分数和计数信号
+
+- [x] 5.5 增加即时运动信号，降低动作展示滞后
+      → 背景: 工位测试发现稳定候选动作存在慢一拍现象，例如手向前出拳时，动作完成后才显示“出拳”
+      → 目标: 将“手正在前后/左右移动”的动作过程，与“出拳 / 挥手”等稳定动作名分开展示
+      → 实现: 使用最近 2-4 帧的短窗口计算即时运动
+      → 展示: 页面新增“即时运动”，例如手向前移动中、手向后收回中、向画面左侧移动中
+      → 边界: 即时运动只用于用户反馈，不直接参与挥手计数
+      → 已完成: GestureView 已新增 instantMotion 字段、指标卡和调试面板字段
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+## Phase 6: 构建验证和工位验收
+
+- [x] 6.1 TypeScript 和前端构建检查
+      → 命令: npm.cmd --prefix frontend run build
+      → 要求: 构建通过
+      → 要求: 无阻断性类型错误
+      → 已验证: npm.cmd --prefix frontend run build 通过
+      → 已验证: 新增即时运动信号后再次构建通过
+
+- [ ] 6.2 工位连续挥手验收
+      → 慢速 / 中速挥手 5 次，waveCount 应接近 5
+      → 挥手过程中短暂出现“手向前 / 手向后 / 握拳”候选状态时，不应频繁打断计数
+
+- [ ] 6.3 前后移动验收
+      → 手真正向前靠近摄像头时，候选状态应出现“手向前”或“出拳 / 前后移动”较高分
+      → 纯前后移动不应明显误计为挥手
+
+- [ ] 6.4 静止验收
+      → 手部静止时不应持续增加 waveCount
+      → 多运动证据分数应整体较低或偏稳定
+
+- [ ] 6.5 收尾记录
+      → 更新 Task2 todolist 勾选状态
+      → 记录仍未解决的问题到 task2 或 后续优化方向.txt
+      → 若用户验收通过，标记 Task2 完成
+
+---
+
+## 待商讨记录区
+
+### kcal 定位
+
+当前项目距离正式商业化仍较远。Task2 的 kcal 继续偏“演示可解释”，用于说明运动时间、频率、幅度、强度和置信度如何影响估算结果；贴近真实消耗放到后续阶段。
+
+### 多证据评分
+
+“挥手 / 手向前 / 手向后 / 握拳”等状态不要求互斥。它们可以同时存在，并各自拥有独立置信度。Task2 的核心是避免单一标签抢占计数链路。

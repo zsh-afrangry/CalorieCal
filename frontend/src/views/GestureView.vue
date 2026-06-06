@@ -3,7 +3,44 @@ import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 type RuntimeStatus = "idle" | "loading" | "ready" | "error";
+type AppRuntimeStatus = "idle" | "loading" | "ready" | "running" | "paused" | "error";
 type LandmarkPoint = { x: number; y: number; z?: number };
+type GestureLabel =
+  | "等待检测"
+  | "静止"
+  | "挥手"
+  | "出拳"
+  | "招手"
+  | "握拳"
+  | "手向前"
+  | "手向后";
+type WaveRuntimeStatus = "idle" | "recording" | "ended";
+type WaveDirection = "left" | "right";
+type ConfidenceLevel = "高" | "中" | "低";
+type HandMotionSample = {
+  time: number;
+  centerX: number;
+  centerY: number;
+  scale: number;
+  fingerCurl: number;
+};
+type MotionEvidence = {
+  horizontalSwingScore: number;
+  depthMoveScore: number;
+  fingerCurlScore: number;
+  waveCycleScore: number;
+  stabilityScore: number;
+};
+type GestureCandidate = {
+  label: GestureLabel;
+  score: number;
+  reason: string;
+};
+type WaveCounterSignal = {
+  active: boolean;
+  score: number;
+  reason: string;
+};
 
 const MEDIAPIPE_TASKS_VERSION = "0.10.22-rc.20250304";
 const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_TASKS_VERSION}/wasm`;
@@ -11,6 +48,20 @@ const HAND_LANDMARKER_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 const TARGET_INFERENCE_FPS = 20;
 const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
+const MOTION_HISTORY_MS = 1200;
+const MIN_MOTION_DELTA = 0.015;
+const WAVE_DIRECTION_DELTA = 0.012;
+const WAVE_TURN_COOLDOWN_MS = 260;
+const WAVE_TURNS_PER_COUNT = 2;
+const WAVE_SIGNAL_MIN_SCORE = 55;
+const WAVE_SIGNAL_GRACE_FRAMES = 4;
+const EMPTY_MOTION_EVIDENCE: MotionEvidence = {
+  horizontalSwingScore: 0,
+  depthMoveScore: 0,
+  fingerCurlScore: 0,
+  waveCycleScore: 0,
+  stabilityScore: 0,
+};
 const HAND_CONNECTIONS = [
   [0, 1],
   [1, 2],
@@ -43,6 +94,22 @@ const modelMessage = ref("等待手势模型加载");
 const handCount = ref(0);
 const inferenceFps = ref(0);
 const lastHandedness = ref("无");
+const currentGesture = ref<GestureLabel>("等待检测");
+const motionDirection = ref("等待检测");
+const instantMotion = ref("等待检测");
+const handScaleTrend = ref("等待检测");
+const gestureReason = ref("等待手部入镜");
+const motionEvidence = ref<MotionEvidence>({ ...EMPTY_MOTION_EVIDENCE });
+const gestureCandidates = ref<GestureCandidate[]>([]);
+const waveCounterSignalReason = ref("等待挥手证据");
+const waveRuntimeStatus = ref<WaveRuntimeStatus>("idle");
+const waveCount = ref(0);
+const waveElapsedMs = ref(0);
+const weightKg = ref(60);
+const waveCounterReason = ref("点击开始后连续挥手，结束只停止记录。");
+const lastWaveCountedAtText = ref("无");
+const waveCycleGestureFrames = ref(0);
+const waveCycleTurnCount = ref(0);
 
 let stream: MediaStream | null = null;
 let animationFrameId: number | null = null;
@@ -52,13 +119,388 @@ let lastInferenceStartedAt = 0;
 let lastFpsSampleAt = 0;
 let inferenceFrameCount = 0;
 let latestHands: LandmarkPoint[][] = [];
+const handMotionHistory: HandMotionSample[] = [];
+let waveStartedAt = 0;
+let waveAccumulatedMs = 0;
+let lastWaveDirection: WaveDirection | null = null;
+let lastWaveTurnAt = 0;
+let waveLowSignalFrames = 0;
+
+const topGestureCandidatesText = computed(() => {
+  if (!gestureCandidates.value.length) {
+    return "等待检测";
+  }
+
+  return gestureCandidates.value
+    .slice(0, 3)
+    .map((candidate) => `${candidate.label} ${candidate.score}`)
+    .join(" / ");
+});
 
 const debugDetails = computed(() => [
+  { label: "运行状态", value: appRuntimeLabel.value },
+  { label: "运行说明", value: appRuntimeReason.value },
   { label: "手部数量", value: String(handCount.value) },
+  { label: "当前动作", value: currentGesture.value },
+  { label: "挥手计数状态", value: waveRuntimeLabel.value },
+  { label: "挥手次数", value: String(waveCount.value) },
+  { label: "挥手频率", value: `${waveFrequencyPerMin.value.toFixed(1)} 次/分钟` },
+  { label: "挥手 MET", value: currentWaveMet.value.toFixed(1) },
+  { label: "挥手 kcal", value: waveCalories.value.toFixed(2) },
+  { label: "估算置信度", value: waveConfidence.value },
+  { label: "置信度原因", value: waveConfidenceSummary.value },
+  { label: "本段挥手帧", value: String(waveCycleGestureFrames.value) },
+  { label: "当前周期换向", value: String(waveCycleTurnCount.value) },
+  { label: "最近计数", value: lastWaveCountedAtText.value },
+  { label: "即时运动", value: instantMotion.value },
+  { label: "运动方向", value: motionDirection.value },
+  { label: "尺度变化", value: handScaleTrend.value },
+  { label: "判断原因", value: gestureReason.value },
+  { label: "候选状态", value: topGestureCandidatesText.value },
+  { label: "横向摆动证据", value: String(motionEvidence.value.horizontalSwingScore) },
+  { label: "前后移动证据", value: String(motionEvidence.value.depthMoveScore) },
+  { label: "手指弯曲证据", value: String(motionEvidence.value.fingerCurlScore) },
+  { label: "挥手周期证据", value: String(motionEvidence.value.waveCycleScore) },
+  { label: "关键点稳定证据", value: String(motionEvidence.value.stabilityScore) },
+  { label: "计数信号", value: waveCounterSignalReason.value },
   { label: "实际推理 FPS", value: inferenceFps.value.toFixed(1) },
   { label: "左右手", value: lastHandedness.value },
   { label: "模型", value: HAND_LANDMARKER_MODEL_URL },
 ]);
+
+const waveFrequencyPerMin = computed(() => {
+  const elapsedMinutes = waveElapsedMs.value / 60_000;
+  return elapsedMinutes > 0 ? waveCount.value / elapsedMinutes : 0;
+});
+
+const currentWaveMet = computed(() => {
+  const frequency = waveFrequencyPerMin.value;
+
+  if (frequency > 45) {
+    return 3.0;
+  }
+
+  if (frequency > 20) {
+    return 2.3;
+  }
+
+  return 1.8;
+});
+
+const waveCalories = computed(() => {
+  const elapsedMinutes = waveElapsedMs.value / 60_000;
+  return (currentWaveMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200;
+});
+
+const waveConfidence = computed<ConfidenceLevel>(() => {
+  if (
+    cameraStatus.value !== "ready" ||
+    modelStatus.value !== "ready" ||
+    handCount.value <= 0 ||
+    waveCount.value <= 0
+  ) {
+    return "低";
+  }
+
+  if (
+    waveCount.value >= 3 &&
+    waveElapsedMs.value >= 10_000 &&
+    waveCycleGestureFrames.value >= 8
+  ) {
+    return "高";
+  }
+
+  return "中";
+});
+
+const waveConfidenceReasons = computed(() => {
+  const reasons: string[] = [];
+
+  if (cameraStatus.value !== "ready") {
+    reasons.push("摄像头未就绪");
+  }
+
+  if (modelStatus.value !== "ready") {
+    reasons.push("手部模型未就绪");
+  }
+
+  if (handCount.value <= 0) {
+    reasons.push("未检测到手部");
+  }
+
+  if (waveCount.value <= 0) {
+    reasons.push("尚无有效挥手周期");
+  }
+
+  if (waveElapsedMs.value > 0 && waveElapsedMs.value < 3000) {
+    reasons.push("记录时间较短");
+  }
+
+  if (currentGesture.value === "挥手") {
+    reasons.push("当前稳定识别为挥手");
+  } else if (waveRuntimeStatus.value === "recording") {
+    reasons.push(`当前更像${currentGesture.value}`);
+  }
+
+  if (waveCycleGestureFrames.value >= 8) {
+    reasons.push("本段挥手帧较稳定");
+  }
+
+  if (waveCount.value >= 3) {
+    reasons.push("已有多个挥手周期");
+  }
+
+  return reasons.length ? reasons : ["等待开始记录"];
+});
+
+const waveConfidenceSummary = computed(() => {
+  return waveConfidenceReasons.value.slice(0, 3).join("；");
+});
+
+function updateWeight(event: Event) {
+  const value = Number((event.target as HTMLInputElement).value);
+
+  if (Number.isFinite(value) && value >= 20 && value <= 200) {
+    weightKg.value = value;
+  }
+}
+
+const waveRuntimeLabel = computed(() => {
+  if (waveRuntimeStatus.value === "recording") {
+    return "记录中";
+  }
+
+  if (waveRuntimeStatus.value === "ended") {
+    return "已结束";
+  }
+
+  return "未开始";
+});
+
+const appRuntimeStatus = computed<AppRuntimeStatus>(() => {
+  if (cameraStatus.value === "error" || modelStatus.value === "error") {
+    return "error";
+  }
+
+  if (cameraStatus.value === "loading" || modelStatus.value === "loading") {
+    return "loading";
+  }
+
+  if (cameraStatus.value !== "ready" || modelStatus.value !== "ready") {
+    return "idle";
+  }
+
+  if (waveRuntimeStatus.value === "recording") {
+    return "running";
+  }
+
+  if (waveRuntimeStatus.value === "ended") {
+    return "paused";
+  }
+
+  return "ready";
+});
+
+const appRuntimeLabel = computed(() => {
+  const labels: Record<AppRuntimeStatus, string> = {
+    idle: "未开始",
+    loading: "加载中",
+    ready: "已就绪",
+    running: "记录中",
+    paused: "已结束",
+    error: "出错",
+  };
+
+  return labels[appRuntimeStatus.value];
+});
+
+const appRuntimeReason = computed(() => {
+  if (cameraStatus.value === "error") {
+    return cameraMessage.value;
+  }
+
+  if (modelStatus.value === "error") {
+    return modelMessage.value;
+  }
+
+  if (cameraStatus.value !== "ready") {
+    return cameraMessage.value;
+  }
+
+  if (modelStatus.value !== "ready") {
+    return modelMessage.value;
+  }
+
+  if (waveRuntimeStatus.value === "recording") {
+    return "正在记录挥手周期。";
+  }
+
+  if (waveRuntimeStatus.value === "ended") {
+    return "记录已结束，可继续开始或重置。";
+  }
+
+  return handCount.value > 0 ? "手部已入镜，可以开始记录。" : "请举起手进入画面。";
+});
+
+function getCameraErrorMessage(error: unknown) {
+  if (!(error instanceof DOMException)) {
+    return "摄像头启动失败，请检查浏览器和设备状态。";
+  }
+
+  if (error.name === "NotAllowedError") {
+    return "摄像头权限被拒绝，请在浏览器中允许摄像头访问。";
+  }
+
+  if (error.name === "NotFoundError") {
+    return "未检测到可用摄像头设备。";
+  }
+
+  if (error.name === "NotReadableError") {
+    return "摄像头正在被其他应用占用。";
+  }
+
+  return "摄像头启动失败，请确认当前页面运行在 localhost 或 HTTPS 环境。";
+}
+
+function formatElapsedTime(ms: number) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function resetWaveTurnTracker() {
+  lastWaveDirection = null;
+  lastWaveTurnAt = 0;
+  waveLowSignalFrames = 0;
+}
+
+function updateWaveElapsed(now: number) {
+  if (waveRuntimeStatus.value !== "recording") {
+    return;
+  }
+
+  waveElapsedMs.value = waveAccumulatedMs + (now - waveStartedAt);
+}
+
+function startWaveCounter() {
+  if (waveRuntimeStatus.value === "recording") {
+    return;
+  }
+
+  waveRuntimeStatus.value = "recording";
+  waveStartedAt = performance.now();
+  waveCycleGestureFrames.value = 0;
+  waveCycleTurnCount.value = 0;
+  resetWaveTurnTracker();
+  waveCounterReason.value = "正在记录：连续左右往返挥手会自动累计次数。";
+}
+
+function finishWaveCounter() {
+  if (waveRuntimeStatus.value !== "recording") {
+    return;
+  }
+
+  const now = performance.now();
+  waveAccumulatedMs += now - waveStartedAt;
+  waveElapsedMs.value = waveAccumulatedMs;
+  waveRuntimeStatus.value = "ended";
+  waveCounterReason.value = "已结束记录。";
+  resetWaveTurnTracker();
+}
+
+function resetWaveCounter() {
+  waveRuntimeStatus.value = "idle";
+  waveCount.value = 0;
+  waveElapsedMs.value = 0;
+  waveAccumulatedMs = 0;
+  waveStartedAt = 0;
+  lastWaveCountedAtText.value = "无";
+  waveCycleGestureFrames.value = 0;
+  waveCycleTurnCount.value = 0;
+  waveCounterReason.value = "点击开始后连续挥手，结束只停止记录。";
+  resetWaveTurnTracker();
+}
+
+function getWaveDirection(sample: HandMotionSample) {
+  const previous = handMotionHistory[handMotionHistory.length - 2];
+
+  if (!previous) {
+    return null;
+  }
+
+  const delta = sample.centerX - previous.centerX;
+
+  if (Math.abs(delta) < WAVE_DIRECTION_DELTA) {
+    return null;
+  }
+
+  return delta > 0 ? "right" : "left";
+}
+
+function updateWaveCounter(
+  now: number,
+  signal: WaveCounterSignal,
+  sample: HandMotionSample,
+) {
+  if (waveRuntimeStatus.value !== "recording") {
+    return;
+  }
+
+  if (!signal.active) {
+    waveLowSignalFrames += 1;
+    waveCounterReason.value =
+      waveLowSignalFrames <= WAVE_SIGNAL_GRACE_FRAMES
+        ? `本周期记录中：${signal.reason}，短暂保留挥手上下文。`
+        : `本周期记录中：${signal.reason}，等待重新出现横向摆动。`;
+
+    if (waveLowSignalFrames > WAVE_SIGNAL_GRACE_FRAMES) {
+      resetWaveTurnTracker();
+    }
+
+    return;
+  }
+
+  waveLowSignalFrames = 0;
+  waveCycleGestureFrames.value += 1;
+  waveCounterSignalReason.value = `${signal.reason}，计数信号 ${signal.score}`;
+
+  const direction = getWaveDirection(sample);
+
+  if (!direction) {
+    waveCounterReason.value = "本周期记录中：挥手幅度较小，等待明确横向运动。";
+    return;
+  }
+
+  if (!lastWaveDirection) {
+    lastWaveDirection = direction;
+    waveCounterReason.value = "本周期记录中：已捕捉挥手方向，等待换向。";
+    return;
+  }
+
+  if (direction === lastWaveDirection) {
+    return;
+  }
+
+  lastWaveDirection = direction;
+
+  if (now - lastWaveTurnAt < WAVE_TURN_COOLDOWN_MS) {
+    waveCounterReason.value = "本周期记录中：换向过快，可能是残影或抖动。";
+    return;
+  }
+
+  lastWaveTurnAt = now;
+  waveCycleTurnCount.value += 1;
+  waveCounterReason.value = `记录中：已捕捉 ${waveCycleTurnCount.value}/${WAVE_TURNS_PER_COUNT} 次换向。`;
+
+  if (waveCycleTurnCount.value >= WAVE_TURNS_PER_COUNT) {
+    waveCount.value += 1;
+    waveCycleTurnCount.value = 0;
+    lastWaveCountedAtText.value = formatElapsedTime(waveElapsedMs.value);
+    waveCounterReason.value = "完成一次左右往返，挥手次数 +1。";
+  }
+}
 
 function stopRenderLoop() {
   if (animationFrameId !== null) {
@@ -69,6 +511,7 @@ function stopRenderLoop() {
 
 function stopCamera() {
   stopRenderLoop();
+  finishWaveCounter();
   stream?.getTracks().forEach((track) => track.stop());
   stream = null;
 
@@ -78,6 +521,12 @@ function stopCamera() {
 
   handCount.value = 0;
   latestHands = [];
+  handMotionHistory.length = 0;
+  currentGesture.value = "等待检测";
+  motionDirection.value = "等待检测";
+  instantMotion.value = "等待检测";
+  handScaleTrend.value = "等待检测";
+  gestureReason.value = "等待手部入镜";
 }
 
 function disposeModel() {
@@ -128,6 +577,285 @@ function updateInferenceFps(now: number) {
     inferenceFrameCount = 0;
     lastFpsSampleAt = now;
   }
+}
+
+function getHandMotionSample(hand: LandmarkPoint[], now: number): HandMotionSample {
+  const xs = hand.map((point) => point.x);
+  const ys = hand.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const fingerPairs = [
+    [8, 6],
+    [12, 10],
+    [16, 14],
+    [20, 18],
+  ] as const;
+  const fingerCurl =
+    fingerPairs.reduce((sum, [tipIndex, jointIndex]) => {
+      const tip = hand[tipIndex];
+      const joint = hand[jointIndex];
+      return sum + (tip && joint ? tip.y - joint.y : 0);
+    }, 0) / fingerPairs.length;
+
+  return {
+    time: now,
+    centerX: (minX + maxX) / 2,
+    centerY: (minY + maxY) / 2,
+    scale: Math.max(maxX - minX, maxY - minY),
+    fingerCurl,
+  };
+}
+
+function countDirectionChanges(values: number[]) {
+  let lastSign = 0;
+  let changes = 0;
+
+  for (let index = 1; index < values.length; index += 1) {
+    const delta = values[index] - values[index - 1];
+    const sign =
+      Math.abs(delta) < MIN_MOTION_DELTA ? 0 : delta > 0 ? 1 : -1;
+
+    if (!sign) {
+      continue;
+    }
+
+    if (lastSign && sign !== lastSign) {
+      changes += 1;
+    }
+
+    lastSign = sign;
+  }
+
+  return changes;
+}
+
+function getRange(values: number[]) {
+  return Math.max(...values) - Math.min(...values);
+}
+
+function getInstantMotionLabel(history: HandMotionSample[]) {
+  if (history.length < 3) {
+    return "采样中";
+  }
+
+  const recent = history.slice(-4);
+  const first = recent[0];
+  const latest = recent[recent.length - 1];
+  const elapsedSeconds = Math.max((latest.time - first.time) / 1000, 0.001);
+  const xVelocity = (latest.centerX - first.centerX) / elapsedSeconds;
+  const yVelocity = (latest.centerY - first.centerY) / elapsedSeconds;
+  const scaleVelocity = first.scale
+    ? ((latest.scale - first.scale) / first.scale) / elapsedSeconds
+    : 0;
+  const absX = Math.abs(xVelocity);
+  const absY = Math.abs(yVelocity);
+  const absScale = Math.abs(scaleVelocity);
+
+  if (absScale > 0.9 && absScale > absX * 1.6) {
+    return scaleVelocity > 0 ? "手向前移动中" : "手向后收回中";
+  }
+
+  if (absX > 0.18 && absX > absY * 1.25) {
+    return xVelocity > 0 ? "向画面右侧移动中" : "向画面左侧移动中";
+  }
+
+  if (absY > 0.18) {
+    return yVelocity > 0 ? "向下移动中" : "向上移动中";
+  }
+
+  return "短时静止";
+}
+
+function clampScore(value: number) {
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function scoreFromRange(value: number, low: number, high: number) {
+  if (value <= low) {
+    return 0;
+  }
+
+  if (value >= high) {
+    return 100;
+  }
+
+  return clampScore(((value - low) / (high - low)) * 100);
+}
+
+function resetMotionEvidence(reason: string) {
+  motionEvidence.value = { ...EMPTY_MOTION_EVIDENCE };
+  gestureCandidates.value = [];
+  waveCounterSignalReason.value = reason;
+}
+
+function getTopGestureCandidate(candidates: GestureCandidate[]) {
+  return candidates[0] ?? { label: "静止" as GestureLabel, score: 0, reason: "暂无候选动作" };
+}
+
+function createGestureCandidate(
+  label: GestureLabel,
+  score: number,
+  reason: string,
+): GestureCandidate {
+  return { label, score, reason };
+}
+
+function buildWaveCounterSignal(evidence: MotionEvidence): WaveCounterSignal {
+  const score = Math.round(
+    evidence.waveCycleScore * 0.55 +
+      evidence.horizontalSwingScore * 0.3 +
+      evidence.stabilityScore * 0.15,
+  );
+  const active = score >= WAVE_SIGNAL_MIN_SCORE;
+  const reason = active
+    ? `挥手证据稳定：周期 ${evidence.waveCycleScore}，横向 ${evidence.horizontalSwingScore}`
+    : `挥手证据不足：周期 ${evidence.waveCycleScore}，横向 ${evidence.horizontalSwingScore}`;
+
+  return { active, score, reason };
+}
+
+function updateGestureAnalysis(now: number, hands: LandmarkPoint[][]) {
+  if (!hands.length) {
+    handMotionHistory.length = 0;
+    currentGesture.value = "等待检测";
+    motionDirection.value = "等待检测";
+    instantMotion.value = "等待检测";
+    handScaleTrend.value = "等待检测";
+    gestureReason.value = "未检测到手部";
+    resetMotionEvidence("未检测到手部");
+    resetWaveTurnTracker();
+    return;
+  }
+
+  const primaryHand = [...hands].sort((left, right) => {
+    const leftScale = getHandMotionSample(left, now).scale;
+    const rightScale = getHandMotionSample(right, now).scale;
+    return rightScale - leftScale;
+  })[0];
+  const sample = getHandMotionSample(primaryHand, now);
+
+  handMotionHistory.push(sample);
+
+  while (
+    handMotionHistory.length &&
+    now - handMotionHistory[0].time > MOTION_HISTORY_MS
+  ) {
+    handMotionHistory.shift();
+  }
+
+  if (handMotionHistory.length < 6) {
+    currentGesture.value = "静止";
+    motionDirection.value = "采样中";
+    instantMotion.value = getInstantMotionLabel(handMotionHistory);
+    handScaleTrend.value = "采样中";
+    gestureReason.value = "等待更多手部运动帧";
+    resetMotionEvidence("采样帧不足");
+    updateWaveCounter(now, { active: false, score: 0, reason: "采样帧不足" }, sample);
+    return;
+  }
+
+  const first = handMotionHistory[0];
+  const xValues = handMotionHistory.map((item) => item.centerX);
+  const yValues = handMotionHistory.map((item) => item.centerY);
+  const scaleValues = handMotionHistory.map((item) => item.scale);
+  const curlValues = handMotionHistory.map((item) => item.fingerCurl);
+  const xRange = getRange(xValues);
+  const yRange = getRange(yValues);
+  const scaleRange = getRange(scaleValues);
+  const curlRange = getRange(curlValues);
+  const xDirectionChanges = countDirectionChanges(xValues);
+  const scaleChange = first.scale
+    ? (sample.scale - first.scale) / first.scale
+    : 0;
+  const xDelta = sample.centerX - first.centerX;
+  const yDelta = sample.centerY - first.centerY;
+
+  motionDirection.value =
+    Math.abs(xDelta) > Math.abs(yDelta)
+      ? xDelta > 0
+        ? "向画面右侧"
+        : "向画面左侧"
+      : yDelta > 0
+        ? "向下"
+        : "向上";
+  instantMotion.value = getInstantMotionLabel(handMotionHistory);
+  handScaleTrend.value =
+    scaleChange > 0.12
+      ? "变大"
+      : scaleChange < -0.12
+        ? "变小"
+        : "稳定";
+
+  const horizontalSwingScore = clampScore(
+    scoreFromRange(xRange, 0.06, 0.18) * 0.65 +
+      Math.min(xDirectionChanges, 4) * 8,
+  );
+  const depthMoveScore = scoreFromRange(Math.abs(scaleChange), 0.08, 0.28);
+  const fingerCurlScore = scoreFromRange(curlRange, 0.04, 0.12);
+  const waveCycleScore = clampScore(
+    horizontalSwingScore * 0.65 + scoreFromRange(xDirectionChanges, 1, 3) * 0.35,
+  );
+  const stabilityScore = clampScore(scoreFromRange(handMotionHistory.length, 6, 14));
+  const nextEvidence: MotionEvidence = {
+    horizontalSwingScore,
+    depthMoveScore,
+    fingerCurlScore,
+    waveCycleScore,
+    stabilityScore,
+  };
+  const forwardScore = scaleChange > 0 ? depthMoveScore : 0;
+  const backwardScore = scaleChange < 0 ? depthMoveScore : 0;
+  const punchScore =
+    scaleChange > 0 && sample.scale > 0.12
+      ? clampScore(depthMoveScore + scoreFromRange(sample.scale, 0.12, 0.2) * 0.25)
+      : 0;
+  const waveScore = waveCycleScore;
+  const beckonScore =
+    xRange < 0.1 && scaleRange < 0.12 ? fingerCurlScore : clampScore(fingerCurlScore * 0.45);
+  const stillScore = clampScore(
+    100 -
+      Math.max(horizontalSwingScore, depthMoveScore, fingerCurlScore, waveCycleScore),
+  );
+  const forwardLabel: GestureLabel = punchScore >= forwardScore ? "出拳" : "手向前";
+  const curlLabel: GestureLabel = beckonScore > 65 ? "招手" : "握拳";
+  const candidates = [
+    createGestureCandidate(
+      "挥手",
+      waveScore,
+      `横向 ${xRange.toFixed(2)}，换向 ${xDirectionChanges} 次`,
+    ),
+    createGestureCandidate(
+      forwardLabel,
+      Math.max(punchScore, forwardScore),
+      `手部尺度变大 ${(Math.max(scaleChange, 0) * 100).toFixed(0)}%`,
+    ),
+    createGestureCandidate(
+      "手向后",
+      backwardScore,
+      `手部尺度变小 ${(Math.max(-scaleChange, 0) * 100).toFixed(0)}%`,
+    ),
+    createGestureCandidate(
+      curlLabel,
+      beckonScore,
+      `手指弯曲变化 ${curlRange.toFixed(2)}`,
+    ),
+    createGestureCandidate("静止", stillScore, "主要运动证据较低"),
+  ]
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  motionEvidence.value = nextEvidence;
+  gestureCandidates.value = candidates;
+
+  const topCandidate = getTopGestureCandidate(candidates);
+  currentGesture.value = topCandidate.label;
+  gestureReason.value = topCandidate.reason;
+
+  const waveSignal = buildWaveCounterSignal(nextEvidence);
+  waveCounterSignalReason.value = `${waveSignal.reason}，信号 ${waveSignal.score}`;
+  updateWaveCounter(now, waveSignal, sample);
 }
 
 function drawHands(
@@ -194,7 +922,13 @@ function runInference(now: number) {
         ?.flat()
         .map((item) => item.categoryName)
         .join(" / ") || "无";
+    updateGestureAnalysis(now, latestHands);
     updateInferenceFps(now);
+  } catch (error) {
+    modelStatus.value = "error";
+    modelMessage.value =
+      error instanceof Error ? `手势推理失败：${error.message}` : "手势推理失败。";
+    stopRenderLoop();
   } finally {
     isInferencing = false;
   }
@@ -219,7 +953,9 @@ function renderFrame() {
 
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.drawImage(video, 0, 0, canvas.width, canvas.height);
-  runInference(performance.now());
+  const now = performance.now();
+  updateWaveElapsed(now);
+  runInference(now);
   drawHands(context, canvas);
 
   animationFrameId = requestAnimationFrame(renderFrame);
@@ -247,8 +983,7 @@ async function startCamera() {
     animationFrameId = requestAnimationFrame(renderFrame);
   } catch (error) {
     cameraStatus.value = "error";
-    cameraMessage.value =
-      error instanceof Error ? error.message : "摄像头启动失败。";
+    cameraMessage.value = getCameraErrorMessage(error);
   }
 }
 
@@ -271,8 +1006,8 @@ onBeforeUnmount(() => {
           <p class="eyebrow">Gesture</p>
           <h1>手势识别</h1>
         </div>
-        <span class="status-pill" :class="`status-${cameraStatus}`">
-          {{ cameraStatus }}
+        <span class="status-pill" :class="`status-${appRuntimeStatus}`">
+          {{ appRuntimeLabel }}
         </span>
       </div>
 
@@ -285,19 +1020,112 @@ onBeforeUnmount(() => {
             <p>{{ cameraMessage }}</p>
           </div>
           <div v-else class="camera-message" aria-live="polite">
-            {{ cameraMessage }}
+            {{ appRuntimeReason }}
+          </div>
+          <div
+            v-if="cameraStatus === 'ready' && modelStatus === 'ready' && handCount === 0"
+            class="pose-hint"
+          >
+            未检测到手部，请举起手并保持在画面内。
+          </div>
+          <div v-if="cameraStatus === 'ready'" class="motion-state-badge">
+            <span>手部动作</span>
+            <strong>{{ currentGesture }}</strong>
+            <small>挥手 {{ waveCount }} 次 / {{ waveRuntimeLabel }}</small>
           </div>
         </div>
       </div>
 
       <div class="controls-row">
-        <button type="button" @click="startCamera">开始</button>
-        <button type="button" class="secondary" @click="stopCamera">重置</button>
+        <button type="button" @click="startCamera">启动摄像头</button>
+        <button type="button" class="secondary" @click="stopCamera">关闭摄像头</button>
       </div>
     </section>
 
     <aside class="side-panel" aria-label="手势识别指标">
+      <label class="weight-field">
+        <span>体重 kg</span>
+        <input
+          type="number"
+          min="20"
+          max="200"
+          :value="weightKg"
+          @input="updateWeight"
+        />
+      </label>
+
+      <div class="controls-row compact-controls">
+        <button type="button" @click="startWaveCounter">开始</button>
+        <button type="button" class="secondary" @click="finishWaveCounter">结束</button>
+        <button type="button" class="secondary" @click="resetWaveCounter">重置</button>
+      </div>
+
       <div class="metrics-grid">
+        <section class="metric-card">
+          <span>挥手次数</span>
+          <strong>{{ waveCount }}</strong>
+          <small>{{ waveCounterReason }}</small>
+        </section>
+        <section class="metric-card">
+          <span>挥手时长</span>
+          <strong>{{ formatElapsedTime(waveElapsedMs) }}</strong>
+          <small>{{ waveRuntimeLabel }}</small>
+        </section>
+        <section class="metric-card">
+          <span>挥手频率</span>
+          <strong>{{ waveFrequencyPerMin.toFixed(1) }}</strong>
+          <small>次/分钟</small>
+        </section>
+        <section class="metric-card">
+          <span>挥手 MET</span>
+          <strong>{{ currentWaveMet.toFixed(1) }}</strong>
+          <small>粗略档位</small>
+        </section>
+        <section class="metric-card">
+          <span>估算热量</span>
+          <strong>{{ waveCalories.toFixed(2) }}</strong>
+          <small>kcal，仅手部动作粗略估算</small>
+        </section>
+        <section class="metric-card">
+          <span>估算置信度</span>
+          <strong>{{ waveConfidence }}</strong>
+          <small>{{ waveConfidenceSummary }}</small>
+        </section>
+        <section class="metric-card">
+          <span>当前周期换向</span>
+          <strong>{{ waveCycleTurnCount }}</strong>
+          <small>本段挥手帧 {{ waveCycleGestureFrames }}</small>
+        </section>
+        <section class="metric-card">
+          <span>当前动作</span>
+          <strong>{{ currentGesture }}</strong>
+          <small>{{ gestureReason }}</small>
+        </section>
+        <section class="metric-card">
+          <span>即时运动</span>
+          <strong>{{ instantMotion }}</strong>
+          <small>短窗口反馈，动作名以候选状态为准</small>
+        </section>
+        <section class="metric-card">
+          <span>候选状态</span>
+          <strong>{{ topGestureCandidatesText }}</strong>
+          <small>各状态独立评分，不共享 100</small>
+        </section>
+        <section class="metric-card">
+          <span>挥手证据</span>
+          <strong>{{ motionEvidence.waveCycleScore }}</strong>
+          <small>{{ waveCounterSignalReason }}</small>
+        </section>
+        <section class="metric-card">
+          <span>运动证据</span>
+          <strong>{{ motionEvidence.horizontalSwingScore }} / {{ motionEvidence.depthMoveScore }}</strong>
+          <small>横向摆动 / 前后移动</small>
+        </section>
+        <section class="metric-card">
+          <span>稳定证据</span>
+          <strong>{{ motionEvidence.stabilityScore }}</strong>
+          <small>手指弯曲 {{ motionEvidence.fingerCurlScore }}</small>
+        </section>
         <section class="metric-card">
           <span>手部数量</span>
           <strong>{{ handCount }}</strong>

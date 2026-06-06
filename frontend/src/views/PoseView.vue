@@ -5,6 +5,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 type CameraStatus = "idle" | "loading" | "ready" | "error";
 type ModelStatus = "idle" | "loading" | "ready" | "error";
 type PoseStatus = "idle" | "detecting" | "detected" | "missing";
+type JumpingJackState = "unknown" | "closed" | "open";
 
 type MetricCard = {
   label: string;
@@ -37,6 +38,24 @@ const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
 const SMOOTHING_WINDOW_SIZE = 5;
 const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
 const MIN_LANDMARK_VISIBILITY = 0.5;
+const LANDMARK_INDEX = {
+  leftShoulder: 11,
+  rightShoulder: 12,
+  leftWrist: 15,
+  rightWrist: 16,
+  leftHip: 23,
+  rightHip: 24,
+  leftAnkle: 27,
+  rightAnkle: 28,
+} as const;
+const MIN_SHOULDER_WIDTH = 0.04;
+const FOOT_OPEN_SHOULDER_RATIO = 1.15;
+const FOOT_CLOSED_SHOULDER_RATIO = 0.85;
+const WRIST_OPEN_SHOULDER_RATIO = 1.15;
+const WRIST_CLOSED_SHOULDER_RATIO = 1.0;
+const ARM_OPEN_MAX_TORSO_RATIO = 0.25;
+const ARM_CLOSED_MIN_TORSO_RATIO = 0.38;
+const ACTION_DEBOUNCE_FRAMES = 3;
 const POSE_CONNECTIONS = [
   [11, 12],
   [11, 13],
@@ -67,6 +86,12 @@ const inferenceFps = ref(0);
 const landmarkCompleteness = ref(0);
 const rawLandmarkState = ref("等待推理");
 const smoothedLandmarkState = ref("等待平滑数据");
+const feetState = ref<JumpingJackState>("unknown");
+const armsState = ref<JumpingJackState>("unknown");
+const instantJumpingJackState = ref<JumpingJackState>("unknown");
+const jumpingJackState = ref<JumpingJackState>("unknown");
+const actionStateReason = ref("等待完整关键点");
+const actionDebounceProgress = ref("0/3");
 
 let stream: MediaStream | null = null;
 let animationFrameId: number | null = null;
@@ -76,10 +101,17 @@ let lastInferenceStartedAt = 0;
 let lastFpsSampleAt = 0;
 let inferenceFrameCount = 0;
 let smoothedLandmarks: LandmarkPoint[] | null = null;
+let pendingJumpingJackState: JumpingJackState = "unknown";
+let pendingJumpingJackFrames = 0;
 const landmarkHistory: LandmarkPoint[][] = [];
 
 const metrics = computed<MetricCard[]>(() => [
   { label: "次数", value: "0", detail: "开合跳" },
+  {
+    label: "动作",
+    value: jumpingJackState.value,
+    detail: `脚 ${feetState.value} / 手 ${armsState.value}`,
+  },
   { label: "时长", value: "00:00", detail: "运动计时" },
   { label: "频率", value: "0.0", detail: "次/分钟" },
   { label: "MET", value: "6.0", detail: "当前档位" },
@@ -102,6 +134,12 @@ const poseDebugDetails = computed(() => [
   { label: "算法坐标", value: "MediaPipe 原始坐标" },
   { label: "原始关键点", value: rawLandmarkState.value },
   { label: "平滑关键点", value: smoothedLandmarkState.value },
+  { label: "脚部状态", value: feetState.value },
+  { label: "手臂状态", value: armsState.value },
+  { label: "即时动作状态", value: instantJumpingJackState.value },
+  { label: "稳定动作状态", value: jumpingJackState.value },
+  { label: "防抖进度", value: actionDebounceProgress.value },
+  { label: "状态判断", value: actionStateReason.value },
 ]);
 
 function getCameraErrorMessage(error: unknown) {
@@ -150,6 +188,7 @@ function stopCamera() {
   smoothedLandmarkState.value = "等待平滑数据";
   landmarkHistory.length = 0;
   smoothedLandmarks = null;
+  resetJumpingJackAnalysis("等待完整关键点");
 }
 
 function disposePoseLandmarker() {
@@ -256,6 +295,17 @@ function updateInferenceFps(now: number) {
   }
 }
 
+function resetJumpingJackAnalysis(reason: string) {
+  feetState.value = "unknown";
+  armsState.value = "unknown";
+  instantJumpingJackState.value = "unknown";
+  jumpingJackState.value = "unknown";
+  actionStateReason.value = reason;
+  pendingJumpingJackState = "unknown";
+  pendingJumpingJackFrames = 0;
+  actionDebounceProgress.value = `0/${ACTION_DEBOUNCE_FRAMES}`;
+}
+
 function isVisibleLandmark(landmark: LandmarkPoint | undefined) {
   return Boolean(
     landmark &&
@@ -265,6 +315,159 @@ function isVisibleLandmark(landmark: LandmarkPoint | undefined) {
       landmark.y >= 0 &&
       landmark.y <= 1,
   );
+}
+
+function getDistanceX(left: LandmarkPoint, right: LandmarkPoint) {
+  return Math.abs(left.x - right.x);
+}
+
+function getAverageY(left: LandmarkPoint, right: LandmarkPoint) {
+  return (left.y + right.y) / 2;
+}
+
+function getRequiredPoseLandmarks(landmarks: LandmarkPoint[]) {
+  const required = {
+    leftShoulder: landmarks[LANDMARK_INDEX.leftShoulder],
+    rightShoulder: landmarks[LANDMARK_INDEX.rightShoulder],
+    leftWrist: landmarks[LANDMARK_INDEX.leftWrist],
+    rightWrist: landmarks[LANDMARK_INDEX.rightWrist],
+    leftHip: landmarks[LANDMARK_INDEX.leftHip],
+    rightHip: landmarks[LANDMARK_INDEX.rightHip],
+    leftAnkle: landmarks[LANDMARK_INDEX.leftAnkle],
+    rightAnkle: landmarks[LANDMARK_INDEX.rightAnkle],
+  };
+
+  const missingKey = Object.entries(required).find(
+    ([, landmark]) => !isVisibleLandmark(landmark),
+  )?.[0];
+
+  return missingKey ? { missingKey, landmarks: null } : { missingKey: "", landmarks: required };
+}
+
+function classifyFeet(ankleDistance: number, shoulderWidth: number) {
+  if (ankleDistance >= shoulderWidth * FOOT_OPEN_SHOULDER_RATIO) {
+    return "open";
+  }
+
+  if (ankleDistance <= shoulderWidth * FOOT_CLOSED_SHOULDER_RATIO) {
+    return "closed";
+  }
+
+  return "unknown";
+}
+
+function classifyArms(
+  wristDistance: number,
+  shoulderWidth: number,
+  averageWristY: number,
+  averageShoulderY: number,
+  torsoHeight: number,
+) {
+  const wristHeightFromShoulder = averageWristY - averageShoulderY;
+
+  if (
+    wristDistance >= shoulderWidth * WRIST_OPEN_SHOULDER_RATIO &&
+    wristHeightFromShoulder <= torsoHeight * ARM_OPEN_MAX_TORSO_RATIO
+  ) {
+    return "open";
+  }
+
+  if (
+    wristDistance <= shoulderWidth * WRIST_CLOSED_SHOULDER_RATIO ||
+    wristHeightFromShoulder >= torsoHeight * ARM_CLOSED_MIN_TORSO_RATIO
+  ) {
+    return "closed";
+  }
+
+  return "unknown";
+}
+
+function updateDebouncedJumpingJackState(nextState: JumpingJackState) {
+  instantJumpingJackState.value = nextState;
+
+  if (nextState === "unknown") {
+    jumpingJackState.value = "unknown";
+    pendingJumpingJackState = "unknown";
+    pendingJumpingJackFrames = 0;
+    actionDebounceProgress.value = `0/${ACTION_DEBOUNCE_FRAMES}`;
+    return;
+  }
+
+  if (nextState === jumpingJackState.value) {
+    pendingJumpingJackState = "unknown";
+    pendingJumpingJackFrames = 0;
+    actionDebounceProgress.value = `${ACTION_DEBOUNCE_FRAMES}/${ACTION_DEBOUNCE_FRAMES}`;
+    return;
+  }
+
+  if (nextState !== pendingJumpingJackState) {
+    pendingJumpingJackState = nextState;
+    pendingJumpingJackFrames = 1;
+  } else {
+    pendingJumpingJackFrames += 1;
+  }
+
+  actionDebounceProgress.value = `${Math.min(
+    pendingJumpingJackFrames,
+    ACTION_DEBOUNCE_FRAMES,
+  )}/${ACTION_DEBOUNCE_FRAMES}`;
+
+  if (pendingJumpingJackFrames >= ACTION_DEBOUNCE_FRAMES) {
+    jumpingJackState.value = nextState;
+    pendingJumpingJackState = "unknown";
+    pendingJumpingJackFrames = 0;
+  }
+}
+
+function updateJumpingJackAnalysis(landmarks: LandmarkPoint[] | null) {
+  if (!landmarks?.length) {
+    resetJumpingJackAnalysis("未检测到完整人体");
+    return;
+  }
+
+  const { missingKey, landmarks: pose } = getRequiredPoseLandmarks(landmarks);
+
+  if (!pose) {
+    resetJumpingJackAnalysis(`关键点不足: ${missingKey}`);
+    return;
+  }
+
+  const shoulderWidth = getDistanceX(pose.leftShoulder, pose.rightShoulder);
+
+  if (shoulderWidth < MIN_SHOULDER_WIDTH) {
+    resetJumpingJackAnalysis("肩宽过小，用户可能离摄像头太远或未正对镜头");
+    return;
+  }
+
+  const ankleDistance = getDistanceX(pose.leftAnkle, pose.rightAnkle);
+  const wristDistance = getDistanceX(pose.leftWrist, pose.rightWrist);
+  const averageShoulderY = getAverageY(pose.leftShoulder, pose.rightShoulder);
+  const averageHipY = getAverageY(pose.leftHip, pose.rightHip);
+  const averageWristY = getAverageY(pose.leftWrist, pose.rightWrist);
+  const torsoHeight = Math.max(Math.abs(averageHipY - averageShoulderY), 0.05);
+  const nextFeetState = classifyFeet(ankleDistance, shoulderWidth);
+  const nextArmsState = classifyArms(
+    wristDistance,
+    shoulderWidth,
+    averageWristY,
+    averageShoulderY,
+    torsoHeight,
+  );
+  const nextActionState =
+    nextFeetState === "open" && nextArmsState === "open"
+      ? "open"
+      : nextFeetState === "closed" && nextArmsState === "closed"
+        ? "closed"
+        : "unknown";
+
+  feetState.value = nextFeetState;
+  armsState.value = nextArmsState;
+  updateDebouncedJumpingJackState(nextActionState);
+
+  actionStateReason.value =
+    `脚踝/肩宽 ${ankleDistance / shoulderWidth >= 10 ? "9.9+" : (ankleDistance / shoulderWidth).toFixed(2)}, ` +
+    `手腕/肩宽 ${wristDistance / shoulderWidth >= 10 ? "9.9+" : (wristDistance / shoulderWidth).toFixed(2)}, ` +
+    `手腕高度 ${(averageWristY - averageShoulderY) / torsoHeight >= 10 ? "9.9+" : ((averageWristY - averageShoulderY) / torsoHeight).toFixed(2)}`;
 }
 
 function toCanvasPoint(
@@ -359,6 +562,7 @@ async function runPoseInference(now: number) {
       smoothedLandmarkState.value = "无平滑数据";
       landmarkHistory.length = 0;
       smoothedLandmarks = null;
+      resetJumpingJackAnalysis("未检测到完整人体");
       return;
     }
 
@@ -369,10 +573,12 @@ async function runPoseInference(now: number) {
     smoothedLandmarkState.value = smoothedLandmarks
       ? `${smoothedLandmarks.length} 个平滑关键点`
       : "无平滑数据";
+    updateJumpingJackAnalysis(smoothedLandmarks);
   } catch (error) {
     poseStatus.value = "missing";
     rawLandmarkState.value =
       error instanceof Error ? error.message : "姿态推理失败";
+    resetJumpingJackAnalysis("姿态推理失败");
   } finally {
     isInferencing = false;
   }
@@ -475,6 +681,14 @@ onBeforeUnmount(() => {
             class="pose-hint"
           >
             未检测到完整人体，请全身入镜并正对摄像头。
+          </div>
+          <div
+            v-if="cameraStatus === 'ready' && poseStatus === 'detected'"
+            class="jump-state-badge"
+          >
+            <span>动作</span>
+            <strong>{{ jumpingJackState }}</strong>
+            <small>脚 {{ feetState }} / 手 {{ armsState }}</small>
           </div>
         </div>
       </div>

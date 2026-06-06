@@ -179,6 +179,18 @@ h1 {
   color: #b91c1c;
 }
 
+.status-running {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}
+
+.status-paused {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+  color: #475569;
+}
+
 .status-detecting {
   background: #eff6ff;
   border-color: #bfdbfe;
@@ -289,10 +301,52 @@ h1 {
   transform: translateX(-50%);
 }
 
+.jump-state-badge,
+.motion-state-badge {
+  background: rgba(15, 23, 42, 0.76);
+  border: 1px solid rgba(94, 234, 212, 0.5);
+  border-radius: 8px;
+  color: #e2e8f0;
+  display: grid;
+  gap: 2px;
+  min-width: 120px;
+  padding: 10px 12px;
+  position: absolute;
+  right: 14px;
+  text-align: right;
+  top: 14px;
+}
+
+.jump-state-badge span,
+.jump-state-badge small,
+.motion-state-badge span,
+.motion-state-badge small {
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.jump-state-badge strong,
+.motion-state-badge strong {
+  color: #ffffff;
+  font-size: 22px;
+  line-height: 1.05;
+}
+
 .controls-row {
   display: flex;
   gap: 10px;
   padding: 16px 20px;
+}
+
+.compact-controls {
+  padding: 0;
+}
+
+.compact-controls button {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0 10px;
 }
 
 .side-panel {

@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
+import {
+  FilesetResolver,
+  HandLandmarker,
+  PoseLandmarker,
+} from "@mediapipe/tasks-vision";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 type RuntimeStatus = "idle" | "loading" | "ready" | "error";
 type AppRuntimeStatus = "idle" | "loading" | "ready" | "running" | "paused" | "error";
-type LandmarkPoint = { x: number; y: number; z?: number };
+type LandmarkPoint = { x: number; y: number; z?: number; visibility?: number };
 type GestureLabel =
   | "等待检测"
   | "静止"
@@ -41,11 +45,31 @@ type WaveCounterSignal = {
   score: number;
   reason: string;
 };
+type PoseDetectionStatus = "idle" | "detected" | "missing";
+type UpperBodySideSample = {
+  shoulder: LandmarkPoint | null;
+  elbow: LandmarkPoint | null;
+  wrist: LandmarkPoint | null;
+  handCenter: LandmarkPoint | null;
+};
+type UpperBodyMotionSample = {
+  time: number;
+  left: UpperBodySideSample;
+  right: UpperBodySideSample;
+};
+type UpperBodyMotionFeatures = {
+  movementDistance: number;
+  movementSpeed: number;
+  movementAmplitude: number;
+  activeUpperBodyMs: number;
+};
 
 const MEDIAPIPE_TASKS_VERSION = "0.10.22-rc.20250304";
 const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_TASKS_VERSION}/wasm`;
 const HAND_LANDMARKER_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const POSE_LANDMARKER_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 const TARGET_INFERENCE_FPS = 20;
 const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
 const MOTION_HISTORY_MS = 1200;
@@ -55,6 +79,17 @@ const WAVE_TURN_COOLDOWN_MS = 260;
 const WAVE_TURNS_PER_COUNT = 2;
 const WAVE_SIGNAL_MIN_SCORE = 55;
 const WAVE_SIGNAL_GRACE_FRAMES = 4;
+const UPPER_BODY_HISTORY_MS = 1200;
+const UPPER_BODY_ACTIVE_DISTANCE_THRESHOLD = 0.025;
+const MIN_POSE_VISIBILITY = 0.45;
+const POSE_LANDMARK_INDEX = {
+  leftShoulder: 11,
+  rightShoulder: 12,
+  leftElbow: 13,
+  rightElbow: 14,
+  leftWrist: 15,
+  rightWrist: 16,
+} as const;
 const EMPTY_MOTION_EVIDENCE: MotionEvidence = {
   horizontalSwingScore: 0,
   depthMoveScore: 0,
@@ -89,11 +124,21 @@ const videoRef = ref<HTMLVideoElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const cameraStatus = ref<RuntimeStatus>("idle");
 const modelStatus = ref<RuntimeStatus>("idle");
+const poseModelStatus = ref<RuntimeStatus>("idle");
+const poseStatus = ref<PoseDetectionStatus>("idle");
 const cameraMessage = ref("等待摄像头启动");
 const modelMessage = ref("等待手势模型加载");
+const poseModelMessage = ref("等待姿态模型加载");
 const handCount = ref(0);
 const inferenceFps = ref(0);
 const lastHandedness = ref("无");
+const upperBodyJointState = ref("等待姿态关键点");
+const upperBodyMotionFeatures = ref<UpperBodyMotionFeatures>({
+  movementDistance: 0,
+  movementSpeed: 0,
+  movementAmplitude: 0,
+  activeUpperBodyMs: 0,
+});
 const currentGesture = ref<GestureLabel>("等待检测");
 const motionDirection = ref("等待检测");
 const instantMotion = ref("等待检测");
@@ -114,12 +159,15 @@ const waveCycleTurnCount = ref(0);
 let stream: MediaStream | null = null;
 let animationFrameId: number | null = null;
 let handLandmarker: HandLandmarker | null = null;
+let poseLandmarker: PoseLandmarker | null = null;
 let isInferencing = false;
 let lastInferenceStartedAt = 0;
 let lastFpsSampleAt = 0;
 let inferenceFrameCount = 0;
 let latestHands: LandmarkPoint[][] = [];
+let latestPoseLandmarks: LandmarkPoint[] | null = null;
 const handMotionHistory: HandMotionSample[] = [];
+const upperBodyMotionHistory: UpperBodyMotionSample[] = [];
 let waveStartedAt = 0;
 let waveAccumulatedMs = 0;
 let lastWaveDirection: WaveDirection | null = null;
@@ -141,6 +189,8 @@ const debugDetails = computed(() => [
   { label: "运行状态", value: appRuntimeLabel.value },
   { label: "运行说明", value: appRuntimeReason.value },
   { label: "手部数量", value: String(handCount.value) },
+  { label: "姿态检测", value: poseStatus.value },
+  { label: "上肢关键点", value: upperBodyJointState.value },
   { label: "当前动作", value: currentGesture.value },
   { label: "挥手计数状态", value: waveRuntimeLabel.value },
   { label: "挥手次数", value: String(waveCount.value) },
@@ -163,9 +213,26 @@ const debugDetails = computed(() => [
   { label: "挥手周期证据", value: String(motionEvidence.value.waveCycleScore) },
   { label: "关键点稳定证据", value: String(motionEvidence.value.stabilityScore) },
   { label: "计数信号", value: waveCounterSignalReason.value },
+  {
+    label: "上肢位移",
+    value: upperBodyMotionFeatures.value.movementDistance.toFixed(3),
+  },
+  {
+    label: "上肢速度",
+    value: upperBodyMotionFeatures.value.movementSpeed.toFixed(3),
+  },
+  {
+    label: "上肢幅度",
+    value: upperBodyMotionFeatures.value.movementAmplitude.toFixed(3),
+  },
+  {
+    label: "上肢有效时长",
+    value: formatElapsedTime(upperBodyMotionFeatures.value.activeUpperBodyMs),
+  },
   { label: "实际推理 FPS", value: inferenceFps.value.toFixed(1) },
   { label: "左右手", value: lastHandedness.value },
-  { label: "模型", value: HAND_LANDMARKER_MODEL_URL },
+  { label: "手部模型", value: HAND_LANDMARKER_MODEL_URL },
+  { label: "姿态模型", value: POSE_LANDMARKER_MODEL_URL },
 ]);
 
 const waveFrequencyPerMin = computed(() => {
@@ -196,6 +263,7 @@ const waveConfidence = computed<ConfidenceLevel>(() => {
   if (
     cameraStatus.value !== "ready" ||
     modelStatus.value !== "ready" ||
+    poseModelStatus.value !== "ready" ||
     handCount.value <= 0 ||
     waveCount.value <= 0
   ) {
@@ -222,6 +290,10 @@ const waveConfidenceReasons = computed(() => {
 
   if (modelStatus.value !== "ready") {
     reasons.push("手部模型未就绪");
+  }
+
+  if (poseModelStatus.value !== "ready") {
+    reasons.push("姿态模型未就绪");
   }
 
   if (handCount.value <= 0) {
@@ -282,11 +354,23 @@ const appRuntimeStatus = computed<AppRuntimeStatus>(() => {
     return "error";
   }
 
-  if (cameraStatus.value === "loading" || modelStatus.value === "loading") {
+  if (poseModelStatus.value === "error") {
+    return "error";
+  }
+
+  if (
+    cameraStatus.value === "loading" ||
+    modelStatus.value === "loading" ||
+    poseModelStatus.value === "loading"
+  ) {
     return "loading";
   }
 
-  if (cameraStatus.value !== "ready" || modelStatus.value !== "ready") {
+  if (
+    cameraStatus.value !== "ready" ||
+    modelStatus.value !== "ready" ||
+    poseModelStatus.value !== "ready"
+  ) {
     return "idle";
   }
 
@@ -323,12 +407,20 @@ const appRuntimeReason = computed(() => {
     return modelMessage.value;
   }
 
+  if (poseModelStatus.value === "error") {
+    return poseModelMessage.value;
+  }
+
   if (cameraStatus.value !== "ready") {
     return cameraMessage.value;
   }
 
   if (modelStatus.value !== "ready") {
     return modelMessage.value;
+  }
+
+  if (poseModelStatus.value !== "ready") {
+    return poseModelMessage.value;
   }
 
   if (waveRuntimeStatus.value === "recording") {
@@ -521,7 +613,17 @@ function stopCamera() {
 
   handCount.value = 0;
   latestHands = [];
+  latestPoseLandmarks = null;
   handMotionHistory.length = 0;
+  upperBodyMotionHistory.length = 0;
+  poseStatus.value = "idle";
+  upperBodyJointState.value = "等待姿态关键点";
+  upperBodyMotionFeatures.value = {
+    movementDistance: 0,
+    movementSpeed: 0,
+    movementAmplitude: 0,
+    activeUpperBodyMs: 0,
+  };
   currentGesture.value = "等待检测";
   motionDirection.value = "等待检测";
   instantMotion.value = "等待检测";
@@ -532,6 +634,11 @@ function stopCamera() {
 function disposeModel() {
   handLandmarker?.close();
   handLandmarker = null;
+}
+
+function disposePoseModel() {
+  poseLandmarker?.close();
+  poseLandmarker = null;
 }
 
 async function loadModel() {
@@ -559,6 +666,34 @@ async function loadModel() {
     modelStatus.value = "error";
     modelMessage.value =
       error instanceof Error ? error.message : "手势模型加载失败。";
+  }
+}
+
+async function loadPoseModel() {
+  if (poseLandmarker || poseModelStatus.value === "loading") {
+    return;
+  }
+
+  poseModelStatus.value = "loading";
+  poseModelMessage.value = "正在加载 MediaPipe Pose Landmarker";
+
+  try {
+    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: POSE_LANDMARKER_MODEL_URL,
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numPoses: 1,
+    });
+    poseModelStatus.value = "ready";
+    poseModelMessage.value = "姿态模型已就绪。";
+  } catch (error) {
+    disposePoseModel();
+    poseModelStatus.value = "error";
+    poseModelMessage.value =
+      error instanceof Error ? error.message : "姿态模型加载失败。";
   }
 }
 
@@ -605,6 +740,152 @@ function getHandMotionSample(hand: LandmarkPoint[], now: number): HandMotionSamp
     centerY: (minY + maxY) / 2,
     scale: Math.max(maxX - minX, maxY - minY),
     fingerCurl,
+  };
+}
+
+function getVisiblePosePoint(landmarks: LandmarkPoint[] | null, index: number) {
+  const point = landmarks?.[index];
+
+  if (!point || (point.visibility ?? 1) < MIN_POSE_VISIBILITY) {
+    return null;
+  }
+
+  return point;
+}
+
+function getHandCenterPoint(hand: LandmarkPoint[] | undefined): LandmarkPoint | null {
+  if (!hand?.length) {
+    return null;
+  }
+
+  const sample = getHandMotionSample(hand, performance.now());
+  return { x: sample.centerX, y: sample.centerY, z: 0 };
+}
+
+function getDistance(pointA: LandmarkPoint | null, pointB: LandmarkPoint | null) {
+  if (!pointA || !pointB) {
+    return 0;
+  }
+
+  return Math.hypot(pointA.x - pointB.x, pointA.y - pointB.y);
+}
+
+function getSideJointDistance(
+  previous: UpperBodySideSample,
+  current: UpperBodySideSample,
+) {
+  const pairs = [
+    [previous.shoulder, current.shoulder],
+    [previous.elbow, current.elbow],
+    [previous.wrist, current.wrist],
+    [previous.handCenter, current.handCenter],
+  ] as const;
+
+  const distances = pairs
+    .map(([from, to]) => getDistance(from, to))
+    .filter((distance) => distance > 0);
+
+  return distances.length
+    ? distances.reduce((sum, distance) => sum + distance, 0) / distances.length
+    : 0;
+}
+
+function getSideAmplitude(samples: UpperBodySideSample[], key: keyof UpperBodySideSample) {
+  const points = samples.map((sample) => sample[key]).filter((point): point is LandmarkPoint => Boolean(point));
+
+  if (points.length < 2) {
+    return 0;
+  }
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+
+  return Math.hypot(getRange(xs), getRange(ys));
+}
+
+function getUpperBodyMotionSample(now: number): UpperBodyMotionSample {
+  const leftHand = latestHands[0];
+  const rightHand = latestHands[1];
+
+  return {
+    time: now,
+    left: {
+      shoulder: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.leftShoulder),
+      elbow: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.leftElbow),
+      wrist: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.leftWrist),
+      handCenter: getHandCenterPoint(leftHand),
+    },
+    right: {
+      shoulder: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.rightShoulder),
+      elbow: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.rightElbow),
+      wrist: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.rightWrist),
+      handCenter: getHandCenterPoint(rightHand),
+    },
+  };
+}
+
+function updateUpperBodyMotionFeatures(now: number) {
+  const sample = getUpperBodyMotionSample(now);
+
+  upperBodyMotionHistory.push(sample);
+
+  while (
+    upperBodyMotionHistory.length &&
+    now - upperBodyMotionHistory[0].time > UPPER_BODY_HISTORY_MS
+  ) {
+    upperBodyMotionHistory.shift();
+  }
+
+  const leftJointCount = [
+    sample.left.shoulder,
+    sample.left.elbow,
+    sample.left.wrist,
+    sample.left.handCenter,
+  ].filter(Boolean).length;
+  const rightJointCount = [
+    sample.right.shoulder,
+    sample.right.elbow,
+    sample.right.wrist,
+    sample.right.handCenter,
+  ].filter(Boolean).length;
+  upperBodyJointState.value = `左 ${leftJointCount}/4，右 ${rightJointCount}/4`;
+
+  if (upperBodyMotionHistory.length < 2) {
+    upperBodyMotionFeatures.value = {
+      ...upperBodyMotionFeatures.value,
+      movementDistance: 0,
+      movementSpeed: 0,
+      movementAmplitude: 0,
+    };
+    return;
+  }
+
+  const previous = upperBodyMotionHistory[upperBodyMotionHistory.length - 2];
+  const elapsedSeconds = Math.max((sample.time - previous.time) / 1000, 0.001);
+  const leftDistance = getSideJointDistance(previous.left, sample.left);
+  const rightDistance = getSideJointDistance(previous.right, sample.right);
+  const movementDistance = leftDistance + rightDistance;
+  const movementSpeed = movementDistance / elapsedSeconds;
+  const leftSamples = upperBodyMotionHistory.map((item) => item.left);
+  const rightSamples = upperBodyMotionHistory.map((item) => item.right);
+  const movementAmplitude = Math.max(
+    getSideAmplitude(leftSamples, "handCenter"),
+    getSideAmplitude(leftSamples, "wrist"),
+    getSideAmplitude(leftSamples, "elbow"),
+    getSideAmplitude(rightSamples, "handCenter"),
+    getSideAmplitude(rightSamples, "wrist"),
+    getSideAmplitude(rightSamples, "elbow"),
+  );
+  const nextActiveMs =
+    movementDistance >= UPPER_BODY_ACTIVE_DISTANCE_THRESHOLD
+      ? upperBodyMotionFeatures.value.activeUpperBodyMs + elapsedSeconds * 1000
+      : upperBodyMotionFeatures.value.activeUpperBodyMs;
+
+  upperBodyMotionFeatures.value = {
+    movementDistance,
+    movementSpeed,
+    movementAmplitude,
+    activeUpperBodyMs: nextActiveMs,
   };
 }
 
@@ -901,7 +1182,7 @@ function runInference(now: number) {
   const video = videoRef.value;
 
   if (
-    !handLandmarker ||
+    (!handLandmarker && !poseLandmarker) ||
     !video ||
     video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
     isInferencing ||
@@ -914,20 +1195,32 @@ function runInference(now: number) {
   lastInferenceStartedAt = now;
 
   try {
-    const result = handLandmarker.detectForVideo(video, now);
-    latestHands = result.landmarks as LandmarkPoint[][];
-    handCount.value = latestHands.length;
-    lastHandedness.value =
-      result.handednesses
-        ?.flat()
-        .map((item) => item.categoryName)
-        .join(" / ") || "无";
-    updateGestureAnalysis(now, latestHands);
+    if (handLandmarker) {
+      const handResult = handLandmarker.detectForVideo(video, now);
+      latestHands = handResult.landmarks as LandmarkPoint[][];
+      handCount.value = latestHands.length;
+      lastHandedness.value =
+        handResult.handednesses
+          ?.flat()
+          .map((item) => item.categoryName)
+          .join(" / ") || "无";
+      updateGestureAnalysis(now, latestHands);
+    }
+
+    if (poseLandmarker) {
+      const poseResult = poseLandmarker.detectForVideo(video, now);
+      latestPoseLandmarks = (poseResult.landmarks[0] as LandmarkPoint[] | undefined) ?? null;
+      poseStatus.value = latestPoseLandmarks?.length ? "detected" : "missing";
+      updateUpperBodyMotionFeatures(now);
+    }
+
     updateInferenceFps(now);
   } catch (error) {
     modelStatus.value = "error";
+    poseModelStatus.value = "error";
     modelMessage.value =
-      error instanceof Error ? `手势推理失败：${error.message}` : "手势推理失败。";
+      error instanceof Error ? `视觉推理失败：${error.message}` : "视觉推理失败。";
+    poseModelMessage.value = modelMessage.value;
     stopRenderLoop();
   } finally {
     isInferencing = false;
@@ -990,11 +1283,13 @@ async function startCamera() {
 onMounted(() => {
   void startCamera();
   void loadModel();
+  void loadPoseModel();
 });
 
 onBeforeUnmount(() => {
   stopCamera();
   disposeModel();
+  disposePoseModel();
 });
 </script>
 
@@ -1127,6 +1422,26 @@ onBeforeUnmount(() => {
           <small>手指弯曲 {{ motionEvidence.fingerCurlScore }}</small>
         </section>
         <section class="metric-card">
+          <span>上肢有效时长</span>
+          <strong>{{ formatElapsedTime(upperBodyMotionFeatures.activeUpperBodyMs) }}</strong>
+          <small>{{ upperBodyJointState }}</small>
+        </section>
+        <section class="metric-card">
+          <span>上肢位移</span>
+          <strong>{{ upperBodyMotionFeatures.movementDistance.toFixed(3) }}</strong>
+          <small>肩肘腕手综合位移</small>
+        </section>
+        <section class="metric-card">
+          <span>上肢速度</span>
+          <strong>{{ upperBodyMotionFeatures.movementSpeed.toFixed(3) }}</strong>
+          <small>最近帧归一化速度</small>
+        </section>
+        <section class="metric-card">
+          <span>上肢幅度</span>
+          <strong>{{ upperBodyMotionFeatures.movementAmplitude.toFixed(3) }}</strong>
+          <small>最近窗口最大活动幅度</small>
+        </section>
+        <section class="metric-card">
           <span>手部数量</span>
           <strong>{{ handCount }}</strong>
           <small>最多 2 只手</small>
@@ -1140,13 +1455,14 @@ onBeforeUnmount(() => {
 
       <details class="debug-panel">
         <summary>
-          <span>手势模型</span>
+          <span>视觉模型</span>
           <strong :class="`debug-status status-${modelStatus}`">
             {{ modelStatus }}
           </strong>
         </summary>
         <div class="debug-body">
           <p>{{ modelMessage }}</p>
+          <p>姿态模型: {{ poseModelStatus }} / {{ poseModelMessage }}</p>
           <dl>
             <template v-for="item in debugDetails" :key="item.label">
               <dt>{{ item.label }}</dt>

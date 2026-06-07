@@ -59,7 +59,37 @@ type DemoMetric = {
   label: string;
   value: string;
   detail: string;
+  tone?: "neutral" | "active" | "good" | "warning" | "danger";
 };
+
+type DepthLookupPoint = {
+  id: string;
+  normX: number;
+  normY: number;
+};
+
+type DepthLookupResult = {
+  id?: string;
+  x: number;
+  y: number;
+  depthMm: number;
+  medianDepthMm: number;
+  foregroundDepthMm?: number;
+  validRatio?: number;
+  foregroundCandidate?: boolean;
+  valid: boolean;
+};
+
+type DepthLookupResponse = {
+  ok: boolean;
+  width?: number;
+  height?: number;
+  error?: string;
+  points?: DepthLookupResult[];
+};
+
+type DepthServiceStatus = "idle" | "ready" | "error";
+type DepthQualityState = "unavailable" | "ready" | "unstable" | "background";
 
 const CAMERA_CONSTRAINTS: MediaStreamConstraints = {
   video: {
@@ -81,6 +111,13 @@ const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
 const SMOOTHING_WINDOW_SIZE = 5;
 const FULL_BODY_HISTORY_MS = 1200;
 const FULL_BODY_ACTIVE_DISTANCE_THRESHOLD = 0.04;
+const DEPTH_SERVER_URL = "http://127.0.0.1:8765/depth";
+const DEPTH_REQUEST_INTERVAL_MS = 250;
+const DEPTH_FRONT_BACK_THRESHOLD_MM = 150;
+const DEPTH_ACTION_MAX_SCORE_OFFSET_MM = 800;
+const DEPTH_MAX_REASONABLE_OFFSET_MM = 2000;
+const DEPTH_BASELINE_HOLD_MS = 500;
+const DEPTH_BASELINE_JUMP_MM = 900;
 const DEMO_WEIGHT_KG = 60;
 const MIN_LANDMARK_VISIBILITY = 0.5;
 const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
@@ -162,6 +199,31 @@ const POSE_CONNECTIONS = [
   [28, 30],
   [30, 32],
 ] as const;
+const LEFT_BODY_SEGMENTS = [
+  [11, 13],
+  [13, 15],
+  [23, 25],
+  [25, 27],
+] as const;
+const RIGHT_BODY_SEGMENTS = [
+  [12, 14],
+  [14, 16],
+  [24, 26],
+  [26, 28],
+] as const;
+const CENTER_BODY_SEGMENTS = [
+  [11, 12],
+  [11, 23],
+  [12, 24],
+  [23, 24],
+] as const;
+const FOOT_SEGMENTS = [
+  [27, 29],
+  [29, 31],
+  [28, 30],
+  [30, 32],
+] as const;
+const EMPHASIZED_JOINT_INDICES = new Set([11, 12, 23, 24, 25, 26, 27, 28]);
 const HAND_CONNECTIONS = [
   [0, 1],
   [1, 2],
@@ -197,6 +259,13 @@ const poseStatus = ref<PoseStatus>("idle");
 const inferenceFps = ref(0);
 const handCount = ref(0);
 const landmarkCompleteness = ref(0);
+const depthServiceStatus = ref<DepthServiceStatus>("idle");
+const depthServiceMessage = ref("当前使用 2D 估算");
+const depthFrameSize = ref("未知");
+const leftWristDepthOffsetMm = ref<number | null>(null);
+const rightWristDepthOffsetMm = ref<number | null>(null);
+const depthQualityState = ref<DepthQualityState>("unavailable");
+const depthQualityReason = ref("当前使用 2D 估算");
 const fullBodyJointState = ref("等待全身关键点");
 const fullBodyMotionFeatures = ref<FullBodyMotionFeatures>({
   movementDistance: 0,
@@ -225,6 +294,10 @@ let isInferencing = false;
 let lastInferenceStartedAt = 0;
 let lastFpsSampleAt = 0;
 let inferenceFrameCount = 0;
+let lastDepthRequestAt = 0;
+let isDepthRequesting = false;
+let lastStableBodyDepthMm: number | null = null;
+let lastStableBodyDepthAt = 0;
 let smoothedLandmarks: LandmarkPoint[] | null = null;
 let latestHands: LandmarkPoint[][] = [];
 let pendingJumpingJackState: JumpingJackState = "unknown";
@@ -265,6 +338,22 @@ const fullBodyCalories = computed(() => {
   return (currentFullBodyMet.value * 3.5 * DEMO_WEIGHT_KG * activeMinutes) / 200;
 });
 
+const fullBodyIntensityTone = computed<DemoMetric["tone"]>(() => {
+  if (fullBodyIntensityLevel.value === "高强度") {
+    return "danger";
+  }
+
+  if (fullBodyIntensityLevel.value === "中强度") {
+    return "warning";
+  }
+
+  if (fullBodyIntensityLevel.value === "低强度") {
+    return "active";
+  }
+
+  return "neutral";
+});
+
 const fullBodyTrackedCompleteness = computed(() => {
   const latestSample = fullBodyMotionHistory[fullBodyMotionHistory.length - 1];
 
@@ -284,22 +373,24 @@ const fullBodyConfidence = computed<ConfidenceLevel>(() => {
     return "低";
   }
 
+  const hasMediumBaseQuality =
+    landmarkCompleteness.value >= 60 && fullBodyTrackedCompleteness.value >= 60;
+
+  if (!hasMediumBaseQuality) {
+    return "低";
+  }
+
   if (
     landmarkCompleteness.value >= 85 &&
     fullBodyTrackedCompleteness.value >= 80 &&
     fullBodyMotionHistory.length >= 3
   ) {
-    return "高";
+    return depthServiceStatus.value === "ready" && depthQualityState.value !== "ready"
+      ? "中"
+      : "高";
   }
 
-  if (
-    landmarkCompleteness.value >= 60 &&
-    fullBodyTrackedCompleteness.value >= 60
-  ) {
-    return "中";
-  }
-
-  return "低";
+  return "中";
 });
 
 const fullBodyConfidenceSummary = computed(() => {
@@ -328,11 +419,113 @@ const fullBodyConfidenceSummary = computed(() => {
     reasons.push("有效活动时间较短");
   }
 
+  if (depthServiceStatus.value === "ready" && depthQualityState.value === "ready") {
+    reasons.push("前后方向证据已接入");
+  } else if (depthServiceStatus.value === "ready") {
+    reasons.push(depthQualityReason.value);
+  } else {
+    reasons.push("当前使用 2D 估算");
+  }
+
   if (!reasons.length) {
     reasons.push("人体入镜和运动信号稳定");
   }
 
   return reasons.slice(0, 2).join("；");
+});
+
+const fullBodyConfidenceTone = computed<DemoMetric["tone"]>(() => {
+  if (fullBodyConfidence.value === "高") {
+    return "good";
+  }
+
+  if (fullBodyConfidence.value === "中") {
+    return "warning";
+  }
+
+  return "danger";
+});
+
+const depthStatusTone = computed<DemoMetric["tone"]>(() =>
+  depthServiceStatus.value === "ready" ? "good" : "neutral",
+);
+
+const depthQualityPrompt = computed(() => {
+  if (depthServiceStatus.value !== "ready") {
+    return "";
+  }
+
+  if (depthQualityState.value === "unstable") {
+    return "请正对摄像头，估算更稳定。";
+  }
+
+  if (depthQualityState.value === "background") {
+    return "请站到画面中央，估算更稳定。";
+  }
+
+  return "";
+});
+
+const cameraStatusLabel = computed(() => {
+  if (cameraStatus.value === "loading") {
+    return "摄像头启动中";
+  }
+
+  if (cameraStatus.value === "ready") {
+    return "摄像头已就绪";
+  }
+
+  if (cameraStatus.value === "error") {
+    return "摄像头未就绪";
+  }
+
+  return "等待摄像头";
+});
+
+const modelStatusLabel = computed(() =>
+  modelStatus.value === "ready" ? "人体识别已就绪" : "人体识别准备中",
+);
+
+const handStatusLabel = computed(() =>
+  handModelStatus.value === "ready" ? "手部识别已就绪" : "手部识别准备中",
+);
+
+const depthStatusLabel = computed(() =>
+  depthServiceStatus.value === "ready" ? "RGB-D 已接入" : "当前使用 2D 估算",
+);
+
+const cameraOverlayTitle = computed(() => {
+  if (cameraStatus.value === "loading") {
+    return "正在启动摄像头";
+  }
+
+  if (cameraStatus.value === "error") {
+    return "摄像头未就绪";
+  }
+
+  return "准备开始识别";
+});
+
+const demoCenterPrompt = computed(() => {
+  if (cameraStatus.value !== "ready") {
+    return null;
+  }
+
+  if (modelStatus.value !== "ready") {
+    return {
+      title: "正在准备识别",
+      detail: "请稍候片刻",
+    };
+  }
+
+  if (poseStatus.value !== "detected") {
+    return {
+      title: "请站到画面中央",
+      detail: "让头部、躯干和四肢尽量完整入镜",
+    };
+  }
+
+  return null;
 });
 
 const systemStatusText = computed(() => {
@@ -345,7 +538,15 @@ const systemStatusText = computed(() => {
   }
 
   if (poseStatus.value === "missing") {
-    return "请站到画面中央，保持身体主要关节入镜。";
+    return "请站到画面中央。";
+  }
+
+  if (fullBodyConfidence.value === "低") {
+    return "请正对摄像头，保持身体完整入镜。";
+  }
+
+  if (depthQualityPrompt.value) {
+    return depthQualityPrompt.value;
   }
 
   if (poseStatus.value === "detected") {
@@ -364,6 +565,10 @@ const motionSuggestion = computed(() => {
     return "请让肩、髋、膝、踝尽量完整入镜";
   }
 
+  if (depthQualityPrompt.value) {
+    return depthQualityPrompt.value;
+  }
+
   if (fullBodyIntensityLevel.value === "静止") {
     return "当前运动量较低";
   }
@@ -380,21 +585,22 @@ const primaryMetrics = computed<DemoMetric[]>(() => [
     label: "当前基本动作",
     value: topFullBodyBasicActionsText.value,
     detail: "可同时存在多个基础动作证据",
-  },
-  {
-    label: "当前组合动作",
-    value: compositeActionLabel.value,
-    detail: compositeActionDetail.value,
+    tone: fullBodyBasicActions.value.length ? "active" : "neutral",
   },
   {
     label: "当前强度",
     value: fullBodyIntensityLevel.value,
     detail: `活动分数 ${fullBodyActivityScore.value}`,
+    tone: fullBodyIntensityTone.value,
   },
   {
-    label: "估算消耗",
-    value: `${fullBodyCalories.value.toFixed(2)} kcal`,
-    detail: `按 ${DEMO_WEIGHT_KG} kg 演示估算`,
+    label: "RGB-D 状态",
+    value: depthServiceStatus.value === "ready" ? "已接入" : "2D 估算",
+    detail:
+      depthServiceStatus.value === "ready"
+        ? `${depthServiceMessage.value} / ${depthFrameSize.value}`
+        : depthServiceMessage.value,
+    tone: depthStatusTone.value,
   },
 ]);
 
@@ -423,6 +629,7 @@ const motionMetrics = computed<DemoMetric[]>(() => [
     label: "识别质量",
     value: fullBodyConfidence.value,
     detail: fullBodyConfidenceSummary.value,
+    tone: fullBodyConfidenceTone.value,
   },
   {
     label: "全身关键点",
@@ -431,24 +638,29 @@ const motionMetrics = computed<DemoMetric[]>(() => [
   },
 ]);
 
+const depthActionMetrics = computed<DemoMetric[]>(() => [
+  getDepthActionEvidence("左手前后", leftWristDepthOffsetMm.value),
+  getDepthActionEvidence("右手前后", rightWristDepthOffsetMm.value),
+]);
+
 function getCameraErrorMessage(error: unknown) {
   if (!(error instanceof DOMException)) {
-    return "摄像头启动失败，请检查浏览器和设备状态。";
+    return "请检查摄像头连接。";
   }
 
   if (error.name === "NotAllowedError") {
-    return "摄像头权限被拒绝，请在浏览器中允许摄像头访问。";
+    return "请允许浏览器使用摄像头。";
   }
 
   if (error.name === "NotFoundError") {
-    return "未检测到可用摄像头设备。";
+    return "未找到摄像头。";
   }
 
   if (error.name === "NotReadableError") {
-    return "摄像头正在被其他应用占用。";
+    return "摄像头可能被其他应用占用。";
   }
 
-  return "摄像头启动失败，请确认当前页面运行在 localhost 或 HTTPS 环境。";
+  return "摄像头暂时不可用。";
 }
 
 function stopRenderLoop() {
@@ -479,6 +691,7 @@ function stopCamera() {
   handCount.value = 0;
   resetJumpingJackAnalysis("等待完整关键点");
   resetFullBodyMotionFeatures();
+  resetDepthServiceStatus();
 }
 
 function disposePoseLandmarker() {
@@ -654,6 +867,305 @@ function formatElapsedTime(ms: number) {
 
 function getPointDistance(left: LandmarkPoint, right: LandmarkPoint) {
   return Math.hypot(left.x - right.x, left.y - right.y);
+}
+
+function resetDepthServiceStatus(reason = "当前使用 2D 估算") {
+  depthServiceStatus.value = "idle";
+  depthServiceMessage.value = reason;
+  depthFrameSize.value = "未知";
+  leftWristDepthOffsetMm.value = null;
+  rightWristDepthOffsetMm.value = null;
+  depthQualityState.value = "unavailable";
+  depthQualityReason.value = reason;
+  lastStableBodyDepthMm = null;
+  lastStableBodyDepthAt = 0;
+}
+
+function getDepthActionEvidence(label: string, offsetMm: number | null): DemoMetric {
+  if (offsetMm === null || depthServiceStatus.value !== "ready") {
+    return {
+      label,
+      value: "2D 估算",
+      detail: "当前使用 2D 估算",
+      tone: "neutral",
+    };
+  }
+
+  if (Math.abs(offsetMm) >= DEPTH_MAX_REASONABLE_OFFSET_MM) {
+    return {
+      label,
+      value: "暂不采信",
+      detail: "depth 采样疑似背景",
+      tone: "warning",
+    };
+  }
+
+  const magnitude = Math.abs(offsetMm);
+  const score = clampScore(
+    ((magnitude - DEPTH_FRONT_BACK_THRESHOLD_MM) /
+      (DEPTH_ACTION_MAX_SCORE_OFFSET_MM - DEPTH_FRONT_BACK_THRESHOLD_MM)) *
+      100,
+  );
+
+  if (offsetMm <= -DEPTH_FRONT_BACK_THRESHOLD_MM) {
+    return {
+      label,
+      value: `手前移 ${score}`,
+      detail: "RGB-D 前后方向证据",
+      tone: "active",
+    };
+  }
+
+  if (offsetMm >= DEPTH_FRONT_BACK_THRESHOLD_MM) {
+    return {
+      label,
+      value: `手后移 ${score}`,
+      detail: "RGB-D 前后方向证据",
+      tone: "active",
+    };
+  }
+
+  return {
+    label,
+    value: "接近平面",
+    detail: "前后位移低于阈值",
+    tone: "neutral",
+  };
+}
+
+function getValidDepth(points: DepthLookupResult[], id: string) {
+  const point = points.find((item) => item.id === id);
+
+  return point?.valid && point.medianDepthMm > 0 ? point.medianDepthMm : null;
+}
+
+function getBodyBaselineDepth(points: DepthLookupResult[]) {
+  const depths = [
+    "torsoCenter",
+    "shoulderCenter",
+    "hipCenter",
+    "leftShoulder",
+    "rightShoulder",
+    "leftHip",
+    "rightHip",
+  ]
+    .map((id) => getValidDepth(points, id))
+    .filter((depth): depth is number => depth !== null)
+    .sort((a, b) => a - b);
+
+  if (!depths.length) {
+    return null;
+  }
+
+  const middle = Math.floor(depths.length / 2);
+
+  return depths.length % 2 === 0
+    ? (depths[middle - 1] + depths[middle]) / 2
+    : depths[middle];
+}
+
+function getEffectiveBodyDepth(bodyDepth: number | null, now: number) {
+  if (bodyDepth === null) {
+    const canHold =
+      lastStableBodyDepthMm !== null &&
+      now - lastStableBodyDepthAt <= DEPTH_BASELINE_HOLD_MS;
+
+    return {
+      depth: canHold ? lastStableBodyDepthMm : null,
+      state: canHold ? "held" : "missing",
+    };
+  }
+
+  if (
+    lastStableBodyDepthMm !== null &&
+    Math.abs(bodyDepth - lastStableBodyDepthMm) >= DEPTH_BASELINE_JUMP_MM
+  ) {
+    const canHold = now - lastStableBodyDepthAt <= DEPTH_BASELINE_HOLD_MS;
+
+    return {
+      depth: canHold ? lastStableBodyDepthMm : null,
+      state: canHold ? "held" : "jump",
+    };
+  }
+
+  lastStableBodyDepthMm = bodyDepth;
+  lastStableBodyDepthAt = now;
+
+  return {
+    depth: bodyDepth,
+    state: "stable",
+  };
+}
+
+function getTorsoReferenceVisibleCount(landmarks: LandmarkPoint[]) {
+  return (["leftShoulder", "rightShoulder", "leftHip", "rightHip"] as const).filter(
+    (key) => isVisibleLandmark(landmarks[LANDMARK_INDEX[key]]),
+  ).length;
+}
+
+function getWristDepth(points: DepthLookupResult[], id: string) {
+  const point = points.find((item) => item.id === id);
+
+  if (!point?.valid) {
+    return null;
+  }
+
+  if (point.foregroundDepthMm && point.foregroundDepthMm > 0) {
+    return point.foregroundDepthMm;
+  }
+
+  return point.medianDepthMm > 0 ? point.medianDepthMm : null;
+}
+
+function getDepthPoint(
+  landmarks: LandmarkPoint[],
+  id: keyof typeof LANDMARK_INDEX,
+): DepthLookupPoint | null {
+  const landmark = landmarks[LANDMARK_INDEX[id]];
+
+  if (!isVisibleLandmark(landmark)) {
+    return null;
+  }
+
+  return {
+    id,
+    normX: landmark.x,
+    normY: landmark.y,
+  };
+}
+
+function getAverageDepthPoint(
+  landmarks: LandmarkPoint[],
+  id: string,
+  keys: Array<keyof typeof LANDMARK_INDEX>,
+): DepthLookupPoint | null {
+  const points = keys
+    .map((key) => landmarks[LANDMARK_INDEX[key]])
+    .filter((landmark): landmark is LandmarkPoint => isVisibleLandmark(landmark));
+
+  if (!points.length) {
+    return null;
+  }
+
+  return {
+    id,
+    normX: points.reduce((total, point) => total + point.x, 0) / points.length,
+    normY: points.reduce((total, point) => total + point.y, 0) / points.length,
+  };
+}
+
+async function updateDepthServiceStatus(
+  landmarks: LandmarkPoint[] | null,
+  now: number,
+) {
+  if (!landmarks?.length) {
+    resetDepthServiceStatus("等待人体关键点 / 使用 2D 估算");
+    return;
+  }
+
+  if (isDepthRequesting || now - lastDepthRequestAt < DEPTH_REQUEST_INTERVAL_MS) {
+    return;
+  }
+
+  const points = [
+    getDepthPoint(landmarks, "leftWrist"),
+    getDepthPoint(landmarks, "rightWrist"),
+    getDepthPoint(landmarks, "leftShoulder"),
+    getDepthPoint(landmarks, "rightShoulder"),
+    getDepthPoint(landmarks, "leftHip"),
+    getDepthPoint(landmarks, "rightHip"),
+    getAverageDepthPoint(landmarks, "shoulderCenter", [
+      "leftShoulder",
+      "rightShoulder",
+    ]),
+    getAverageDepthPoint(landmarks, "hipCenter", ["leftHip", "rightHip"]),
+    getAverageDepthPoint(landmarks, "torsoCenter", [
+      "leftShoulder",
+      "rightShoulder",
+      "leftHip",
+      "rightHip",
+    ]),
+  ].filter((point): point is DepthLookupPoint => Boolean(point));
+
+  if (!points.length) {
+    resetDepthServiceStatus("缺少 depth 查询点 / 使用 2D 估算");
+    return;
+  }
+
+  isDepthRequesting = true;
+  lastDepthRequestAt = now;
+
+  try {
+    const response = await fetch(DEPTH_SERVER_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ points }),
+    });
+    const data = (await response.json()) as DepthLookupResponse;
+
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || `depth server ${response.status}`);
+    }
+
+    depthServiceStatus.value = "ready";
+    depthServiceMessage.value = "RGB-D 已接入";
+    depthFrameSize.value =
+      data.width && data.height ? `${data.width}x${data.height}` : "未知";
+    const depthPoints = data.points ?? [];
+    const torsoReferenceVisibleCount = getTorsoReferenceVisibleCount(landmarks);
+    const bodyDepth = getBodyBaselineDepth(depthPoints);
+    const effectiveBodyDepth = getEffectiveBodyDepth(bodyDepth, now);
+    const leftWristDepth = getWristDepth(depthPoints, "leftWrist");
+    const rightWristDepth = getWristDepth(depthPoints, "rightWrist");
+    leftWristDepthOffsetMm.value =
+      effectiveBodyDepth.depth !== null && leftWristDepth !== null
+        ? leftWristDepth - effectiveBodyDepth.depth
+        : null;
+    rightWristDepthOffsetMm.value =
+      effectiveBodyDepth.depth !== null && rightWristDepth !== null
+        ? rightWristDepth - effectiveBodyDepth.depth
+        : null;
+
+    if (
+      torsoReferenceVisibleCount < 3 ||
+      effectiveBodyDepth.depth === null ||
+      (leftWristDepth === null && rightWristDepth === null)
+    ) {
+      depthQualityState.value = "unstable";
+      depthQualityReason.value =
+        torsoReferenceVisibleCount < 3
+          ? "躯干参考不稳定"
+          : "身体基准不稳定";
+    } else if (effectiveBodyDepth.state === "held") {
+      depthQualityState.value = "unstable";
+      depthQualityReason.value = "短暂沿用身体基准";
+    } else if (effectiveBodyDepth.state === "jump") {
+      depthQualityState.value = "unstable";
+      depthQualityReason.value = "身体基准跳变过大";
+    } else if (
+      [leftWristDepthOffsetMm.value, rightWristDepthOffsetMm.value].some(
+        (offset) => offset !== null && Math.abs(offset) >= DEPTH_MAX_REASONABLE_OFFSET_MM,
+      )
+    ) {
+      depthQualityState.value = "background";
+      depthQualityReason.value = "depth 采样疑似背景";
+    } else {
+      depthQualityState.value = "ready";
+      depthQualityReason.value = "前后方向证据已接入";
+    }
+  } catch {
+    depthServiceStatus.value = "error";
+    depthServiceMessage.value = "当前使用 2D 估算";
+    depthFrameSize.value = "未知";
+    leftWristDepthOffsetMm.value = null;
+    rightWristDepthOffsetMm.value = null;
+    depthQualityState.value = "unavailable";
+    depthQualityReason.value = "当前使用 2D 估算";
+  } finally {
+    isDepthRequesting = false;
+  }
 }
 
 function getVisibleTrackedPoint(
@@ -1225,22 +1737,21 @@ function shouldDrawPosePoint(index: number) {
   return index >= 11 || DISPLAY_FACE_LANDMARK_INDICES.includes(index);
 }
 
-function drawPoseOverlay(
+function drawBodySegmentGroup(
   context: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  landmarks: LandmarkPoint[] | null,
+  landmarks: LandmarkPoint[],
+  segments: readonly (readonly [number, number])[],
+  color: string,
+  width: number,
 ) {
-  if (!landmarks?.length) {
-    return;
-  }
-
   context.save();
+  context.strokeStyle = color;
+  context.lineWidth = width;
   context.lineCap = "round";
   context.lineJoin = "round";
-  context.strokeStyle = "rgba(45, 212, 191, 0.92)";
-  context.lineWidth = Math.max(4, canvas.width / 230);
 
-  POSE_CONNECTIONS.forEach(([fromIndex, toIndex]) => {
+  segments.forEach(([fromIndex, toIndex]) => {
     const from = landmarks[fromIndex];
     const to = landmarks[toIndex];
 
@@ -1257,6 +1768,109 @@ function drawPoseOverlay(
     context.stroke();
   });
 
+  context.restore();
+}
+
+function drawTorsoPanel(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  landmarks: LandmarkPoint[],
+) {
+  const torsoKeys = [
+    LANDMARK_INDEX.leftShoulder,
+    LANDMARK_INDEX.rightShoulder,
+    LANDMARK_INDEX.rightHip,
+    LANDMARK_INDEX.leftHip,
+  ];
+  const torsoPoints = torsoKeys
+    .map((index) => landmarks[index])
+    .filter((landmark): landmark is LandmarkPoint => isVisibleLandmark(landmark));
+
+  if (torsoPoints.length < 3) {
+    return;
+  }
+
+  const points = torsoKeys
+    .map((index) => landmarks[index])
+    .filter((landmark): landmark is LandmarkPoint => isVisibleLandmark(landmark))
+    .map((landmark) => toCanvasPoint(landmark, canvas.width, canvas.height));
+
+  context.save();
+  context.fillStyle = "rgba(45, 212, 191, 0.18)";
+  context.strokeStyle = "rgba(20, 184, 166, 0.92)";
+  context.lineWidth = Math.max(3, canvas.width / 320);
+  context.beginPath();
+  points.forEach((point, index) => {
+    if (index === 0) {
+      context.moveTo(point.x, point.y);
+    } else {
+      context.lineTo(point.x, point.y);
+    }
+  });
+  context.closePath();
+  context.fill();
+  context.stroke();
+  context.restore();
+}
+
+function drawPoseJoint(
+  context: CanvasRenderingContext2D,
+  point: { x: number; y: number },
+  radius: number,
+  fill: string,
+) {
+  context.beginPath();
+  context.fillStyle = fill;
+  context.strokeStyle = "rgba(15, 23, 42, 0.76)";
+  context.lineWidth = 2;
+  context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+}
+
+function drawPoseOverlay(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  landmarks: LandmarkPoint[] | null,
+) {
+  if (!landmarks?.length) {
+    return;
+  }
+
+  drawTorsoPanel(context, canvas, landmarks);
+  drawBodySegmentGroup(
+    context,
+    canvas,
+    landmarks,
+    CENTER_BODY_SEGMENTS,
+    "rgba(45, 212, 191, 0.92)",
+    Math.max(5, canvas.width / 220),
+  );
+  drawBodySegmentGroup(
+    context,
+    canvas,
+    landmarks,
+    LEFT_BODY_SEGMENTS,
+    "rgba(96, 165, 250, 0.96)",
+    Math.max(8, canvas.width / 150),
+  );
+  drawBodySegmentGroup(
+    context,
+    canvas,
+    landmarks,
+    RIGHT_BODY_SEGMENTS,
+    "rgba(250, 204, 21, 0.96)",
+    Math.max(8, canvas.width / 150),
+  );
+  drawBodySegmentGroup(
+    context,
+    canvas,
+    landmarks,
+    FOOT_SEGMENTS,
+    "rgba(226, 232, 240, 0.86)",
+    Math.max(4, canvas.width / 260),
+  );
+
   landmarks.forEach((landmark, index) => {
     if (!isVisibleLandmark(landmark) || !shouldDrawPosePoint(index)) {
       return;
@@ -1265,17 +1879,15 @@ function drawPoseOverlay(
     const point = toCanvasPoint(landmark, canvas.width, canvas.height);
     const isRequired = REQUIRED_LANDMARK_INDICES.includes(index);
     const isFace = DISPLAY_FACE_LANDMARK_INDICES.includes(index);
+    const isEmphasized = EMPHASIZED_JOINT_INDICES.has(index);
 
-    context.beginPath();
-    context.fillStyle = isRequired ? "#facc15" : isFace ? "#fb7185" : "#ffffff";
-    context.strokeStyle = "rgba(15, 23, 42, 0.72)";
-    context.lineWidth = 2;
-    context.arc(point.x, point.y, isRequired ? 7 : 5, 0, Math.PI * 2);
-    context.fill();
-    context.stroke();
+    drawPoseJoint(
+      context,
+      point,
+      isEmphasized ? Math.max(8, canvas.width / 170) : isRequired ? 7 : 5,
+      isEmphasized ? "#ffffff" : isRequired ? "#facc15" : isFace ? "#fb7185" : "#ffffff",
+    );
   });
-
-  context.restore();
 }
 
 function drawHandsOverlay(
@@ -1364,6 +1976,7 @@ async function runPoseInference(now: number) {
       smoothedLandmarks = null;
       resetJumpingJackAnalysis("未检测到完整人体");
       resetFullBodyMotionFeatures();
+      resetDepthServiceStatus("等待人体关键点 / 使用 2D 估算");
       return;
     }
 
@@ -1372,10 +1985,12 @@ async function runPoseInference(now: number) {
     updateSmoothedLandmarks(landmarks);
     updateJumpingJackAnalysis(smoothedLandmarks, now);
     updateFullBodyMotionFeatures(smoothedLandmarks, now);
+    void updateDepthServiceStatus(smoothedLandmarks, now);
   } catch {
     poseStatus.value = "missing";
     resetJumpingJackAnalysis("姿态推理失败");
     resetFullBodyMotionFeatures();
+    resetDepthServiceStatus("姿态推理失败 / 使用 2D 估算");
   } finally {
     isInferencing = false;
   }
@@ -1461,7 +2076,7 @@ onBeforeUnmount(() => {
           <h1>运动强度演示</h1>
         </div>
         <span class="status-pill" :class="`status-${cameraStatus}`">
-          {{ cameraStatus }}
+          {{ cameraStatusLabel }}
         </span>
       </div>
 
@@ -1471,12 +2086,17 @@ onBeforeUnmount(() => {
           <canvas ref="canvasRef" aria-label="运动识别画布渲染层" />
 
           <div v-if="cameraStatus !== 'ready'" class="camera-overlay">
-            <span>Camera</span>
+            <span>{{ cameraOverlayTitle }}</span>
             <p>{{ cameraMessage }}</p>
           </div>
 
           <div v-else class="demo-live-banner" aria-live="polite">
             {{ systemStatusText }}
+          </div>
+
+          <div v-if="demoCenterPrompt" class="demo-center-prompt" aria-live="polite">
+            <strong>{{ demoCenterPrompt.title }}</strong>
+            <span>{{ demoCenterPrompt.detail }}</span>
           </div>
 
           <div
@@ -1509,6 +2129,7 @@ onBeforeUnmount(() => {
           v-for="metric in primaryMetrics"
           :key="metric.label"
           class="demo-metric-card"
+          :class="metric.tone ? `tone-${metric.tone}` : undefined"
         >
           <span>{{ metric.label }}</span>
           <strong>{{ metric.value }}</strong>
@@ -1526,6 +2147,26 @@ onBeforeUnmount(() => {
             v-for="metric in motionMetrics"
             :key="metric.label"
             class="demo-metric-card"
+            :class="metric.tone ? `tone-${metric.tone}` : undefined"
+          >
+            <span>{{ metric.label }}</span>
+            <strong>{{ metric.value }}</strong>
+            <small>{{ metric.detail }}</small>
+          </section>
+        </div>
+      </section>
+
+      <section class="demo-section">
+        <div class="demo-section-header">
+          <span>前后方向</span>
+          <small>{{ depthServiceStatus === "ready" ? "RGB-D 证据" : "当前使用 2D 估算" }}</small>
+        </div>
+        <div class="demo-metrics-grid compact">
+          <section
+            v-for="metric in depthActionMetrics"
+            :key="metric.label"
+            class="demo-metric-card"
+            :class="metric.tone ? `tone-${metric.tone}` : undefined"
           >
             <span>{{ metric.label }}</span>
             <strong>{{ metric.value }}</strong>
@@ -1535,8 +2176,9 @@ onBeforeUnmount(() => {
       </section>
 
       <section class="demo-status-strip">
-        <span>Pose {{ modelStatus }}</span>
-        <span>Hand {{ handModelStatus }}</span>
+        <span>{{ modelStatusLabel }}</span>
+        <span>{{ handStatusLabel }}</span>
+        <span>{{ depthStatusLabel }}</span>
         <span>{{ inferenceFps.toFixed(1) }} FPS</span>
         <span>{{ handCount }} hand</span>
       </section>
@@ -1573,7 +2215,51 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid #e2e8f0;
   display: flex;
   justify-content: space-between;
-  padding: 18px 20px;
+  gap: 18px;
+  padding: 20px 24px;
+}
+
+.eyebrow {
+  color: #0f766e;
+  font-size: 13px;
+  font-weight: 900;
+  margin: 0 0 5px;
+}
+
+.demo-stage-toolbar h1 {
+  color: #0f172a;
+  font-size: 34px;
+  line-height: 1.05;
+  margin: 0;
+}
+
+.status-pill {
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  color: #334155;
+  font-size: 15px;
+  font-weight: 900;
+  padding: 9px 14px;
+  white-space: nowrap;
+}
+
+.status-ready {
+  background: #ecfdf5;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.status-loading,
+.status-idle {
+  background: #eff6ff;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+}
+
+.status-error {
+  background: #fff7ed;
+  border-color: #fdba74;
+  color: #9a3412;
 }
 
 .demo-camera-stage {
@@ -1628,9 +2314,48 @@ onBeforeUnmount(() => {
   max-width: calc(100% - 32px);
   padding: 10px 12px;
   position: absolute;
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+
+.camera-overlay,
+.demo-center-prompt {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.78);
+  border: 1px solid rgba(226, 232, 240, 0.28);
+  border-radius: 8px;
+  color: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  left: 50%;
+  max-width: min(480px, calc(100% - 48px));
+  padding: 22px 24px;
+  position: absolute;
+  text-align: center;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 3;
+}
+
+.camera-overlay span,
+.demo-center-prompt strong {
+  color: #ffffff;
+  font-size: 26px;
+  font-weight: 900;
+  line-height: 1.15;
+}
+
+.camera-overlay p,
+.demo-center-prompt span {
+  color: #cbd5e1;
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.45;
+  margin: 0;
 }
 
 .demo-action-badge {
+  animation: subtleRise 260ms ease-out;
   background: rgba(15, 23, 42, 0.78);
   border: 1px solid rgba(250, 204, 21, 0.58);
   border-radius: 8px;
@@ -1643,6 +2368,7 @@ onBeforeUnmount(() => {
   right: 16px;
   text-align: right;
   top: 16px;
+  z-index: 2;
 }
 
 .demo-action-badge span,
@@ -1674,12 +2400,13 @@ onBeforeUnmount(() => {
   border: 1px solid #dbe3ef;
   border-radius: 8px;
   display: grid;
-  gap: 8px;
-  padding: 16px;
+  gap: 10px;
+  padding: 18px;
 }
 
 .demo-hero-metric {
   background: #f8fafc;
+  min-height: 132px;
 }
 
 .demo-hero-metric.accent {
@@ -1691,26 +2418,29 @@ onBeforeUnmount(() => {
 .demo-metric-card span,
 .demo-section-header span {
   color: #475569;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 900;
 }
 
 .demo-hero-metric strong {
   color: #0f172a;
-  font-size: 32px;
+  font-size: 38px;
   line-height: 1.1;
+  overflow-wrap: anywhere;
 }
 
 .demo-hero-metric small,
 .demo-metric-card small,
 .demo-section-header small {
   color: #64748b;
+  font-size: 13px;
+  font-weight: 750;
   line-height: 1.35;
 }
 
 .demo-metrics-grid {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .demo-metrics-grid.compact {
@@ -1721,16 +2451,56 @@ onBeforeUnmount(() => {
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   display: grid;
-  gap: 5px;
-  min-height: 112px;
-  padding: 13px;
+  gap: 7px;
+  min-height: 122px;
+  padding: 15px;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease;
 }
 
 .demo-metric-card strong {
   color: #0f172a;
-  font-size: 22px;
+  font-size: 25px;
   line-height: 1.14;
   overflow-wrap: anywhere;
+}
+
+.demo-metric-card.tone-active {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+.demo-metric-card.tone-good {
+  background: #ecfdf5;
+  border-color: #86efac;
+}
+
+.demo-metric-card.tone-warning {
+  background: #fffbeb;
+  border-color: #fcd34d;
+}
+
+.demo-metric-card.tone-danger {
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+
+.demo-metric-card.tone-active strong {
+  color: #1d4ed8;
+}
+
+.demo-metric-card.tone-good strong {
+  color: #166534;
+}
+
+.demo-metric-card.tone-warning strong {
+  color: #92400e;
+}
+
+.demo-metric-card.tone-danger strong {
+  color: #9a3412;
 }
 
 .demo-section-header {
@@ -1758,6 +2528,52 @@ onBeforeUnmount(() => {
   color: #64748b;
   font-size: 12px;
   font-weight: 800;
+}
+
+@keyframes subtleRise {
+  from {
+    opacity: 0.82;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (min-width: 1500px) {
+  .demo-shell {
+    gap: 24px;
+    grid-template-columns: minmax(0, 1fr) 420px;
+  }
+
+  .demo-stage-toolbar h1 {
+    font-size: 40px;
+  }
+
+  .demo-action-badge strong {
+    font-size: 36px;
+  }
+
+  .demo-hero-metric strong {
+    font-size: 44px;
+  }
+
+  .demo-metric-card strong {
+    font-size: 29px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .demo-action-badge {
+    animation: none;
+  }
+
+  .demo-live-banner,
+  .demo-metric-card {
+    transition: none;
+  }
 }
 
 @media (max-width: 1100px) {

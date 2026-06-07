@@ -1,8 +1,9 @@
 # Task5 RGB-D 深度摄像头接入评估 — 实施清单
 
-> 状态：已开始。  
+> 状态：已基本完成，已收敛到 Task6。  
 > 目标：评估 Orbbec Astra Pro HD / ORBBEC Depth Sensor 是否能稳定输出真实 depth，并与当前 MediaPipe Pose / Hand 主链路融合。  
 > 原则：RGB-D 优先，SAM 3D Body 暂作备选；先跑通 Python 最小 depth 读取，再考虑前端接入。  
+> 收敛说明：Task5 已完成 RGB-D 摄像头硬件验证、OpenNI Python depth 探针、depth HTTP 服务、/#/pose 调试接入和正面前后方向动作验证。后续将 depth 接入 /#/demo、置信度融合、侧身质量提示和外场演示体验放入 Task6 / Task7。registration 开启失败和侧身躯干基准不稳定保留为后续风险项。  
 
 ---
 

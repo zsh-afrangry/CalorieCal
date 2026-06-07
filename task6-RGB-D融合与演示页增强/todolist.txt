@@ -1,0 +1,134 @@
+# Task6 RGB-D 融合与演示页增强 — 实施清单
+
+> 状态：已完成，已收敛到 Task7。  
+> 目标：将 Task5 已跑通的 RGB-D depth 能力，从 /#/pose 调试页推进到 /#/demo 外场演示页，并用于前后方向动作证据、空间幅度、估算置信度和质量提示。  
+> 原则：MediaPipe 仍是主链路；OpenNI depth server 只补充 z/depth 信息；/#/pose 保留调试，/#/demo 面向商场液晶屏演示。  
+> 收敛说明：Task6 已完成 /#/demo RGB-D 状态接入、前后方向证据展示、估算置信度融合、侧身和质量提示、启动与验收说明。后续进入 Task7，重点优化 /#/demo 的用户体验和外场大屏展示。  
+
+---
+
+## Phase 1: Task6 范围确认和 Task5 交接
+
+- [x] 1.1 确认 Task5 已收敛
+      → Task5 已完成 RGB-D 硬件验证、Python 探针、depth server、/#/pose 调试接入和正面前后动作验证
+      → registration 开启失败保留为风险项，不阻塞 Task6
+      → 侧身躯干基准不稳定进入 Task6 质量提示和后续 3D Body 研究方向
+
+- [x] 1.2 明确 Task6 不替换主链路
+      → MediaPipe Pose / Hand 继续负责关键点和主要运动量
+      → RGB-D depth 只补充前后方向动作证据、空间幅度和估算置信度
+
+- [x] 1.3 明确 /#/pose 和 /#/demo 分工
+      → /#/pose: 调试、depth 原始字段、采样来源、身体基准来源
+      → /#/demo: 外场展示、少量关键指标、质量提示、路人可读
+
+## Phase 2: /#/demo 接入 depth 服务状态
+
+- [x] 2.1 在 DemoView 中复用 depth server 请求能力
+      → 请求 http://127.0.0.1:8765/depth
+      → 查询 leftWrist、rightWrist、躯干参考点
+      → 与 /#/pose 保持同一套 depth 字段语义
+      → 已完成: DemoView 以约 250ms 节流请求 depth server，查询左右手腕、肩、髋和躯干中心
+
+- [x] 2.2 显示 depth 服务状态
+      → 未启动: 显示“RGB-D 未连接 / 使用 2D 估算”
+      → 已连接: 显示“RGB-D 已接入”
+      → 请求失败: 显示质量提示，不影响基础演示页运行
+      → 已完成: /#/demo 主指标卡新增 RGB-D 状态；底部状态条新增 RGB-D idle / ready / error
+
+- [x] 2.3 构建验证
+      → 执行 npm.cmd --prefix frontend run build
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+## Phase 3: 前后方向动作证据进入 /#/demo
+
+- [x] 3.1 计算左右手 z 轴差值
+      → wrist depth - body baseline depth
+      → 负值表示更靠近摄像头，即“在身体前”
+      → 正值表示更远离摄像头，即“在身体后”
+      → 已完成: DemoView 基于左右手腕 depth 和躯干/肩/髋中位身体基准计算左右手 z 轴差值
+
+- [x] 3.2 展示前后方向基础动作证据
+      → 手前移 / 手后移 / 接近身体平面 / 暂不采信
+      → 显示简化后的 0~100 证据分数
+      → 不展示过多毫米调试细节
+      → 已完成: /#/demo 新增“前后方向”展示区，显示左手前后、右手前后基础证据
+
+- [x] 3.3 对组合动作保留接口
+      → 出拳、身体前倾、身体后退可以读取 depth 证据
+      → 当前先不强行改写组合动作识别逻辑
+      → 已完成: 当前 depth 证据只作为独立演示指标展示，不抢占当前基本动作或组合动作名称
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+## Phase 4: depth 参与估算置信度
+
+- [x] 4.1 增加 depth 质量因素
+      → depth server 状态
+      → 手腕 depth 有效性
+      → 身体基准有效性
+      → 是否疑似采到背景
+      → 已完成: DemoView 新增 depthQualityState / depthQualityReason，区分 unavailable / ready / unstable / background
+
+- [x] 4.2 更新全身估算置信度原因
+      → RGB-D 可用时说明“前后方向证据已接入”
+      → RGB-D 不可用时说明“当前使用 2D 估算”
+      → 侧身或躯干不可见时说明“身体基准不稳定”
+      → 已完成: 识别质量原因会展示前后方向证据、2D 估算、身体基准不稳定或 depth 采样疑似背景
+
+- [x] 4.3 避免 depth 过度抢占
+      → depth 只提高或降低前后方向动作证据和估算置信度
+      → 不直接覆盖当前基本动作或组合动作名称
+      → 已完成: depth 不改写当前基本动作或组合动作；仅在 RGB-D 已连接但质量不稳时将原本高置信度压到中等
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+## Phase 5: 侧身和质量提示
+
+- [x] 5.1 检测躯干基准不稳定
+      → 肩/髋/躯干中心缺失过多
+      → 身体基准 depth 与历史基准差异过大
+      → 左右肩或左右髋可见性不足
+      → 已完成: DemoView 检测肩/髋可见数量、身体基准缺失、身体基准跳变和疑似背景采样
+
+- [x] 5.2 增加质量提示
+      → “请正对摄像头，前后方向识别更稳定”
+      → “躯干参考不稳定，估算置信度下降”
+      → “depth 采样疑似背景”
+      → 已完成: /#/demo 顶部提示和运动量提示会显示正对摄像头、躯干参考不稳定、depth 采样疑似背景等短提示
+
+- [x] 5.3 可选历史缓冲
+      → 短时间侧身或丢点时，沿用最近稳定身体基准
+      → 超过短时间窗口后降低置信度，不继续强行估算
+      → 已完成: 身体基准短暂缺失或 900mm 以上跳变时，最多沿用 0.5 秒最近稳定基准；超过窗口后标记不稳定并降低置信度
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+## Phase 6: 启动说明和验收流程
+
+- [x] 6.1 编写启动说明
+      → 启动 depth server
+      → 启动 frontend
+      → 检查 /health
+      → 打开 /#/pose 和 /#/demo
+      → 已完成: 新增 task6-RGB-D融合与演示页增强/启动和验收说明.md
+
+- [x] 6.2 编写工位验收清单
+      → 正对摄像头手前伸/收回
+      → depth server 关闭时页面降级
+      → 侧身时质量提示出现
+      → /#/demo 不展示过多调试噪音
+      → 已完成: 启动和验收说明中记录正对、收回、关闭 depth server、侧身、疑似背景和调试噪音验收项
+
+- [x] 6.3 最终构建验证
+      → npm.cmd --prefix frontend run build
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+---
+
+## 待商讨记录区
+
+### Task6 的定位
+
+Task6 不是继续证明 3D 摄像头能不能工作，而是把已经可用的 depth 信息变成演示页可读、估算链路可解释的能力。
+
+### 与 Task7 的关系
+
+Task6 关注 RGB-D 融合和数据正确性；Task7 关注 /#/demo 的用户体验、视觉层级、外场液晶屏显示和路人可读性。

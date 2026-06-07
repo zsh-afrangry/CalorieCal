@@ -63,6 +63,32 @@ type BasicActionCandidate = {
   reason: string;
 };
 
+type DepthLookupPoint = {
+  id: string;
+  normX: number;
+  normY: number;
+};
+
+type DepthLookupResult = {
+  id?: string;
+  x: number;
+  y: number;
+  depthMm: number;
+  medianDepthMm: number;
+  foregroundDepthMm?: number;
+  validRatio?: number;
+  foregroundCandidate?: boolean;
+  valid: boolean;
+};
+
+type DepthLookupResponse = {
+  ok: boolean;
+  width?: number;
+  height?: number;
+  points?: DepthLookupResult[];
+  error?: string;
+};
+
 const CAMERA_CONSTRAINTS: MediaStreamConstraints = {
   video: {
     facingMode: "user",
@@ -83,6 +109,11 @@ const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
 const SMOOTHING_WINDOW_SIZE = 5;
 const FULL_BODY_HISTORY_MS = 1200;
 const FULL_BODY_ACTIVE_DISTANCE_THRESHOLD = 0.04;
+const DEPTH_SERVER_URL = "http://127.0.0.1:8765/depth";
+const DEPTH_REQUEST_INTERVAL_MS = 250;
+const DEPTH_FRONT_BACK_THRESHOLD_MM = 150;
+const DEPTH_ACTION_MAX_SCORE_OFFSET_MM = 800;
+const DEPTH_MAX_REASONABLE_OFFSET_MM = 2000;
 const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
 const MIN_LANDMARK_VISIBILITY = 0.5;
 const LANDMARK_INDEX = {
@@ -224,6 +255,19 @@ const fullBodyMotionFeatures = ref<FullBodyMotionFeatures>({
 const fullBodyActivityScore = ref(0);
 const fullBodyIntensityLevel = ref<FullBodyIntensityLevel>("静止");
 const fullBodyBasicActions = ref<BasicActionCandidate[]>([]);
+const depthServiceStatus = ref("idle");
+const depthServiceMessage = ref("等待 depth server");
+const depthFrameSize = ref("未知");
+const leftWristDepthMm = ref<number | null>(null);
+const rightWristDepthMm = ref<number | null>(null);
+const bodyDepthBaselineMm = ref<number | null>(null);
+const bodyDepthSource = ref("无");
+const leftWristDepthOffsetMm = ref<number | null>(null);
+const rightWristDepthOffsetMm = ref<number | null>(null);
+const leftWristDepthRelation = ref("无");
+const rightWristDepthRelation = ref("无");
+const leftWristDepthSource = ref("无");
+const rightWristDepthSource = ref("无");
 
 let stream: MediaStream | null = null;
 let animationFrameId: number | null = null;
@@ -238,6 +282,8 @@ let latestHands: LandmarkPoint[][] = [];
 let pendingJumpingJackState: JumpingJackState = "unknown";
 let pendingJumpingJackFrames = 0;
 let lastJumpingJackRuntimeAt = 0;
+let lastDepthRequestAt = 0;
+let isDepthRequesting = false;
 const landmarkHistory: LandmarkPoint[][] = [];
 const fullBodyMotionHistory: FullBodyMotionSample[] = [];
 
@@ -443,6 +489,57 @@ const jumpingJackQualitySummary = computed(() =>
   jumpingJackQualityFeedback.value.slice(0, 3).join("；"),
 );
 
+const depthDebugSummary = computed(() => {
+  if (depthServiceStatus.value !== "ready") {
+    return depthServiceMessage.value;
+  }
+
+  return `左手 ${formatNullableMm(leftWristDepthMm.value)} / 右手 ${formatNullableMm(
+    rightWristDepthMm.value,
+  )} / 身体 ${formatNullableMm(bodyDepthBaselineMm.value)} / ${leftWristDepthRelation.value} / ${rightWristDepthRelation.value}`;
+});
+
+const depthPrimaryMetrics = computed<MetricCard[]>(() => [
+  {
+    label: "左手腕 depth",
+    value: formatNullableMm(leftWristDepthMm.value),
+    detail: leftWristDepthRelation.value,
+  },
+  {
+    label: "右手腕 depth",
+    value: formatNullableMm(rightWristDepthMm.value),
+    detail: rightWristDepthRelation.value,
+  },
+  {
+    label: "身体基准 depth",
+    value: formatNullableMm(bodyDepthBaselineMm.value),
+    detail: "躯干参考",
+  },
+]);
+
+const depthDetailMetrics = computed<MetricCard[]>(() => [
+  {
+    label: "左手 z 轴差值",
+    value: formatSignedNullableMm(leftWristDepthOffsetMm.value),
+    detail: leftWristDepthSource.value,
+  },
+  {
+    label: "右手 z 轴差值",
+    value: formatSignedNullableMm(rightWristDepthOffsetMm.value),
+    detail: rightWristDepthSource.value,
+  },
+  {
+    label: "Depth 帧尺寸",
+    value: depthFrameSize.value,
+    detail: depthServiceMessage.value,
+  },
+]);
+
+const depthActionEvidenceMetrics = computed<MetricCard[]>(() => [
+  getDepthActionEvidence("左手前后基础动作", leftWristDepthOffsetMm.value),
+  getDepthActionEvidence("右手前后基础动作", rightWristDepthOffsetMm.value),
+]);
+
 const metrics = computed<MetricCard[]>(() => [
   {
     label: "开合跳次数",
@@ -572,6 +669,19 @@ const poseDebugDetails = computed(() => [
   { label: "全身估算置信度", value: fullBodyConfidence.value },
   { label: "置信度原因", value: fullBodyConfidenceSummary.value },
   { label: "质量反馈", value: jumpingJackQualitySummary.value },
+  { label: "Depth 服务", value: depthServiceStatus.value },
+  { label: "Depth 摘要", value: depthDebugSummary.value },
+  { label: "Depth 帧尺寸", value: depthFrameSize.value },
+  { label: "左手腕 depth", value: formatNullableMm(leftWristDepthMm.value) },
+  { label: "右手腕 depth", value: formatNullableMm(rightWristDepthMm.value) },
+  { label: "身体基准 depth", value: formatNullableMm(bodyDepthBaselineMm.value) },
+  { label: "身体基准来源", value: bodyDepthSource.value },
+  { label: "左手 z 轴差值", value: formatSignedNullableMm(leftWristDepthOffsetMm.value) },
+  { label: "右手 z 轴差值", value: formatSignedNullableMm(rightWristDepthOffsetMm.value) },
+  { label: "左手前后状态", value: leftWristDepthRelation.value },
+  { label: "右手前后状态", value: rightWristDepthRelation.value },
+  { label: "左手采样来源", value: leftWristDepthSource.value },
+  { label: "右手采样来源", value: rightWristDepthSource.value },
   { label: "基本动作候选", value: topFullBodyBasicActionsText.value },
   { label: "全身位移", value: fullBodyMotionFeatures.value.movementDistance.toFixed(3) },
   { label: "上肢位移", value: fullBodyMotionFeatures.value.upperBodyDistance.toFixed(3) },
@@ -905,6 +1015,87 @@ function formatElapsedTime(ms: number) {
   return `${minutes}:${seconds}`;
 }
 
+function formatNullableMm(value: number | null) {
+  return value === null ? "无" : `${Math.round(value)}mm`;
+}
+
+function formatSignedNullableMm(value: number | null) {
+  if (value === null) {
+    return "无";
+  }
+
+  const rounded = Math.round(value);
+
+  return `${rounded > 0 ? "+" : ""}${rounded}mm`;
+}
+
+function getDepthRelation(offsetMm: number | null) {
+  if (offsetMm === null) {
+    return "无";
+  }
+
+  if (Math.abs(offsetMm) >= DEPTH_MAX_REASONABLE_OFFSET_MM) {
+    return "疑似采到背景";
+  }
+
+  if (offsetMm <= -DEPTH_FRONT_BACK_THRESHOLD_MM) {
+    return "在身体前";
+  }
+
+  if (offsetMm >= DEPTH_FRONT_BACK_THRESHOLD_MM) {
+    return "在身体后";
+  }
+
+  return "接近身体平面";
+}
+
+function getDepthActionEvidence(label: string, offsetMm: number | null): MetricCard {
+  if (offsetMm === null) {
+    return {
+      label,
+      value: "无",
+      detail: "等待 wrist/body depth",
+    };
+  }
+
+  if (Math.abs(offsetMm) >= DEPTH_MAX_REASONABLE_OFFSET_MM) {
+    return {
+      label,
+      value: "暂不采信",
+      detail: `疑似采到背景 / ${formatSignedNullableMm(offsetMm)}`,
+    };
+  }
+
+  const magnitude = Math.abs(offsetMm);
+  const score = clampScore(
+    ((magnitude - DEPTH_FRONT_BACK_THRESHOLD_MM) /
+      (DEPTH_ACTION_MAX_SCORE_OFFSET_MM - DEPTH_FRONT_BACK_THRESHOLD_MM)) *
+      100,
+  );
+
+  if (offsetMm <= -DEPTH_FRONT_BACK_THRESHOLD_MM) {
+    return {
+      label,
+      value: `手前移 ${score}`,
+      detail: `${formatSignedNullableMm(offsetMm)}，depth 证据`,
+    };
+  }
+
+  if (offsetMm >= DEPTH_FRONT_BACK_THRESHOLD_MM) {
+    return {
+      label,
+      value: `手后移 ${score}`,
+      detail: `${formatSignedNullableMm(offsetMm)}，depth 证据`,
+    };
+  }
+
+  return {
+    label,
+    value: "接近平面",
+    detail: `${formatSignedNullableMm(offsetMm)}，低于 ${DEPTH_FRONT_BACK_THRESHOLD_MM}mm 阈值`,
+  };
+}
+
 function getPointDistance(left: LandmarkPoint, right: LandmarkPoint) {
   return Math.hypot(left.x - right.x, left.y - right.y);
 }
@@ -1205,6 +1396,207 @@ function resetFullBodyMotionFeatures() {
   fullBodyActivityScore.value = 0;
   fullBodyIntensityLevel.value = "静止";
   fullBodyBasicActions.value = [];
+}
+
+function resetDepthDebug(reason = "等待完整关键点") {
+  depthServiceStatus.value = "idle";
+  depthServiceMessage.value = reason;
+  depthFrameSize.value = "未知";
+  leftWristDepthMm.value = null;
+  rightWristDepthMm.value = null;
+  bodyDepthBaselineMm.value = null;
+  bodyDepthSource.value = "无";
+  leftWristDepthOffsetMm.value = null;
+  rightWristDepthOffsetMm.value = null;
+  leftWristDepthRelation.value = "无";
+  rightWristDepthRelation.value = "无";
+  leftWristDepthSource.value = "无";
+  rightWristDepthSource.value = "无";
+}
+
+function getDepthPoint(
+  landmarks: LandmarkPoint[],
+  id: keyof typeof LANDMARK_INDEX,
+): DepthLookupPoint | null {
+  const landmark = landmarks[LANDMARK_INDEX[id]];
+
+  if (!isVisibleLandmark(landmark)) {
+    return null;
+  }
+
+  return {
+    id,
+    normX: landmark.x,
+    normY: landmark.y,
+  };
+}
+
+function getAverageDepthPoint(
+  landmarks: LandmarkPoint[],
+  id: string,
+  keys: Array<keyof typeof LANDMARK_INDEX>,
+): DepthLookupPoint | null {
+  const points = keys
+    .map((key) => landmarks[LANDMARK_INDEX[key]])
+    .filter((landmark): landmark is LandmarkPoint => isVisibleLandmark(landmark));
+
+  if (!points.length) {
+    return null;
+  }
+
+  return {
+    id,
+    normX: points.reduce((total, point) => total + point.x, 0) / points.length,
+    normY: points.reduce((total, point) => total + point.y, 0) / points.length,
+  };
+}
+
+function getValidDepth(points: DepthLookupResult[], id: string) {
+  const point = points.find((item) => item.id === id);
+
+  return point?.valid && point.medianDepthMm > 0 ? point.medianDepthMm : null;
+}
+
+function getBodyBaseline(points: DepthLookupResult[]) {
+  const candidates = [
+    { id: "torsoCenter", label: "躯干中心" },
+    { id: "shoulderCenter", label: "肩部中心" },
+    { id: "hipCenter", label: "髋部中心" },
+    { id: "leftShoulder", label: "左肩" },
+    { id: "rightShoulder", label: "右肩" },
+    { id: "leftHip", label: "左髋" },
+    { id: "rightHip", label: "右髋" },
+  ]
+    .map((candidate) => ({
+      ...candidate,
+      depth: getValidDepth(points, candidate.id),
+    }))
+    .filter((candidate): candidate is { id: string; label: string; depth: number } =>
+      candidate.depth !== null,
+    );
+
+  if (!candidates.length) {
+    return { depth: null, source: "无" };
+  }
+
+  const depths = candidates.map((candidate) => candidate.depth).sort((a, b) => a - b);
+  const middle = Math.floor(depths.length / 2);
+  const baseline =
+    depths.length % 2 === 0
+      ? (depths[middle - 1] + depths[middle]) / 2
+      : depths[middle];
+
+  return {
+    depth: baseline,
+    source: candidates.map((candidate) => `${candidate.label}:${candidate.depth}`).join(" / "),
+  };
+}
+
+function getWristDepth(points: DepthLookupResult[], id: string) {
+  const point = points.find((item) => item.id === id);
+
+  if (!point?.valid) {
+    return { depth: null, source: "无" };
+  }
+
+  if (point.foregroundDepthMm && point.foregroundDepthMm > 0) {
+    const source = point.foregroundCandidate
+      ? `前景候选 r${point.validRatio ?? "?"}`
+      : `前景窗口 r${point.validRatio ?? "?"}`;
+
+    return { depth: point.foregroundDepthMm, source };
+  }
+
+  if (point.medianDepthMm > 0) {
+    return { depth: point.medianDepthMm, source: `中心中位数 r${point.validRatio ?? "?"}` };
+  }
+
+  return { depth: null, source: "无有效深度" };
+}
+
+async function updateDepthDebug(
+  landmarks: LandmarkPoint[] | null,
+  now: number,
+) {
+  if (!landmarks?.length) {
+    resetDepthDebug("未检测到完整人体");
+    return;
+  }
+
+  if (isDepthRequesting || now - lastDepthRequestAt < DEPTH_REQUEST_INTERVAL_MS) {
+    return;
+  }
+
+  const points = [
+    getDepthPoint(landmarks, "leftWrist"),
+    getDepthPoint(landmarks, "rightWrist"),
+    getDepthPoint(landmarks, "leftShoulder"),
+    getDepthPoint(landmarks, "rightShoulder"),
+    getDepthPoint(landmarks, "leftHip"),
+    getDepthPoint(landmarks, "rightHip"),
+    getAverageDepthPoint(landmarks, "shoulderCenter", ["leftShoulder", "rightShoulder"]),
+    getAverageDepthPoint(landmarks, "hipCenter", ["leftHip", "rightHip"]),
+    getAverageDepthPoint(landmarks, "torsoCenter", [
+      "leftShoulder",
+      "rightShoulder",
+      "leftHip",
+      "rightHip",
+    ]),
+  ].filter((point): point is DepthLookupPoint => Boolean(point));
+
+  if (!points.length) {
+    resetDepthDebug("缺少可查询 depth 的关键点");
+    return;
+  }
+
+  isDepthRequesting = true;
+  lastDepthRequestAt = now;
+
+  try {
+    const response = await fetch(DEPTH_SERVER_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ points }),
+    });
+    const data = (await response.json()) as DepthLookupResponse;
+
+    if (!response.ok || !data.ok || !data.points) {
+      throw new Error(data.error || `depth server ${response.status}`);
+    }
+
+    const baseline = getBodyBaseline(data.points);
+    const leftWristDepth = getWristDepth(data.points, "leftWrist");
+    const rightWristDepth = getWristDepth(data.points, "rightWrist");
+
+    depthServiceStatus.value = "ready";
+    depthServiceMessage.value = "depth server 已连接";
+    depthFrameSize.value =
+      data.width && data.height ? `${data.width}x${data.height}` : "未知";
+    bodyDepthBaselineMm.value = baseline.depth;
+    bodyDepthSource.value = baseline.source;
+    leftWristDepthMm.value = leftWristDepth.depth;
+    rightWristDepthMm.value = rightWristDepth.depth;
+    leftWristDepthSource.value = leftWristDepth.source;
+    rightWristDepthSource.value = rightWristDepth.source;
+    leftWristDepthOffsetMm.value =
+      leftWristDepth.depth !== null && baseline.depth !== null
+        ? leftWristDepth.depth - baseline.depth
+        : null;
+    rightWristDepthOffsetMm.value =
+      rightWristDepth.depth !== null && baseline.depth !== null
+        ? rightWristDepth.depth - baseline.depth
+        : null;
+    leftWristDepthRelation.value = getDepthRelation(leftWristDepthOffsetMm.value);
+    rightWristDepthRelation.value = getDepthRelation(rightWristDepthOffsetMm.value);
+  } catch (error) {
+    depthServiceStatus.value = "error";
+    depthServiceMessage.value =
+      error instanceof Error ? error.message : "depth server 请求失败";
+  } finally {
+    isDepthRequesting = false;
+  }
 }
 
 function updateFullBodyMotionFeatures(
@@ -1585,6 +1977,7 @@ async function runPoseInference(now: number) {
       smoothedLandmarks = null;
       resetJumpingJackAnalysis("未检测到完整人体");
       resetFullBodyMotionFeatures();
+      resetDepthDebug("未检测到完整人体");
       return;
     }
 
@@ -1597,12 +1990,14 @@ async function runPoseInference(now: number) {
       : "无平滑数据";
     updateJumpingJackAnalysis(smoothedLandmarks);
     updateFullBodyMotionFeatures(smoothedLandmarks, now);
+    void updateDepthDebug(smoothedLandmarks, now);
   } catch (error) {
     poseStatus.value = "missing";
     rawLandmarkState.value =
       error instanceof Error ? error.message : "姿态推理失败";
     resetJumpingJackAnalysis("姿态推理失败");
     resetFullBodyMotionFeatures();
+    resetDepthDebug("姿态推理失败");
   } finally {
     isInferencing = false;
   }
@@ -1728,22 +2123,89 @@ onBeforeUnmount(() => {
     </section>
 
     <aside class="side-panel" aria-label="实时指标">
-      <label class="weight-field">
-        <span>体重 kg</span>
-        <input v-model.number="weightKg" type="number" min="20" max="200" />
-      </label>
+      <section class="depth-focus-panel" aria-label="Depth 测试参数">
+        <div class="depth-focus-header">
+          <div>
+            <p class="eyebrow">RGB-D Depth</p>
+            <h2>深度调试</h2>
+          </div>
+          <span class="status-pill" :class="`status-${depthServiceStatus}`">
+            {{ depthServiceStatus }}
+          </span>
+        </div>
 
-      <div class="metrics-grid">
-        <section
-          v-for="metric in metrics"
-          :key="metric.label"
-          class="metric-card"
-        >
-          <span>{{ metric.label }}</span>
-          <strong>{{ metric.value }}</strong>
-          <small v-if="metric.detail">{{ metric.detail }}</small>
+        <section class="depth-hero-card">
+          <span>Depth 摘要</span>
+          <strong>{{ depthDebugSummary }}</strong>
+          <small>z 轴差值只表示摄像头纵深方向差，不等于手臂长度。</small>
         </section>
-      </div>
+
+        <div class="depth-primary-grid">
+          <section
+            v-for="metric in depthPrimaryMetrics"
+            :key="metric.label"
+            class="depth-metric-card"
+          >
+            <span>{{ metric.label }}</span>
+            <strong>{{ metric.value }}</strong>
+            <small>{{ metric.detail }}</small>
+          </section>
+        </div>
+
+        <div class="depth-detail-grid">
+          <section
+            v-for="metric in depthDetailMetrics"
+            :key="metric.label"
+            class="depth-detail-card"
+          >
+            <span>{{ metric.label }}</span>
+            <strong>{{ metric.value }}</strong>
+            <small>{{ metric.detail }}</small>
+          </section>
+        </div>
+
+        <div class="depth-action-grid">
+          <section
+            v-for="metric in depthActionEvidenceMetrics"
+            :key="metric.label"
+            class="depth-action-card"
+          >
+            <span>{{ metric.label }}</span>
+            <strong>{{ metric.value }}</strong>
+            <small>{{ metric.detail }}</small>
+          </section>
+        </div>
+
+        <section class="depth-source-card">
+          <span>身体基准来源</span>
+          <strong>{{ bodyDepthSource }}</strong>
+        </section>
+      </section>
+
+      <details class="debug-panel">
+        <summary>
+          <span>运动估算指标</span>
+          <strong class="debug-status status-ready">折叠</strong>
+        </summary>
+        <div class="debug-body">
+          <label class="weight-field">
+            <span>体重 kg</span>
+            <input v-model.number="weightKg" type="number" min="20" max="200" />
+          </label>
+
+          <div class="metrics-grid">
+            <section
+              v-for="metric in metrics"
+              :key="metric.label"
+              class="metric-card"
+            >
+              <span>{{ metric.label }}</span>
+              <strong>{{ metric.value }}</strong>
+              <small v-if="metric.detail">{{ metric.detail }}</small>
+            </section>
+          </div>
+        </div>
+      </details>
 
       <details class="debug-panel">
         <summary>

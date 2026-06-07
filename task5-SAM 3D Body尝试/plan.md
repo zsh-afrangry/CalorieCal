@@ -1,32 +1,46 @@
-# Task5：SAM 3D Body 尝试
+# Task5：RGB-D 深度摄像头接入评估
 
 ## 本 task 要完成的内容
 
-探索 Meta 的 SAM 3D Body / 3DB 是否适合本项目。该能力更准确地说是单张 RGB 图像的全身人体网格恢复 Human Mesh Recovery，不是普通“图片转 3D 建模工具”。
+优先探索当前 Orbbec Astra Pro HD / ORBBEC Depth Sensor 是否能为项目提供真实纵深信息。用户已通过 OpenNI NiViewer 验证设备可用，并确认开启 device registration 的 depth -> image 后，可以看到 Image registration is on，且拖拽点位时能显示 2D distance 和 3D distance。
 
-本 task 只做技术可行性评估，不作为前期 MVP 的必要能力。当前主链路仍然是 MediaPipe Pose / Hand Landmarker；SAM 3D Body 只评估是否能补足遮挡、深度、身体比例和 3D 姿态理解，不急于接入实时前端。
+本 task 的重点从 SAM 3D Body 调整为 RGB-D 深度摄像头接入评估。SAM 3D Body 保留为备选研究路线，但当前更优先验证真实 depth 数据是否能改善前后方向运动、动作幅度、遮挡、身体比例和热量估算置信度。
+
+当前主链路仍然是 MediaPipe Pose / Hand Landmarker。RGB-D 摄像头不替代 MediaPipe，而是给 MediaPipe 的 2D 关键点补充 z/depth 信息。
 
 ## 预期结果
 
-1. 理解 SAM 3D Body 能输出什么，例如人体 mesh、身体姿态、手部和脚部结构。
-2. 判断它是否能改善本项目中的摄像头角度、遮挡、深度估计和身体比例问题。
-3. 评估其运行成本、模型体积、实时性、部署复杂度和浏览器端可用性。
-4. 给出是否进入后续正式开发的判断：立即使用、只做离线分析、或暂缓。
-5. 如果收益不明显，保留当前 MediaPipe 主链路，把 SAM 3D Body 作为后续研究方向。
+1. 跑通 Python / OpenNI 最小 depth 读取脚本，确认能读取 ORBBEC Depth Sensor 的 depth 帧。
+2. 确认 depth 单位、分辨率、帧率、中心点距离和静止抖动范围。
+3. 明确 depth -> image registration 对本项目的意义：MediaPipe 在 RGB 图上给出 x/y，depth 图在同一坐标系下补充 z。
+4. 评估 RGB-D 对前后方向动作的增益，例如手向前、手向后、出拳、身体前倾、身体后退。
+5. 给出后续接入判断：只做后端探针、接入 /pose 调试、接入 /demo 展示，或暂缓。
+6. SAM 3D Body 作为备选路线保留，后续只在真实 depth 摄像头收益不足时再评估。
+
+## 当前结论
+
+1. RGB-D depth 已经证明在正对摄像头时基本可用，可以补足手向前/手向后这类前后方向动作证据。
+2. 侧身时容易丢失稳定躯干基准，主要问题是 2D 姿态关键点可见性和身体参考面估计，不是单纯 depth 数值问题。
+3. SAM 3D Body / 3D 骨架恢复暂不接入实时 MVP 主链路，但保留为后续解决侧身、遮挡、躯干不可见问题的研究方向。
 
 ## 可能的实现方案和技术栈
 
-1. 技术验证：优先使用 Python 环境和官方仓库 / 论文提供的推理流程。
-2. 输入：单张图片或短视频抽帧。
-3. 输出：人体 3D mesh、可视化结果和关键指标说明。
-4. 对比：与 MediaPipe Pose 的 2D/3D landmarks 对比，判断对热量估算是否有实际增益。
-5. 集成：若后续采用，更可能作为后端离线分析或高级模式，不建议一开始放到浏览器实时推理。
-6. 当前优先验证官方仓库、论文、checkpoint、硬件需求和推理耗时，再决定是否写代码接入。
+1. 技术验证：Python + OpenNI2 / primesense binding，优先读取 depth 帧。
+2. 输入：Orbbec Astra Pro HD 的 RGB 画面和 ORBBEC Depth Sensor 的 depth 帧。
+3. 输出：中心点 depth、指定点 depth、depth 分辨率、有效深度比例。
+4. 对比：浏览器只能看到 Astra Pro HD Camera 的 RGB 视频，depth 需要 Python 后端或本地服务读取。
+5. 集成：前端继续用 MediaPipe 识别关键点；后端根据关键点 x/y 查询 depth，返回 z/depth 和置信度。
+6. 后续可选：HTTP / WebSocket depth 服务、/pose 调试面板、/#/demo 演示指标、SAM 3D Body 对比研究。
 
 ## 边界
 
 1. 不作为 Task1-Task4 的必要依赖。
 2. 不急于商业化或产品化。
-3. 不用它替代当前 MediaPipe 主链路。
-4. 如果模型过重、实时性不足或对 kcal 估算增益不明显，则暂缓。
-5. 不把 Task5 做成“为了使用新模型而使用新模型”；它必须服务运动时间、频率、幅度、强度、估算消耗和置信度。
+3. 不用 RGB-D 替代当前 MediaPipe 主链路，而是补充 z/depth。
+4. 不急于接入前端；先验证 Python 是否能稳定读取 depth。
+5. 如果 depth 抖动大、registration 不稳定或后端接入成本过高，则暂缓接入。
+6. 不把 Task5 做成“为了使用 3D 而使用 3D”；它必须服务运动时间、频率、幅度、强度、估算消耗和置信度。
+
+## SAM 3D Body 备选路线
+
+SAM 3D Body / 3DB 仍保留为后续研究方向。它更适合离线人体网格恢复或论文展示，不是当前实时演示链路的优先选择。若 RGB-D 摄像头方案无法满足需求，再回到 SAM 3D Body 做对比评估。

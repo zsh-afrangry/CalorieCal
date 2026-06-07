@@ -452,6 +452,105 @@ h1 {
   gap: 10px;
 }
 
+.depth-focus-panel {
+  border: 1px solid #99f6e4;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.depth-focus-header {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.depth-focus-header h2 {
+  color: #0f172a;
+  font-size: 22px;
+  line-height: 1.1;
+  margin: 0;
+}
+
+.depth-hero-card,
+.depth-metric-card,
+.depth-detail-card,
+.depth-action-card,
+.depth-source-card {
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+}
+
+.depth-hero-card {
+  background: #ecfdf5;
+  border-color: #99f6e4;
+}
+
+.depth-hero-card span,
+.depth-metric-card span,
+.depth-detail-card span,
+.depth-action-card span,
+.depth-source-card span {
+  color: #475569;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.depth-hero-card strong {
+  color: #0f172a;
+  font-size: 22px;
+  line-height: 1.22;
+}
+
+.depth-hero-card small,
+.depth-metric-card small,
+.depth-detail-card small,
+.depth-action-card small {
+  color: #64748b;
+  line-height: 1.35;
+}
+
+.depth-primary-grid,
+.depth-detail-grid,
+.depth-action-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.depth-metric-card strong {
+  color: #0f172a;
+  font-size: 36px;
+  line-height: 1;
+}
+
+.depth-detail-card strong {
+  color: #0f172a;
+  font-size: 26px;
+  line-height: 1.08;
+}
+
+.depth-action-card {
+  background: #f8fafc;
+}
+
+.depth-action-card strong {
+  color: #0f172a;
+  font-size: 24px;
+  line-height: 1.08;
+}
+
+.depth-source-card strong {
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .metric-section {
   border: 1px solid #e2e8f0;
   border-radius: 8px;

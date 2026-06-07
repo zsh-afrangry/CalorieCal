@@ -1,65 +1,181 @@
-# Task5 SAM 3D Body 尝试 — 实施清单
+# Task5 RGB-D 深度摄像头接入评估 — 实施清单
 
-> 状态：待开始。  
-> 目标：评估 Meta SAM 3D Body / 3DB 是否值得进入本项目，不默认替换当前 MediaPipe 主链路。  
-> 原则：先研究和验证，再决定是否接入；优先关注它是否能改善深度、遮挡、身体比例、3D 姿态和热量估算置信度。  
+> 状态：已开始。  
+> 目标：评估 Orbbec Astra Pro HD / ORBBEC Depth Sensor 是否能稳定输出真实 depth，并与当前 MediaPipe Pose / Hand 主链路融合。  
+> 原则：RGB-D 优先，SAM 3D Body 暂作备选；先跑通 Python 最小 depth 读取，再考虑前端接入。  
 
 ---
 
-## Phase 1: 范围确认和资料核对
+## Phase 1: RGB-D 范围确认和硬件验证
 
-- [ ] 1.1 核对官方资料
-      → 确认论文、官方仓库、checkpoint、许可证、硬件要求和推理流程
-      → 输出: 是否具备本地尝试条件
+- [x] 1.1 确认设备类型
+      → PnP 设备显示 Astra Pro HD Camera 和 ORBBEC Depth Sensor
+      → 浏览器 enumerateDevices 只能看到 Astra Pro HD Camera 和 Chicony USB2.0 Camera
+      → 结论: 浏览器只能直接读取 RGB；真实 depth 需要 OpenNI / SDK / Python 后端
 
-- [ ] 1.2 明确 Task5 不替换主链路
+- [x] 1.2 使用 NiViewer 验证 depth 可用
+      → 工具: OpenNI_2.3.0.86\Win64-Release\tools\NiViewer\NiViewer.exe
+      → 已观察: Image registration is off / on
+      → 已观察: Capture Formats - Depth: Lossless；Image: Lossy；IR: Lossless
+      → 已观察: 开启 device registration 的 depth -> image 后，显示 Image registration is on
+      → 已观察: 拖拽点位可显示 2D distance 和 3D distance
+
+- [x] 1.3 明确 Task5 不替换主链路
       → MediaPipe Pose / Hand 仍作为实时前端主链路
-      → SAM 3D Body 只作为 3D 人体网格恢复可行性评估
+      → RGB-D depth 用于补充关键点 z/depth，不替代 2D 关键点识别
 
-- [ ] 1.3 明确评估指标
-      → 运行成本、实时性、模型体积、安装复杂度、输出质量、对 kcal 估算是否有增益
+- [x] 1.4 明确评估指标
+      → depth 分辨率、帧率、单位、静止抖动、registration 对齐、前后方向动作增益、对 kcal 估算是否有帮助
 
-## Phase 2: 最小离线推理尝试
+## Phase 2: Python 最小 depth 读取
 
-- [ ] 2.1 准备 Python 环境方案
-      → 优先按官方仓库说明创建独立环境
+- [x] 2.1 准备 Python 环境方案
+      → 优先使用 OpenNI2 读取 depth 帧
       → 不污染 frontend 依赖
+      → 已完成: 新增 task5-SAM 3D Body尝试/openni_depth_probe.py
+      → 已调整: primesense binding 在当前 Python 环境 import 阶段报错，脚本已改为 ctypes 直接调用 OpenNI2.dll
+      → 已验证: python -m py_compile 通过
+      → 待用户执行: 安装 numpy 并运行探针脚本
 
-- [ ] 2.2 准备测试输入
-      → 使用单张人体图片或短视频抽帧
-      → 保留输入样例和输出路径说明
+- [x] 2.2 跑通中心点 depth 探针
+      → 读取一帧 depth
+      → 打印 depth 分辨率、中心点 depth、中心点附近有效深度中位数
+      → 目标: 输出类似 center depth = xxx mm
+      → 已完成: Python 探针成功读取 depth 帧
+      → 已观察: size=640x480，center=4518mm，median_r5=4518mm
 
-- [ ] 2.3 跑通一次官方推理
-      → 输出人体 mesh / 可视化结果 / 关键日志
-      → 如果硬件或 checkpoint 受限，记录阻塞原因
+- [x] 2.3 验证稳定性
+      → 手或身体静止时连续读取 100 帧
+      → 记录中心点或手掌区域 depth 的均值、最小值、最大值、标准差
+      → 判断是否足够支持前后方向运动
+      → 已完成: 连续 120 帧 valid_samples=120/120
+      → 已观察: median=4518mm，mean=4518.0mm，min=4518mm，max=4518mm，stdev=0.0mm
+      → 说明: 当前中心点测试非常稳定，后续还需在手掌近距离和不同位置继续测试
 
-## Phase 3: 与当前 MediaPipe 链路对比
+- [x] 2.4 支持指定采样点和 registration 尝试
+      → 已完成: openni_depth_probe.py 支持 --x / --y 像素采样点
+      → 已完成: 支持 --norm-x / --norm-y 归一化采样点，便于模拟 MediaPipe 坐标
+      → 已完成: 支持 --enable-registration 尝试开启 OpenNI depth -> color registration
+      → 已验证: python -m py_compile 通过
+      → 已观察: 使用 --enable-registration 时 oniDeviceSetProperty 返回 OniStatus=4
+      → 已调整: registration 失败时只输出 warning，不中断 depth 读取；脚本会打印实际加载的 OpenNI2.dll 路径和 registration 支持状态
+      → 已观察: 脚本曾自动加载 OpenNI_2.3.0.86\samples\bin\OpenNI2.dll，可能不是 NiViewer 使用的 DLL
+      → 已调整: OpenNI2.dll 自动查找策略优先 Win64-Release；新增 --list-dlls 用于列出 DLL 候选
 
-- [ ] 3.1 对比输出能力
-      → MediaPipe: 关键点、实时性、浏览器端可用
-      → SAM 3D Body: 3D mesh、身体表面、深度和比例信息
+- [x] 2.5 继续测试 raw depth 的前后方向变化
+      → 使用 --norm-x 0.5 --norm-y 0.5 采样中心点
+      → 手掌或身体进入中心区域后前后移动
+      → 观察 depth 是否随前后移动持续变化，并记录 0 值出现频率
+      → 说明: registration 对齐可以后续单独处理，raw depth 已足够先验证前后方向运动
+      → 已观察: 切换到 Win64-Release\tools\NiViewer\OpenNI2.dll 后，中心点 valid_samples=120/120
+      → 已观察: 中心点背景 depth 在 7824mm / 8007mm 间跳变，median=7824mm，mean=7909.4mm，stdev=91.3mm
+      → 已观察: --enable-registration 仍返回 OniStatus=4，但 raw depth 读取不受影响
+      → 已验收: 用户确认 depth 会随前后移动变化，可以进入下一步
 
-- [ ] 3.2 对比对热量估算的实际价值
-      → 判断是否能改善位移、幅度、前后方向动作、遮挡和置信度
-      → 不只看视觉效果好不好看
+- [ ] 2.6 单独处理 registration 开启失败
+      → 现象: registration_depth_to_color_supported=True，但 oniDeviceSetProperty(image_registration=depth_to_color) 返回 OniStatus=4
+      → 初步判断: 可能是 OpenNI C API 设置时机、stream 状态、DLL / driver 行为或 Astra 系列扩展参数问题
+      → 决策: 不阻塞 raw depth 前后方向验证；后续在 MediaPipe 坐标融合前再处理 RGB-depth 对齐
 
-- [ ] 3.3 记录部署成本
-      → 是否需要 GPU、是否适合后端、是否能实时、是否能在商场演示场景使用
+## Phase 3: 与当前 MediaPipe 链路融合设计
+
+- [x] 3.1 设计坐标融合方式
+      → 前端 MediaPipe 输出关键点 x/y
+      → 后端 OpenNI 在 registration 后的 depth 图上查询 x/y 附近 depth
+      → 返回关键点 z/depth 和有效性
+      → 已完成: 新增 openni_depth_server.py，支持按像素坐标或归一化坐标查询 depth
+      → 说明: 当前先基于 raw depth 查询；registration 对齐单独作为 2.6 问题继续跟踪
+
+- [x] 3.2 设计 depth API
+      → 可选 HTTP: 前端传关键点列表，后端返回 depth 列表
+      → 可选 WebSocket: 后端持续推送 depth 帧摘要或关键点 depth
+      → 已完成: 最小 HTTP API
+      → GET /health 返回服务状态
+      → GET /depth?normX=0.5&normY=0.5 返回单点 depth
+      → POST /depth 支持 points 列表，适配 MediaPipe 多关键点
+      → 已验证: python -m py_compile openni_depth_server.py 通过
+      → 已验收: Invoke-RestMethod http://127.0.0.1:8765/health 返回 ok=True
+      → 已验收: Invoke-RestMethod http://127.0.0.1:8765/depth?normX=0.5&normY=0.5 返回 width=640、height=480、medianDepthMm=7824、valid=True
+
+- [x] 3.3 明确优先优化动作
+      → 手向前 / 手向后
+      → 出拳
+      → 身体前倾 / 后退
+      → 前后方向运动幅度和置信度
+      → 当前优先级: 先验证左右手相对躯干的前后基础动作证据，再考虑出拳、身体前倾/后退等组合动作
+
+- [x] 3.4 前端接入 depth server 调试展示
+      → /pose 向 http://127.0.0.1:8765/depth 发送少量 MediaPipe 关键点
+      → 先查询 leftWrist、rightWrist、leftShoulder、rightShoulder
+      → 展示左右手腕 depth、肩部基准 depth、手腕相对身体前后偏移
+      → 只做调试显示，不改变动作识别、计数、MET 或 kcal 逻辑
+      → 已完成: PoseView 新增 depth server 调试请求，约每 250ms 请求一次
+      → 已完成: 姿态调试面板展示 Depth 服务、Depth 摘要、Depth 帧尺寸、左右手腕 depth、身体基准 depth、左右手前后偏移
+      → 已完成: 未检测到人体或姿态推理失败时清空 depth 调试状态
+      → 已验证: npm.cmd --prefix frontend run build 通过
+      → 已验证: python -m py_compile openni_depth_server.py 通过
+
+- [x] 3.5 前后方向基础动作验证
+      → 验证手向前时 wrist depth 小于 shoulder depth
+      → 验证手回收或后移时 wrist depth 接近或大于 shoulder depth
+      → 记录 registration 未开启导致的坐标偏差
+      → 已实现第一版采样偏差缓解: depth server 返回 foregroundDepthMm、validRatio、foregroundCandidate
+      → 已实现第一版采样偏差缓解: 后端默认在关键点周围 searchRadius=35 的窗口内寻找更靠近摄像头的前景候选
+      → 已实现第一版采样偏差缓解: 前端手腕 depth 优先使用 foregroundDepthMm，身体基准仍使用肩部中心中位数
+      → 已新增调试字段: 左手采样来源、右手采样来源
+      → 已观察: 手腕与身体基准 z 轴差值可能被误解为“手长”；该值只表示摄像头纵深方向差值
+      → 已调整: 前端显示文案由“前后偏移”改为“z 轴差值”
+      → 已调整: 身体基准由单纯肩部均值改为肩、髋、肩中心、髋中心、躯干中心的稳健中位基准
+      → 已新增调试字段: 身体基准来源
+      → 已调整: /pose 右侧进入 Depth 测试优先展示，depth 大卡常显，运动估算指标、视觉模型、姿态调试默认折叠
+      → 已调整: 左右手腕 depth、身体基准 depth、z 轴差值、采样来源放大显示，便于测试 RGB-D 采样偏差
+      → 已新增: depth 基础动作证据卡，将左右手 z 轴差值转成“手前移 / 手后移 / 接近平面 / 暂不采信”和 0~100 证据分数
+      → 说明: depth 证据暂时只做展示和验证，不改写原有全身动作识别、计数、MET 或 kcal 逻辑
+      → 已验收: 正对摄像头时，手前移/手后移 depth 证据与实际动作基本一致
+      → 已观察: 侧身时容易识别不到稳定躯干，导致身体基准 depth 不稳定；这是 2D 姿态关键点可见性和躯干参考点问题，不是单纯 depth 数值问题
+      → 已验证: npm.cmd --prefix frontend run build 通过
+      → 已验证: python -m py_compile openni_depth_server.py 通过
 
 ## Phase 4: 结论和后续方案
 
-- [ ] 4.1 给出接入判断
-      → 立即使用 / 只做离线分析 / 暂缓
+- [x] 4.1 给出接入判断
+      → 接入 /pose 调试 / 接入 /demo 演示 / 只保留探针 / 暂缓
+      → 结论: RGB-D depth 不应只保留探针，建议继续接入 /pose 调试，并后续接入 /demo 演示
+      → 理由: 正对摄像头时，depth 能补足 RGB 难以判断的前后方向运动，可服务“手前移/手后移/出拳/前倾后退”的证据评分
 
-- [ ] 4.2 如果暂缓，记录原因
-      → 例如模型过重、实时性不足、安装复杂、对 kcal 增益不明显
+- [x] 4.2 如果暂缓，记录原因
+      → 例如 depth 抖动大、registration 不稳定、Python 依赖复杂、实时性不足
+      → 当前不整体暂缓 RGB-D；但 registration 开启失败、侧身躯干基准不稳定、Python 后端依赖复杂需要作为风险保留
+      → 侧身问题后续可考虑更稳的 3D 骨架/人体 mesh、多相机、或使用更多躯干候选点和历史基准缓冲处理
 
-- [ ] 4.3 如果继续，拆分后续任务
-      → 后端推理服务、前端 mesh 可视化、与 MediaPipe 特征融合、置信度融合
+- [x] 4.3 如果继续，拆分后续任务
+      → Python depth 服务、前端关键点 depth 请求、/pose 调试展示、/#/demo 演示展示、置信度融合
+      → 后续任务 1: 将 depth 前后证据纳入多运动证据评分，但先只作为独立证据，不抢占原有动作识别
+      → 后续任务 2: /demo 增加 depth 状态提示，让商场屏幕能展示“前后运动/空间幅度/置信度”
+      → 后续任务 3: 继续研究侧身和遮挡场景，判断是否需要 SAM 3D Body / 3D 骨架恢复作为补充
 
-- [ ] 4.4 构建或脚本验证
+- [x] 4.4 构建或脚本验证
       → 如修改前端，执行 npm.cmd --prefix frontend run build
       → 如新增 Python 脚本，执行对应最小运行或语法检查
+      → 当前阶段为文档和验收结论收敛；上一轮前端构建和 Python 语法检查已通过
+
+## Phase 5: SAM 3D Body 备选研究
+
+- [x] 5.1 保留 SAM 3D Body 资料核对
+      → 确认论文、官方仓库、checkpoint、许可证、硬件要求和推理流程
+      → 说明: 仅在 RGB-D 方案收益不足时继续
+      → 已核对: 官方仓库为 facebookresearch/sam-3d-body，提供推理代码、checkpoint 下载链接和示例 notebook
+      → 已核对: 论文说明 3DB 是单张 RGB 图像的 full-body human mesh recovery，支持 2D keypoints / masks 等 prompt
+      → 已核对: 官方介绍强调对遮挡、少见姿态、复杂视角有更强鲁棒性，但手部精度仍不超过专门的 hand-only 模型
+      → 记录: checkpoint 需要 Hugging Face 下载/访问，实际接入前还要单独评估显存、速度、许可证和部署复杂度
+
+- [x] 5.2 判断是否需要人体 mesh
+      → 若真实 depth 已能解决前后方向运动和置信度，SAM 3D Body 暂缓
+      → 若需要人体表面 / 3D mesh / 离线论文展示，再单独推进
+      → 当前判断: 暂不把 SAM 3D Body 接入实时 MVP 主链路
+      → 理由: 当前 RGB-D 在正对摄像头时已能提供可解释的前后动作证据，且更贴近实时商场演示
+      → 保留价值: 侧身、遮挡、躯干基准丢失时，SAM 3D Body / 3D 骨架恢复可能提供更稳定的身体参考面
+      → 后续路线: 先继续 RGB-D + MediaPipe 融合；若侧身验收成为核心需求，再建立 SAM 3D Body 离线对比实验
 
 ---
 
@@ -67,8 +183,12 @@
 
 ### Task5 的定位
 
-Task5 是研究型任务，不是 MVP 必须项。它的价值必须落到运动时间、频率、幅度、强度、估算消耗和置信度，而不是单纯展示 3D 人体模型。
+Task5 是 RGB-D 深度接入评估，不是为了展示 3D 模型。它的价值必须落到运动时间、频率、幅度、强度、估算消耗和置信度，尤其是补足普通 RGB 摄像头难以判断的前后方向运动。
 
-### 可能的结论
+### SAM 3D Body 位置
 
-如果 SAM 3D Body 对实时性和部署成本不友好，短期可以继续使用 MediaPipe 主链路，把 SAM 3D Body 留作离线分析或论文展示方向。
+SAM 3D Body 保留为备选研究方向。当前已有可用 Orbbec RGB-D 摄像头，因此优先评估真实 depth 硬件，而不是先从单张 RGB 估计人体 mesh。
+
+### 侧身和遮挡记录
+
+当前 RGB-D 前后证据在正对摄像头时基本可用，但侧身时容易丢失稳定躯干基准。后续 3D Body / 3D 骨架方案的价值主要在这里：改善侧身、遮挡、躯干不可见时的身体参考面估计，而不是替代已经可用的正面 depth 证据。

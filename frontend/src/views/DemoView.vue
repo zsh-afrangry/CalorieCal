@@ -8,18 +8,10 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 type CameraStatus = "idle" | "loading" | "ready" | "error";
 type ModelStatus = "idle" | "loading" | "ready" | "error";
-type PoseStatus = "idle" | "detecting" | "detected" | "missing";
+type PoseStatus = "idle" | "detected" | "missing";
 type JumpingJackState = "unknown" | "closed" | "open";
-type JumpingJackRuntimeStatus = "idle" | "running" | "paused";
-type JumpingJackCounterPhase = "waiting_closed" | "ready" | "opened";
 type FullBodyIntensityLevel = "静止" | "低强度" | "中强度" | "高强度";
 type ConfidenceLevel = "高" | "中" | "低";
-
-type MetricCard = {
-  label: string;
-  value: string;
-  detail?: string;
-};
 
 type LandmarkPoint = {
   x: number;
@@ -63,6 +55,12 @@ type BasicActionCandidate = {
   reason: string;
 };
 
+type DemoMetric = {
+  label: string;
+  value: string;
+  detail: string;
+};
+
 const CAMERA_CONSTRAINTS: MediaStreamConstraints = {
   video: {
     facingMode: "user",
@@ -83,8 +81,19 @@ const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
 const SMOOTHING_WINDOW_SIZE = 5;
 const FULL_BODY_HISTORY_MS = 1200;
 const FULL_BODY_ACTIVE_DISTANCE_THRESHOLD = 0.04;
-const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
+const DEMO_WEIGHT_KG = 60;
 const MIN_LANDMARK_VISIBILITY = 0.5;
+const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
+const DISPLAY_FACE_LANDMARK_INDICES = [0, 3, 6, 9, 10];
+const MIN_SHOULDER_WIDTH = 0.04;
+const FOOT_OPEN_SHOULDER_RATIO = 1.15;
+const FOOT_CLOSED_SHOULDER_RATIO = 0.85;
+const WRIST_OPEN_SHOULDER_RATIO = 1.15;
+const WRIST_CLOSED_SHOULDER_RATIO = 1.0;
+const ARM_OPEN_MAX_TORSO_RATIO = 0.25;
+const ARM_CLOSED_MIN_TORSO_RATIO = 0.38;
+const ACTION_DEBOUNCE_FRAMES = 3;
+const COMPOSITE_ACTION_HOLD_MS = 900;
 const LANDMARK_INDEX = {
   leftShoulder: 11,
   rightShoulder: 12,
@@ -135,14 +144,6 @@ const TORSO_TRACKED_KEYS: FullBodyTrackedKey[] = [
   "leftHip",
   "rightHip",
 ];
-const MIN_SHOULDER_WIDTH = 0.04;
-const FOOT_OPEN_SHOULDER_RATIO = 1.15;
-const FOOT_CLOSED_SHOULDER_RATIO = 0.85;
-const WRIST_OPEN_SHOULDER_RATIO = 1.15;
-const WRIST_CLOSED_SHOULDER_RATIO = 1.0;
-const ARM_OPEN_MAX_TORSO_RATIO = 0.25;
-const ARM_CLOSED_MIN_TORSO_RATIO = 0.38;
-const ACTION_DEBOUNCE_FRAMES = 3;
 const POSE_CONNECTIONS = [
   [11, 12],
   [11, 13],
@@ -196,21 +197,6 @@ const poseStatus = ref<PoseStatus>("idle");
 const inferenceFps = ref(0);
 const handCount = ref(0);
 const landmarkCompleteness = ref(0);
-const rawLandmarkState = ref("等待推理");
-const smoothedLandmarkState = ref("等待平滑数据");
-const feetState = ref<JumpingJackState>("unknown");
-const armsState = ref<JumpingJackState>("unknown");
-const instantJumpingJackState = ref<JumpingJackState>("unknown");
-const jumpingJackState = ref<JumpingJackState>("unknown");
-const jumpingJackRuntimeStatus = ref<JumpingJackRuntimeStatus>("idle");
-const jumpingJackCounterPhase =
-  ref<JumpingJackCounterPhase>("waiting_closed");
-const jumpingJackCount = ref(0);
-const jumpingJackElapsedMs = ref(0);
-const jumpingJackCounterReason = ref("点击开始后，从双脚合拢和双臂回落开始记录。");
-const weightKg = ref(60);
-const actionStateReason = ref("等待完整关键点");
-const actionDebounceProgress = ref("0/3");
 const fullBodyJointState = ref("等待全身关键点");
 const fullBodyMotionFeatures = ref<FullBodyMotionFeatures>({
   movementDistance: 0,
@@ -224,6 +210,12 @@ const fullBodyMotionFeatures = ref<FullBodyMotionFeatures>({
 const fullBodyActivityScore = ref(0);
 const fullBodyIntensityLevel = ref<FullBodyIntensityLevel>("静止");
 const fullBodyBasicActions = ref<BasicActionCandidate[]>([]);
+const feetState = ref<JumpingJackState>("unknown");
+const armsState = ref<JumpingJackState>("unknown");
+const jumpingJackState = ref<JumpingJackState>("unknown");
+const compositeActionLabel = ref("未识别组合动作");
+const compositeActionDetail = ref("等待组合动作证据");
+const lastCompositeEvidenceAt = ref(0);
 
 let stream: MediaStream | null = null;
 let animationFrameId: number | null = null;
@@ -237,7 +229,6 @@ let smoothedLandmarks: LandmarkPoint[] | null = null;
 let latestHands: LandmarkPoint[][] = [];
 let pendingJumpingJackState: JumpingJackState = "unknown";
 let pendingJumpingJackFrames = 0;
-let lastJumpingJackRuntimeAt = 0;
 const landmarkHistory: LandmarkPoint[][] = [];
 const fullBodyMotionHistory: FullBodyMotionSample[] = [];
 
@@ -271,37 +262,7 @@ const currentFullBodyMet = computed(() => {
 const fullBodyCalories = computed(() => {
   const activeMinutes = fullBodyMotionFeatures.value.activeFullBodyMs / 60_000;
 
-  return (currentFullBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200;
-});
-
-const jumpingJackFrequencyPerMin = computed(() => {
-  const elapsedMinutes = jumpingJackElapsedMs.value / 60_000;
-
-  return elapsedMinutes > 0 ? jumpingJackCount.value / elapsedMinutes : 0;
-});
-
-const currentJumpingJackMet = computed(() => {
-  const frequency = jumpingJackFrequencyPerMin.value;
-
-  if (!jumpingJackCount.value || !jumpingJackElapsedMs.value) {
-    return 0;
-  }
-
-  if (frequency > 50) {
-    return 10.0;
-  }
-
-  if (frequency > 30) {
-    return 8.0;
-  }
-
-  return 6.0;
-});
-
-const jumpingJackCalories = computed(() => {
-  const elapsedMinutes = jumpingJackElapsedMs.value / 60_000;
-
-  return (currentJumpingJackMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200;
+  return (currentFullBodyMet.value * 3.5 * DEMO_WEIGHT_KG * activeMinutes) / 200;
 });
 
 const fullBodyTrackedCompleteness = computed(() => {
@@ -326,16 +287,14 @@ const fullBodyConfidence = computed<ConfidenceLevel>(() => {
   if (
     landmarkCompleteness.value >= 85 &&
     fullBodyTrackedCompleteness.value >= 80 &&
-    fullBodyMotionFeatures.value.activeFullBodyMs >= 5000 &&
-    fullBodyActivityScore.value >= 35
+    fullBodyMotionHistory.length >= 3
   ) {
     return "高";
   }
 
   if (
     landmarkCompleteness.value >= 60 &&
-    fullBodyTrackedCompleteness.value >= 60 &&
-    fullBodyMotionHistory.length >= 3
+    fullBodyTrackedCompleteness.value >= 60
   ) {
     return "中";
   }
@@ -343,7 +302,7 @@ const fullBodyConfidence = computed<ConfidenceLevel>(() => {
   return "低";
 });
 
-const fullBodyConfidenceReasons = computed(() => {
+const fullBodyConfidenceSummary = computed(() => {
   const reasons: string[] = [];
 
   if (poseStatus.value !== "detected") {
@@ -355,231 +314,121 @@ const fullBodyConfidenceReasons = computed(() => {
   }
 
   if (landmarkCompleteness.value < 60) {
-    reasons.push("开合跳关键点完整率较低");
-  } else if (landmarkCompleteness.value >= 85) {
-    reasons.push("开合跳关键点较完整");
+    reasons.push("关键点完整率较低");
   }
 
   if (fullBodyTrackedCompleteness.value < 60) {
     reasons.push("全身跟踪关键点不足");
-  } else if (fullBodyTrackedCompleteness.value >= 80) {
-    reasons.push("全身关键点覆盖较好");
   }
 
-  if (fullBodyMotionFeatures.value.activeFullBodyMs < 3000) {
+  if (
+    fullBodyMotionFeatures.value.activeFullBodyMs < 1000 &&
+    fullBodyActivityScore.value > 0
+  ) {
     reasons.push("有效活动时间较短");
   }
 
-  if (
-    fullBodyActivityScore.value < 15 &&
-    fullBodyMotionFeatures.value.activeFullBodyMs > 0
-  ) {
-    reasons.push("全身运动量较小");
-  }
-
-  if (fullBodyMotionFeatures.value.movementAmplitude < 0.04) {
-    reasons.push("全身动作幅度较小");
-  }
-
   if (!reasons.length) {
-    reasons.push("关键点和运动量信号稳定");
+    reasons.push("人体入镜和运动信号稳定");
   }
 
-  return reasons;
+  return reasons.slice(0, 2).join("；");
 });
 
-const fullBodyConfidenceSummary = computed(() =>
-  fullBodyConfidenceReasons.value.slice(0, 3).join("；"),
-);
-
-const jumpingJackQualityFeedback = computed(() => {
-  const feedback: string[] = [];
-
-  if (jumpingJackRuntimeStatus.value === "idle") {
-    feedback.push("点击开始后再评估开合跳周期");
+const systemStatusText = computed(() => {
+  if (cameraStatus.value !== "ready") {
+    return cameraMessage.value;
   }
 
+  if (modelStatus.value !== "ready") {
+    return modelMessage.value;
+  }
+
+  if (poseStatus.value === "missing") {
+    return "请站到画面中央，保持身体主要关节入镜。";
+  }
+
+  if (poseStatus.value === "detected") {
+    return "正在实时估算全身运动强度。";
+  }
+
+  return "等待人体入镜。";
+});
+
+const motionSuggestion = computed(() => {
   if (poseStatus.value !== "detected") {
-    feedback.push("请保持全身入镜");
+    return "人体进入画面后开始估算";
   }
 
-  if (landmarkCompleteness.value < 75) {
-    feedback.push("肩、腕、髋、踝关键点不够完整");
+  if (fullBodyConfidence.value === "低") {
+    return "请让肩、髋、膝、踝尽量完整入镜";
   }
 
-  if (jumpingJackRuntimeStatus.value === "running") {
-    if (feetState.value !== "open" && jumpingJackCounterPhase.value === "ready") {
-      feedback.push("准备 open 阶段时双脚打开幅度可能不足");
-    }
-
-    if (armsState.value !== "open" && jumpingJackCounterPhase.value === "ready") {
-      feedback.push("准备 open 阶段时手臂抬起或打开不足");
-    }
-
-    if (jumpingJackCounterPhase.value === "waiting_closed") {
-      feedback.push("先回到双脚合拢和双臂回落的起始姿势");
-    }
-
-    if (jumpingJackCount.value < 2 && jumpingJackElapsedMs.value > 5000) {
-      feedback.push("完整周期样本较少，频率和 kcal 仅供参考");
-    }
+  if (fullBodyIntensityLevel.value === "静止") {
+    return "当前运动量较低";
   }
 
-  if (
-    jumpingJackFrequencyPerMin.value > 0 &&
-    (jumpingJackFrequencyPerMin.value < 10 || jumpingJackFrequencyPerMin.value > 80)
-  ) {
-    feedback.push("当前开合跳频率可能不稳定");
+  if (fullBodyIntensityLevel.value === "高强度") {
+    return "当前全身参与度较高";
   }
 
-  if (!feedback.length) {
-    feedback.push("开合跳周期信号正常");
-  }
-
-  return feedback;
+  return "当前运动信号正常";
 });
 
-const jumpingJackQualitySummary = computed(() =>
-  jumpingJackQualityFeedback.value.slice(0, 3).join("；"),
-);
-
-const metrics = computed<MetricCard[]>(() => [
+const primaryMetrics = computed<DemoMetric[]>(() => [
   {
-    label: "开合跳次数",
-    value: String(jumpingJackCount.value),
-    detail: "组合动作计数",
-  },
-  {
-    label: "开合跳时长",
-    value: formatElapsedTime(jumpingJackElapsedMs.value),
-    detail: jumpingJackRuntimeStatus.value,
-  },
-  {
-    label: "开合跳频率",
-    value: jumpingJackFrequencyPerMin.value.toFixed(1),
-    detail: "次/分钟",
-  },
-  {
-    label: "开合跳 MET",
-    value: currentJumpingJackMet.value.toFixed(1),
-    detail: "组合动作示例",
-  },
-  {
-    label: "开合跳 kcal",
-    value: jumpingJackCalories.value.toFixed(2),
-    detail: "组合动作估算",
-  },
-  {
-    label: "组合动作阶段",
-    value: jumpingJackCounterPhase.value,
-    detail: jumpingJackCounterReason.value,
-  },
-  {
-    label: "动作",
-    value: jumpingJackState.value,
-    detail: `脚 ${feetState.value} / 手 ${armsState.value}`,
-  },
-  {
-    label: "全身活动时长",
-    value: formatElapsedTime(fullBodyMotionFeatures.value.activeFullBodyMs),
-    detail: "有效活动",
-  },
-  {
-    label: "全身 MET",
-    value: currentFullBodyMet.value.toFixed(1),
-    detail: fullBodyIntensityLevel.value,
-  },
-  {
-    label: "全身 kcal",
-    value: fullBodyCalories.value.toFixed(2),
-    detail: "通用活动估算",
-  },
-  {
-    label: "全身估算置信度",
-    value: fullBodyConfidence.value,
-    detail: fullBodyConfidenceSummary.value,
-  },
-  {
-    label: "动作质量反馈",
-    value: jumpingJackQualitySummary.value,
-    detail: "开合跳示例",
-  },
-  {
-    label: "全身活动分数",
-    value: String(fullBodyActivityScore.value),
-    detail: fullBodyIntensityLevel.value,
-  },
-  {
-    label: "基本动作候选",
+    label: "当前基本动作",
     value: topFullBodyBasicActionsText.value,
-    detail: "非唯一动作名",
+    detail: "可同时存在多个基础动作证据",
   },
+  {
+    label: "当前组合动作",
+    value: compositeActionLabel.value,
+    detail: compositeActionDetail.value,
+  },
+  {
+    label: "当前强度",
+    value: fullBodyIntensityLevel.value,
+    detail: `活动分数 ${fullBodyActivityScore.value}`,
+  },
+  {
+    label: "估算消耗",
+    value: `${fullBodyCalories.value.toFixed(2)} kcal`,
+    detail: `按 ${DEMO_WEIGHT_KG} kg 演示估算`,
+  },
+]);
+
+const motionMetrics = computed<DemoMetric[]>(() => [
   {
     label: "全身位移",
     value: fullBodyMotionFeatures.value.movementDistance.toFixed(3),
-    detail: "最近帧",
+    detail: "最近帧归一化位移",
   },
   {
     label: "全身速度",
     value: fullBodyMotionFeatures.value.movementSpeed.toFixed(2),
-    detail: "归一化/秒",
+    detail: "归一化 / 秒",
   },
   {
     label: "全身幅度",
     value: fullBodyMotionFeatures.value.movementAmplitude.toFixed(3),
-    detail: "1.2秒窗口",
+    detail: "1.2 秒窗口",
   },
-]);
-
-const modelDetails = computed(() => [
-  { label: "tasks-vision", value: MEDIAPIPE_TASKS_VERSION },
-  { label: "wasm", value: MEDIAPIPE_WASM_URL },
-  { label: "pose model", value: POSE_LANDMARKER_MODEL_URL },
-  { label: "hand model", value: HAND_LANDMARKER_MODEL_URL },
-]);
-
-const poseDebugDetails = computed(() => [
-  { label: "人体检测", value: poseStatus.value },
-  { label: "检测到手数", value: String(handCount.value) },
-  { label: "手部模型", value: handModelStatus.value },
-  { label: "关键点完整率", value: `${landmarkCompleteness.value.toFixed(0)}%` },
-  { label: "实际推理 FPS", value: inferenceFps.value.toFixed(1) },
-  { label: "目标推理 FPS", value: `${TARGET_INFERENCE_FPS}` },
-  { label: "显示镜像", value: "video/canvas scaleX(-1)" },
-  { label: "算法坐标", value: "MediaPipe 原始坐标" },
-  { label: "原始关键点", value: rawLandmarkState.value },
-  { label: "平滑关键点", value: smoothedLandmarkState.value },
-  { label: "脚部状态", value: feetState.value },
-  { label: "手臂状态", value: armsState.value },
-  { label: "即时动作状态", value: instantJumpingJackState.value },
-  { label: "稳定动作状态", value: jumpingJackState.value },
-  { label: "开合跳记录", value: jumpingJackRuntimeStatus.value },
-  { label: "开合跳次数", value: String(jumpingJackCount.value) },
-  { label: "开合跳时长", value: formatElapsedTime(jumpingJackElapsedMs.value) },
-  { label: "开合跳频率", value: jumpingJackFrequencyPerMin.value.toFixed(1) },
-  { label: "开合跳 MET", value: currentJumpingJackMet.value.toFixed(1) },
-  { label: "开合跳 kcal", value: jumpingJackCalories.value.toFixed(2) },
-  { label: "组合动作阶段", value: jumpingJackCounterPhase.value },
-  { label: "组合动作计数", value: jumpingJackCounterReason.value },
-  { label: "防抖进度", value: actionDebounceProgress.value },
-  { label: "状态判断", value: actionStateReason.value },
-  { label: "全身关键点", value: fullBodyJointState.value },
-  { label: "全身活动分数", value: String(fullBodyActivityScore.value) },
-  { label: "全身强度档位", value: fullBodyIntensityLevel.value },
-  { label: "全身 MET", value: currentFullBodyMet.value.toFixed(1) },
-  { label: "全身 kcal", value: fullBodyCalories.value.toFixed(2) },
-  { label: "全身跟踪完整率", value: `${fullBodyTrackedCompleteness.value.toFixed(0)}%` },
-  { label: "全身估算置信度", value: fullBodyConfidence.value },
-  { label: "置信度原因", value: fullBodyConfidenceSummary.value },
-  { label: "质量反馈", value: jumpingJackQualitySummary.value },
-  { label: "基本动作候选", value: topFullBodyBasicActionsText.value },
-  { label: "全身位移", value: fullBodyMotionFeatures.value.movementDistance.toFixed(3) },
-  { label: "上肢位移", value: fullBodyMotionFeatures.value.upperBodyDistance.toFixed(3) },
-  { label: "下肢位移", value: fullBodyMotionFeatures.value.lowerBodyDistance.toFixed(3) },
-  { label: "躯干位移", value: fullBodyMotionFeatures.value.torsoDistance.toFixed(3) },
-  { label: "全身速度", value: fullBodyMotionFeatures.value.movementSpeed.toFixed(2) },
-  { label: "全身幅度", value: fullBodyMotionFeatures.value.movementAmplitude.toFixed(3) },
-  { label: "全身活动时长", value: formatElapsedTime(fullBodyMotionFeatures.value.activeFullBodyMs) },
+  {
+    label: "有效活动",
+    value: formatElapsedTime(fullBodyMotionFeatures.value.activeFullBodyMs),
+    detail: "超过阈值后累计",
+  },
+  {
+    label: "识别质量",
+    value: fullBodyConfidence.value,
+    detail: fullBodyConfidenceSummary.value,
+  },
+  {
+    label: "全身关键点",
+    value: fullBodyJointState.value,
+    detail: `完整率 ${landmarkCompleteness.value.toFixed(0)}%`,
+  },
 ]);
 
 function getCameraErrorMessage(error: unknown) {
@@ -624,14 +473,11 @@ function stopCamera() {
   poseStatus.value = "idle";
   inferenceFps.value = 0;
   landmarkCompleteness.value = 0;
-  rawLandmarkState.value = "等待推理";
-  smoothedLandmarkState.value = "等待平滑数据";
   landmarkHistory.length = 0;
   smoothedLandmarks = null;
   latestHands = [];
   handCount.value = 0;
   resetJumpingJackAnalysis("等待完整关键点");
-  resetJumpingJackCounter();
   resetFullBodyMotionFeatures();
 }
 
@@ -659,21 +505,20 @@ async function loadHandLandmarker() {
     handLandmarker = await HandLandmarker.createFromOptions(vision, {
       baseOptions: {
         modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-        delegate: "GPU",
       },
       runningMode: "VIDEO",
       numHands: 2,
+      minHandDetectionConfidence: 0.45,
+      minHandPresenceConfidence: 0.45,
+      minTrackingConfidence: 0.45,
     });
 
     handModelStatus.value = "ready";
-    handModelMessage.value = "手部模型已就绪，将叠加 21 点手部骨架。";
+    handModelMessage.value = "手部模型已就绪";
   } catch (error) {
-    disposeHandLandmarker();
     handModelStatus.value = "error";
     handModelMessage.value =
-      error instanceof Error
-        ? `手部模型加载失败：${error.message}`
-        : "手部模型加载失败，请检查网络和模型资源路径。";
+      error instanceof Error ? error.message : "手部模型加载失败";
   }
 }
 
@@ -691,21 +536,20 @@ async function loadPoseLandmarker() {
     poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
       baseOptions: {
         modelAssetPath: POSE_LANDMARKER_MODEL_URL,
-        delegate: "GPU",
       },
       runningMode: "VIDEO",
       numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
     });
 
     modelStatus.value = "ready";
-    modelMessage.value = "姿态模型已就绪，下一步将接入逐帧推理。";
+    modelMessage.value = "姿态模型已就绪";
   } catch (error) {
-    disposePoseLandmarker();
     modelStatus.value = "error";
     modelMessage.value =
-      error instanceof Error
-        ? `姿态模型加载失败：${error.message}`
-        : "姿态模型加载失败，请检查网络和模型资源路径。";
+      error instanceof Error ? error.message : "姿态模型加载失败";
   }
 }
 
@@ -721,39 +565,39 @@ function toLandmarkPoints(landmarks: LandmarkPoint[]) {
 function updateSmoothedLandmarks(landmarks: LandmarkPoint[]) {
   landmarkHistory.push(toLandmarkPoints(landmarks));
 
-  if (landmarkHistory.length > SMOOTHING_WINDOW_SIZE) {
+  while (landmarkHistory.length > SMOOTHING_WINDOW_SIZE) {
     landmarkHistory.shift();
   }
 
-  smoothedLandmarks = landmarks.map((_, index) => {
+  const landmarkCount = landmarks.length;
+
+  smoothedLandmarks = Array.from({ length: landmarkCount }, (_, index) => {
     const points = landmarkHistory
-      .map((frame) => frame[index])
+      .map((sample) => sample[index])
       .filter((point): point is LandmarkPoint => Boolean(point));
-    const count = points.length || 1;
+    const total = points.reduce<{ x: number; y: number; z: number; visibility: number }>(
+      (acc, point) => ({
+        x: acc.x + point.x,
+        y: acc.y + point.y,
+        z: acc.z + (point.z ?? 0),
+        visibility: acc.visibility + (point.visibility ?? 1),
+      }),
+      { x: 0, y: 0, z: 0, visibility: 0 },
+    );
 
     return {
-      x: points.reduce((sum, point) => sum + point.x, 0) / count,
-      y: points.reduce((sum, point) => sum + point.y, 0) / count,
-      z: points.reduce((sum, point) => sum + (point.z ?? 0), 0) / count,
-      visibility:
-        points.reduce((sum, point) => sum + (point.visibility ?? 1), 0) /
-        count,
+      x: total.x / points.length,
+      y: total.y / points.length,
+      z: total.z / points.length,
+      visibility: total.visibility / points.length,
     };
   });
 }
 
 function updateLandmarkCompleteness(landmarks: LandmarkPoint[]) {
-  const visibleCount = REQUIRED_LANDMARK_INDICES.filter((index) => {
-    const landmark = landmarks[index];
-    return (
-      landmark &&
-      (landmark.visibility ?? 1) >= MIN_LANDMARK_VISIBILITY &&
-      landmark.x >= 0 &&
-      landmark.x <= 1 &&
-      landmark.y >= 0 &&
-      landmark.y <= 1
-    );
-  }).length;
+  const visibleCount = REQUIRED_LANDMARK_INDICES.filter((index) =>
+    isVisibleLandmark(landmarks[index]),
+  ).length;
 
   landmarkCompleteness.value =
     (visibleCount / REQUIRED_LANDMARK_INDICES.length) * 100;
@@ -767,10 +611,10 @@ function updateInferenceFps(now: number) {
     return;
   }
 
-  const elapsed = now - lastFpsSampleAt;
+  const elapsedMs = now - lastFpsSampleAt;
 
-  if (elapsed >= 1000) {
-    inferenceFps.value = (inferenceFrameCount * 1000) / elapsed;
+  if (elapsedMs >= 1000) {
+    inferenceFps.value = (inferenceFrameCount * 1000) / elapsedMs;
     inferenceFrameCount = 0;
     lastFpsSampleAt = now;
   }
@@ -779,112 +623,15 @@ function updateInferenceFps(now: number) {
 function resetJumpingJackAnalysis(reason: string) {
   feetState.value = "unknown";
   armsState.value = "unknown";
-  instantJumpingJackState.value = "unknown";
   jumpingJackState.value = "unknown";
-  actionStateReason.value = reason;
   pendingJumpingJackState = "unknown";
   pendingJumpingJackFrames = 0;
-  actionDebounceProgress.value = `0/${ACTION_DEBOUNCE_FRAMES}`;
-}
-
-function resetJumpingJackCounter() {
-  jumpingJackRuntimeStatus.value = "idle";
-  jumpingJackCounterPhase.value = "waiting_closed";
-  jumpingJackCount.value = 0;
-  jumpingJackElapsedMs.value = 0;
-  lastJumpingJackRuntimeAt = 0;
-  jumpingJackCounterReason.value = "点击开始后，从双脚合拢和双臂回落开始记录。";
-}
-
-function startJumpingJackRecording() {
-  if (jumpingJackRuntimeStatus.value === "running") {
-    return;
-  }
-
-  jumpingJackRuntimeStatus.value = "running";
-  lastJumpingJackRuntimeAt = performance.now();
-
-  if (jumpingJackCounterPhase.value === "waiting_closed") {
-    jumpingJackCounterReason.value = "等待 closed 起始姿势，再进入 ready。";
-  } else {
-    jumpingJackCounterReason.value = "记录中，等待完整 closed → open → closed 周期。";
-  }
-}
-
-function pauseJumpingJackRecording() {
-  if (jumpingJackRuntimeStatus.value !== "running") {
-    return;
-  }
-
-  jumpingJackRuntimeStatus.value = "paused";
-  lastJumpingJackRuntimeAt = 0;
-  jumpingJackCounterReason.value = "已暂停，组合动作状态机保持当前阶段。";
-}
-
-function resetJumpingJackRecording() {
-  resetJumpingJackCounter();
-  resetJumpingJackAnalysis("等待完整关键点");
-}
-
-function updateJumpingJackRuntime(now: number) {
-  if (jumpingJackRuntimeStatus.value !== "running") {
-    lastJumpingJackRuntimeAt = 0;
-    return;
-  }
-
-  if (!lastJumpingJackRuntimeAt) {
-    lastJumpingJackRuntimeAt = now;
-    return;
-  }
-
-  jumpingJackElapsedMs.value += now - lastJumpingJackRuntimeAt;
-  lastJumpingJackRuntimeAt = now;
-}
-
-function updateJumpingJackCounter(state: JumpingJackState) {
-  if (jumpingJackRuntimeStatus.value !== "running") {
-    return;
-  }
-
-  if (state === "unknown") {
-    jumpingJackCounterReason.value = "当前状态 unknown，组合动作状态机暂不推进。";
-    return;
-  }
-
-  if (jumpingJackCounterPhase.value === "waiting_closed") {
-    if (state === "closed") {
-      jumpingJackCounterPhase.value = "ready";
-      jumpingJackCounterReason.value = "已捕获 closed 起始姿势，等待 open。";
-    } else {
-      jumpingJackCounterReason.value = "请先回到 closed 起始姿势。";
-    }
-    return;
-  }
-
-  if (jumpingJackCounterPhase.value === "ready") {
-    if (state === "open") {
-      jumpingJackCounterPhase.value = "opened";
-      jumpingJackCounterReason.value = "已捕获 open，等待回到 closed 完成 1 次。";
-    }
-    return;
-  }
-
-  if (jumpingJackCounterPhase.value === "opened" && state === "closed") {
-    jumpingJackCount.value += 1;
-    jumpingJackCounterPhase.value = "ready";
-    jumpingJackCounterReason.value = "完成 closed → open → closed，计数 +1。";
-  }
+  compositeActionLabel.value = "未识别组合动作";
+  compositeActionDetail.value = reason;
 }
 
 function isVisibleLandmark(landmark: LandmarkPoint | undefined) {
-  return Boolean(
-    landmark &&
-      (landmark.visibility ?? 1) >= MIN_LANDMARK_VISIBILITY &&
-      landmark.x >= 0 &&
-      landmark.x <= 1 &&
-      landmark.y >= 0 &&
-      landmark.y <= 1,
-  );
+  return Boolean(landmark) && (landmark?.visibility ?? 1) >= MIN_LANDMARK_VISIBILITY;
 }
 
 function getDistanceX(left: LandmarkPoint, right: LandmarkPoint) {
@@ -913,24 +660,26 @@ function getVisibleTrackedPoint(
   landmarks: LandmarkPoint[],
   key: FullBodyTrackedKey,
 ) {
-  const landmark = landmarks[LANDMARK_INDEX[key]];
+  const point = landmarks[LANDMARK_INDEX[key]];
 
-  return isVisibleLandmark(landmark) ? landmark : null;
+  return isVisibleLandmark(point) ? point : null;
 }
 
 function getFullBodyMotionSample(
   landmarks: LandmarkPoint[],
   now: number,
 ): FullBodyMotionSample {
-  const points: FullBodyMotionSample["points"] = {};
+  const points = FULL_BODY_TRACKED_KEYS.reduce<
+    Partial<Record<FullBodyTrackedKey, LandmarkPoint>>
+  >((acc, key) => {
+    const point = getVisibleTrackedPoint(landmarks, key);
 
-  FULL_BODY_TRACKED_KEYS.forEach((key) => {
-    const landmark = getVisibleTrackedPoint(landmarks, key);
-
-    if (landmark) {
-      points[key] = landmark;
+    if (point) {
+      acc[key] = point;
     }
-  });
+
+    return acc;
+  }, {});
 
   return { time: now, points };
 }
@@ -955,67 +704,82 @@ function getAverageTrackedDistance(
     return 0;
   }
 
-  return distances.reduce((sum, distance) => sum + distance, 0) / distances.length;
+  return distances.reduce((total, distance) => total + distance, 0) / distances.length;
 }
 
 function getTrackedAmplitude(
-  samples: FullBodyMotionSample[],
+  history: FullBodyMotionSample[],
   keys: FullBodyTrackedKey[],
 ) {
-  const amplitudes = keys.map((key) => {
-    const points = samples
-      .map((sample) => sample.points[key])
-      .filter((point): point is LandmarkPoint => Boolean(point));
+  const ranges = keys
+    .map((key) => {
+      const points = history
+        .map((sample) => sample.points[key])
+        .filter((point): point is LandmarkPoint => Boolean(point));
 
-    if (points.length < 2) {
-      return 0;
-    }
+      if (points.length < 2) {
+        return null;
+      }
 
-    const xValues = points.map((point) => point.x);
-    const yValues = points.map((point) => point.y);
-    const xRange = Math.max(...xValues) - Math.min(...xValues);
-    const yRange = Math.max(...yValues) - Math.min(...yValues);
+      const xs = points.map((point) => point.x);
+      const ys = points.map((point) => point.y);
 
-    return Math.hypot(xRange, yRange);
-  });
+      return Math.hypot(
+        Math.max(...xs) - Math.min(...xs),
+        Math.max(...ys) - Math.min(...ys),
+      );
+    })
+    .filter((range): range is number => range !== null);
 
-  return Math.max(...amplitudes, 0);
+  if (!ranges.length) {
+    return 0;
+  }
+
+  return ranges.reduce((total, range) => total + range, 0) / ranges.length;
 }
 
 function clampScore(value: number) {
-  return Math.min(100, Math.max(0, Math.round(value)));
+  return Math.round(Math.min(Math.max(value, 0), 100));
 }
 
 function scoreFromRange(value: number, min: number, max: number) {
-  if (max <= min) {
-    return value >= max ? 100 : 0;
+  if (value <= min) {
+    return 0;
   }
 
-  return clampScore(((value - min) / (max - min)) * 100);
+  if (value >= max) {
+    return 100;
+  }
+
+  return ((value - min) / (max - min)) * 100;
 }
 
 function scoreFromInverseRange(value: number, min: number, max: number) {
-  if (max <= min) {
-    return value <= min ? 100 : 0;
+  if (value <= min) {
+    return 100;
   }
 
-  return clampScore(((max - value) / (max - min)) * 100);
+  if (value >= max) {
+    return 0;
+  }
+
+  return ((max - value) / (max - min)) * 100;
 }
 
 function getFullBodyIntensityLevel(score: number): FullBodyIntensityLevel {
-  if (score < 15) {
-    return "静止";
+  if (score >= 70) {
+    return "高强度";
   }
 
-  if (score < 40) {
-    return "低强度";
-  }
-
-  if (score < 70) {
+  if (score >= 40) {
     return "中强度";
   }
 
-  return "高强度";
+  if (score >= 15) {
+    return "低强度";
+  }
+
+  return "静止";
 }
 
 function getAverageTrackedY(
@@ -1030,18 +794,18 @@ function getAverageTrackedY(
     return null;
   }
 
-  return points.reduce((sum, point) => sum + point.y, 0) / points.length;
+  return points.reduce((total, point) => total + point.y, 0) / points.length;
 }
 
 function getTrackedDistance(
   sample: FullBodyMotionSample,
-  firstKey: FullBodyTrackedKey,
-  secondKey: FullBodyTrackedKey,
+  leftKey: FullBodyTrackedKey,
+  rightKey: FullBodyTrackedKey,
 ) {
-  const first = sample.points[firstKey];
-  const second = sample.points[secondKey];
+  const left = sample.points[leftKey];
+  const right = sample.points[rightKey];
 
-  return first && second ? getPointDistance(first, second) : null;
+  return left && right ? getPointDistance(left, right) : null;
 }
 
 function getTorsoHeight(sample: FullBodyMotionSample) {
@@ -1049,7 +813,7 @@ function getTorsoHeight(sample: FullBodyMotionSample) {
   const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
 
   if (shoulderY === null || hipY === null) {
-    return null;
+    return 0;
   }
 
   return Math.max(Math.abs(hipY - shoulderY), 0.05);
@@ -1064,25 +828,27 @@ function getLimbLiftScore(
   const knee = sample.points[kneeKey];
   const torsoHeight = getTorsoHeight(sample);
 
-  if (!hip || !knee || torsoHeight === null) {
+  if (!hip || !knee || torsoHeight <= 0) {
     return 0;
   }
 
-  return scoreFromRange((hip.y - knee.y) / torsoHeight, -0.05, 0.45);
+  const kneeGapRatio = Math.abs(knee.y - hip.y) / torsoHeight;
+
+  return scoreFromInverseRange(kneeGapRatio, 0.18, 0.62);
 }
 
 function getHipVerticalDelta(
+  sample: FullBodyMotionSample,
   previous: FullBodyMotionSample | null,
-  current: FullBodyMotionSample,
 ) {
   if (!previous) {
     return 0;
   }
 
+  const currentHipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
   const previousHipY = getAverageTrackedY(previous, ["leftHip", "rightHip"]);
-  const currentHipY = getAverageTrackedY(current, ["leftHip", "rightHip"]);
 
-  if (previousHipY === null || currentHipY === null) {
+  if (currentHipY === null || previousHipY === null) {
     return 0;
   }
 
@@ -1096,39 +862,35 @@ function getFullBodyBasicActionCandidates(
   const shoulderDistance = getTrackedDistance(sample, "leftShoulder", "rightShoulder");
   const ankleDistance = getTrackedDistance(sample, "leftAnkle", "rightAnkle");
   const wristDistance = getTrackedDistance(sample, "leftWrist", "rightWrist");
+  const torsoHeight = getTorsoHeight(sample);
   const shoulderY = getAverageTrackedY(sample, ["leftShoulder", "rightShoulder"]);
   const wristY = getAverageTrackedY(sample, ["leftWrist", "rightWrist"]);
-  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
-  const ankleY = getAverageTrackedY(sample, ["leftAnkle", "rightAnkle"]);
-  const torsoHeight = getTorsoHeight(sample);
-  const ankleRatio =
-    shoulderDistance && ankleDistance ? ankleDistance / shoulderDistance : 0;
-  const wristRatio =
-    shoulderDistance && wristDistance ? wristDistance / shoulderDistance : 0;
-  const armLiftRatio =
-    shoulderY !== null && wristY !== null && torsoHeight !== null
+  const hipToAnkleDistance = getTrackedDistance(sample, "leftHip", "leftAnkle");
+  const hipDelta = getHipVerticalDelta(sample, previous);
+  const shoulderWidth = Math.max(shoulderDistance ?? 0, MIN_SHOULDER_WIDTH);
+  const ankleRatio = ankleDistance ? ankleDistance / shoulderWidth : 0;
+  const wristRatio = wristDistance ? wristDistance / shoulderWidth : 0;
+  const wristLiftRatio =
+    wristY !== null && shoulderY !== null && torsoHeight > 0
       ? (shoulderY - wristY) / torsoHeight
       : 0;
   const hipToAnkleRatio =
-    hipY !== null && ankleY !== null && torsoHeight !== null
-      ? (ankleY - hipY) / torsoHeight
-      : 0;
-  const hipDelta = getHipVerticalDelta(previous, sample);
+    hipToAnkleDistance && torsoHeight > 0 ? hipToAnkleDistance / torsoHeight : 0;
   const candidates: BasicActionCandidate[] = [
     {
       label: "双脚打开",
-      score: scoreFromRange(ankleRatio, 0.85, 1.25),
-      reason: "脚踝间距相对肩宽变大",
+      score: scoreFromRange(ankleRatio, 1.05, 1.45),
+      reason: "脚踝距离超过肩宽",
     },
     {
       label: "双脚合拢",
-      score: scoreFromInverseRange(ankleRatio, 0.75, 1.1),
-      reason: "脚踝间距相对肩宽较小",
+      score: scoreFromInverseRange(ankleRatio, 0.85, 1.1),
+      reason: "脚踝距离接近或小于肩宽",
     },
     {
       label: "双臂上抬",
       score: Math.max(
-        scoreFromRange(armLiftRatio, -0.1, 0.35),
+        scoreFromRange(wristLiftRatio, 0.05, 0.45),
         scoreFromRange(wristRatio, 0.9, 1.35) * 0.7,
       ),
       reason: "手腕高于肩部或双手横向打开",
@@ -1176,13 +938,12 @@ function updateFullBodyActivityClassification(
   const speedScore = scoreFromRange(features.movementSpeed, 0.12, 0.8);
   const amplitudeScore = scoreFromRange(features.movementAmplitude, 0.04, 0.32);
   const lowerBodyScore = scoreFromRange(features.lowerBodyDistance, 0.01, 0.08);
-  const completenessScore = landmarkCompleteness.value;
   const activityScore = clampScore(
     distanceScore * 0.25 +
       speedScore * 0.25 +
       amplitudeScore * 0.25 +
       lowerBodyScore * 0.15 +
-      completenessScore * 0.1,
+      landmarkCompleteness.value * 0.1,
   );
 
   fullBodyActivityScore.value = activityScore;
@@ -1297,7 +1058,6 @@ function getRequiredPoseLandmarks(landmarks: LandmarkPoint[]) {
     leftAnkle: landmarks[LANDMARK_INDEX.leftAnkle],
     rightAnkle: landmarks[LANDMARK_INDEX.rightAnkle],
   };
-
   const missingKey = Object.entries(required).find(
     ([, landmark]) => !isVisibleLandmark(landmark),
   )?.[0];
@@ -1343,21 +1103,45 @@ function classifyArms(
   return "unknown";
 }
 
-function updateDebouncedJumpingJackState(nextState: JumpingJackState) {
-  instantJumpingJackState.value = nextState;
+function updateCompositeActionDisplay(now: number) {
+  const isRecentComposite = now - lastCompositeEvidenceAt.value <= COMPOSITE_ACTION_HOLD_MS;
+
+  if (jumpingJackState.value === "open" || isRecentComposite) {
+    compositeActionLabel.value = "开合跳";
+    compositeActionDetail.value = `脚 ${feetState.value} / 手 ${armsState.value}`;
+    return;
+  }
+
+  if (fullBodyActivityScore.value >= 25) {
+    compositeActionLabel.value = "全身活动";
+    compositeActionDetail.value = "暂未匹配到明确组合动作";
+    return;
+  }
+
+  compositeActionLabel.value = "未识别组合动作";
+  compositeActionDetail.value = "当前主要看基础动作和运动量";
+}
+
+function updateDebouncedJumpingJackState(
+  nextState: JumpingJackState,
+  now: number,
+) {
+  if (nextState === "open") {
+    lastCompositeEvidenceAt.value = now;
+  }
 
   if (nextState === "unknown") {
     jumpingJackState.value = "unknown";
     pendingJumpingJackState = "unknown";
     pendingJumpingJackFrames = 0;
-    actionDebounceProgress.value = `0/${ACTION_DEBOUNCE_FRAMES}`;
+    updateCompositeActionDisplay(now);
     return;
   }
 
   if (nextState === jumpingJackState.value) {
     pendingJumpingJackState = "unknown";
     pendingJumpingJackFrames = 0;
-    actionDebounceProgress.value = `${ACTION_DEBOUNCE_FRAMES}/${ACTION_DEBOUNCE_FRAMES}`;
+    updateCompositeActionDisplay(now);
     return;
   }
 
@@ -1368,20 +1152,19 @@ function updateDebouncedJumpingJackState(nextState: JumpingJackState) {
     pendingJumpingJackFrames += 1;
   }
 
-  actionDebounceProgress.value = `${Math.min(
-    pendingJumpingJackFrames,
-    ACTION_DEBOUNCE_FRAMES,
-  )}/${ACTION_DEBOUNCE_FRAMES}`;
-
   if (pendingJumpingJackFrames >= ACTION_DEBOUNCE_FRAMES) {
     jumpingJackState.value = nextState;
     pendingJumpingJackState = "unknown";
     pendingJumpingJackFrames = 0;
-    updateJumpingJackCounter(nextState);
   }
+
+  updateCompositeActionDisplay(now);
 }
 
-function updateJumpingJackAnalysis(landmarks: LandmarkPoint[] | null) {
+function updateJumpingJackAnalysis(
+  landmarks: LandmarkPoint[] | null,
+  now: number,
+) {
   if (!landmarks?.length) {
     resetJumpingJackAnalysis("未检测到完整人体");
     return;
@@ -1397,7 +1180,7 @@ function updateJumpingJackAnalysis(landmarks: LandmarkPoint[] | null) {
   const shoulderWidth = getDistanceX(pose.leftShoulder, pose.rightShoulder);
 
   if (shoulderWidth < MIN_SHOULDER_WIDTH) {
-    resetJumpingJackAnalysis("肩宽过小，用户可能离摄像头太远或未正对镜头");
+    resetJumpingJackAnalysis("人体距离过远或未正对镜头");
     return;
   }
 
@@ -1424,12 +1207,7 @@ function updateJumpingJackAnalysis(landmarks: LandmarkPoint[] | null) {
 
   feetState.value = nextFeetState;
   armsState.value = nextArmsState;
-  updateDebouncedJumpingJackState(nextActionState);
-
-  actionStateReason.value =
-    `脚踝/肩宽 ${ankleDistance / shoulderWidth >= 10 ? "9.9+" : (ankleDistance / shoulderWidth).toFixed(2)}, ` +
-    `手腕/肩宽 ${wristDistance / shoulderWidth >= 10 ? "9.9+" : (wristDistance / shoulderWidth).toFixed(2)}, ` +
-    `手腕高度 ${(averageWristY - averageShoulderY) / torsoHeight >= 10 ? "9.9+" : ((averageWristY - averageShoulderY) / torsoHeight).toFixed(2)}`;
+  updateDebouncedJumpingJackState(nextActionState, now);
 }
 
 function toCanvasPoint(
@@ -1441,6 +1219,10 @@ function toCanvasPoint(
     x: landmark.x * canvasWidth,
     y: landmark.y * canvasHeight,
   };
+}
+
+function shouldDrawPosePoint(index: number) {
+  return index >= 11 || DISPLAY_FACE_LANDMARK_INDICES.includes(index);
 }
 
 function drawPoseOverlay(
@@ -1455,8 +1237,8 @@ function drawPoseOverlay(
   context.save();
   context.lineCap = "round";
   context.lineJoin = "round";
-  context.strokeStyle = "rgba(45, 212, 191, 0.9)";
-  context.lineWidth = Math.max(3, canvas.width / 260);
+  context.strokeStyle = "rgba(45, 212, 191, 0.92)";
+  context.lineWidth = Math.max(4, canvas.width / 230);
 
   POSE_CONNECTIONS.forEach(([fromIndex, toIndex]) => {
     const from = landmarks[fromIndex];
@@ -1476,18 +1258,19 @@ function drawPoseOverlay(
   });
 
   landmarks.forEach((landmark, index) => {
-    if (!isVisibleLandmark(landmark)) {
+    if (!isVisibleLandmark(landmark) || !shouldDrawPosePoint(index)) {
       return;
     }
 
     const point = toCanvasPoint(landmark, canvas.width, canvas.height);
     const isRequired = REQUIRED_LANDMARK_INDICES.includes(index);
+    const isFace = DISPLAY_FACE_LANDMARK_INDICES.includes(index);
 
     context.beginPath();
-    context.fillStyle = isRequired ? "#facc15" : "#ffffff";
+    context.fillStyle = isRequired ? "#facc15" : isFace ? "#fb7185" : "#ffffff";
     context.strokeStyle = "rgba(15, 23, 42, 0.72)";
     context.lineWidth = 2;
-    context.arc(point.x, point.y, isRequired ? 6 : 4, 0, Math.PI * 2);
+    context.arc(point.x, point.y, isRequired ? 7 : 5, 0, Math.PI * 2);
     context.fill();
     context.stroke();
   });
@@ -1541,8 +1324,6 @@ function drawHandsOverlay(
 async function runPoseInference(now: number) {
   const video = videoRef.value;
 
-  updateJumpingJackRuntime(now);
-
   if (
     (!poseLandmarker && !handLandmarker) ||
     !video ||
@@ -1559,7 +1340,7 @@ async function runPoseInference(now: number) {
   try {
     if (handLandmarker) {
       const handResult = handLandmarker.detectForVideo(video, now);
-      latestHands = handResult.landmarks as LandmarkPoint[][];
+      latestHands = (handResult.landmarks as LandmarkPoint[][]).map(toLandmarkPoints);
       handCount.value = latestHands.length;
     } else {
       latestHands = [];
@@ -1579,8 +1360,6 @@ async function runPoseInference(now: number) {
     if (!landmarks?.length) {
       poseStatus.value = "missing";
       landmarkCompleteness.value = 0;
-      rawLandmarkState.value = "未检测到人体";
-      smoothedLandmarkState.value = "无平滑数据";
       landmarkHistory.length = 0;
       smoothedLandmarks = null;
       resetJumpingJackAnalysis("未检测到完整人体");
@@ -1589,18 +1368,12 @@ async function runPoseInference(now: number) {
     }
 
     poseStatus.value = "detected";
-    rawLandmarkState.value = `${landmarks.length} 个关键点`;
     updateLandmarkCompleteness(landmarks);
     updateSmoothedLandmarks(landmarks);
-    smoothedLandmarkState.value = smoothedLandmarks
-      ? `${smoothedLandmarks.length} 个平滑关键点`
-      : "无平滑数据";
-    updateJumpingJackAnalysis(smoothedLandmarks);
+    updateJumpingJackAnalysis(smoothedLandmarks, now);
     updateFullBodyMotionFeatures(smoothedLandmarks, now);
-  } catch (error) {
+  } catch {
     poseStatus.value = "missing";
-    rawLandmarkState.value =
-      error instanceof Error ? error.message : "姿态推理失败";
     resetJumpingJackAnalysis("姿态推理失败");
     resetFullBodyMotionFeatures();
   } finally {
@@ -1656,7 +1429,7 @@ async function startCamera() {
     await videoRef.value.play();
 
     cameraStatus.value = "ready";
-    cameraMessage.value = "摄像头已就绪，Phase 3 将接入姿态识别。";
+    cameraMessage.value = "摄像头已就绪";
     stopRenderLoop();
     animationFrameId = requestAnimationFrame(renderFrame);
   } catch (error) {
@@ -1680,107 +1453,343 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="app-shell">
-    <section class="stage-panel" aria-label="摄像头识别区域">
-      <div class="stage-toolbar">
+  <main class="demo-shell">
+    <section class="demo-stage-panel" aria-label="演示版摄像头识别区域">
+      <div class="demo-stage-toolbar">
         <div>
-          <p class="eyebrow">CalorieCal MVP</p>
-          <h1>开合跳识别</h1>
+          <p class="eyebrow">CalorieCal Demo</p>
+          <h1>运动强度演示</h1>
         </div>
         <span class="status-pill" :class="`status-${cameraStatus}`">
           {{ cameraStatus }}
         </span>
       </div>
 
-      <div class="camera-stage">
-        <div class="camera-frame">
+      <div class="demo-camera-stage">
+        <div class="demo-camera-frame">
           <video ref="videoRef" aria-label="摄像头原始画面" playsinline muted />
-          <canvas ref="canvasRef" aria-label="摄像头画布渲染层" />
+          <canvas ref="canvasRef" aria-label="运动识别画布渲染层" />
+
           <div v-if="cameraStatus !== 'ready'" class="camera-overlay">
             <span>Camera</span>
             <p>{{ cameraMessage }}</p>
           </div>
-          <div v-else class="camera-message" aria-live="polite">
-            {{ cameraMessage }}
+
+          <div v-else class="demo-live-banner" aria-live="polite">
+            {{ systemStatusText }}
           </div>
-          <div
-            v-if="cameraStatus === 'ready' && poseStatus === 'missing'"
-            class="pose-hint"
-          >
-            未检测到完整人体，请全身入镜并正对摄像头。
-          </div>
+
           <div
             v-if="cameraStatus === 'ready' && poseStatus === 'detected'"
-            class="jump-state-badge"
+            class="demo-action-badge"
           >
-            <span>开合跳</span>
-            <strong>{{ jumpingJackState }}</strong>
-            <small>{{ jumpingJackRuntimeStatus }} / {{ jumpingJackCounterPhase }}</small>
+            <span>{{ fullBodyIntensityLevel }}</span>
+            <strong>{{ compositeActionLabel }}</strong>
+            <small>{{ topFullBodyBasicActionsText }}</small>
           </div>
         </div>
-      </div>
-
-      <div class="controls-row">
-        <button type="button" @click="startJumpingJackRecording">开始</button>
-        <button type="button" class="secondary" @click="pauseJumpingJackRecording">暂停</button>
-        <button type="button" class="secondary" @click="resetJumpingJackRecording">重置</button>
       </div>
     </section>
 
-    <aside class="side-panel" aria-label="实时指标">
-      <label class="weight-field">
-        <span>体重 kg</span>
-        <input v-model.number="weightKg" type="number" min="20" max="200" />
-      </label>
+    <aside class="demo-side-panel" aria-label="演示版实时指标">
+      <section class="demo-hero-metric">
+        <span>当前组合动作</span>
+        <strong>{{ compositeActionLabel }}</strong>
+        <small>{{ compositeActionDetail }}</small>
+      </section>
 
-      <div class="metrics-grid">
+      <section class="demo-hero-metric accent">
+        <span>估算消耗</span>
+        <strong>{{ fullBodyCalories.toFixed(2) }} kcal</strong>
+        <small>当前为演示估算口径</small>
+      </section>
+
+      <div class="demo-metrics-grid">
         <section
-          v-for="metric in metrics"
+          v-for="metric in primaryMetrics"
           :key="metric.label"
-          class="metric-card"
+          class="demo-metric-card"
         >
           <span>{{ metric.label }}</span>
           <strong>{{ metric.value }}</strong>
-          <small v-if="metric.detail">{{ metric.detail }}</small>
+          <small>{{ metric.detail }}</small>
         </section>
       </div>
 
-      <details class="debug-panel">
-        <summary>
-          <span>视觉模型</span>
-          <strong :class="`debug-status status-${modelStatus}`">
-            {{ modelStatus }}
-          </strong>
-        </summary>
-        <div class="debug-body">
-          <p>{{ modelMessage }}</p>
-          <p>{{ handModelMessage }}</p>
-          <dl>
-            <template v-for="item in modelDetails" :key="item.label">
-              <dt>{{ item.label }}</dt>
-              <dd>{{ item.value }}</dd>
-            </template>
-          </dl>
+      <section class="demo-section">
+        <div class="demo-section-header">
+          <span>运动量</span>
+          <small>{{ motionSuggestion }}</small>
         </div>
-      </details>
+        <div class="demo-metrics-grid compact">
+          <section
+            v-for="metric in motionMetrics"
+            :key="metric.label"
+            class="demo-metric-card"
+          >
+            <span>{{ metric.label }}</span>
+            <strong>{{ metric.value }}</strong>
+            <small>{{ metric.detail }}</small>
+          </section>
+        </div>
+      </section>
 
-      <details class="debug-panel">
-        <summary>
-          <span>姿态调试</span>
-          <strong :class="`debug-status status-${poseStatus}`">
-            {{ poseStatus }}
-          </strong>
-        </summary>
-        <div class="debug-body">
-          <p>显示层镜像，算法层保持 MediaPipe 原始坐标。</p>
-          <dl>
-            <template v-for="item in poseDebugDetails" :key="item.label">
-              <dt>{{ item.label }}</dt>
-              <dd>{{ item.value }}</dd>
-            </template>
-          </dl>
-        </div>
-      </details>
+      <section class="demo-status-strip">
+        <span>Pose {{ modelStatus }}</span>
+        <span>Hand {{ handModelStatus }}</span>
+        <span>{{ inferenceFps.toFixed(1) }} FPS</span>
+        <span>{{ handCount }} hand</span>
+      </section>
     </aside>
   </main>
 </template>
+
+<style scoped>
+.demo-shell {
+  align-items: start;
+  display: grid;
+  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  width: 100%;
+}
+
+.demo-stage-panel,
+.demo-side-panel {
+  background: #ffffff;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+}
+
+.demo-stage-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 48px);
+  overflow: hidden;
+}
+
+.demo-stage-toolbar {
+  align-items: center;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  padding: 18px 20px;
+}
+
+.demo-camera-stage {
+  align-items: center;
+  background:
+    linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(20, 83, 45, 0.9)),
+    #0f172a;
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  min-height: 540px;
+  padding: 24px;
+}
+
+.demo-camera-frame {
+  aspect-ratio: 16 / 9;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  border-radius: 8px;
+  max-width: 1180px;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.demo-camera-frame video,
+.demo-camera-frame canvas {
+  height: 100%;
+  inset: 0;
+  object-fit: cover;
+  position: absolute;
+  transform: scaleX(-1);
+  width: 100%;
+}
+
+.demo-camera-frame video {
+  opacity: 0;
+}
+
+.demo-camera-frame canvas {
+  background: #020617;
+}
+
+.demo-live-banner {
+  background: rgba(15, 23, 42, 0.74);
+  border: 1px solid rgba(148, 163, 184, 0.38);
+  border-radius: 6px;
+  bottom: 16px;
+  color: #f8fafc;
+  font-size: 15px;
+  font-weight: 800;
+  left: 16px;
+  max-width: calc(100% - 32px);
+  padding: 10px 12px;
+  position: absolute;
+}
+
+.demo-action-badge {
+  background: rgba(15, 23, 42, 0.78);
+  border: 1px solid rgba(250, 204, 21, 0.58);
+  border-radius: 8px;
+  color: #e2e8f0;
+  display: grid;
+  gap: 4px;
+  max-width: min(360px, calc(100% - 32px));
+  padding: 14px 16px;
+  position: absolute;
+  right: 16px;
+  text-align: right;
+  top: 16px;
+}
+
+.demo-action-badge span,
+.demo-action-badge small {
+  color: #cbd5e1;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.demo-action-badge strong {
+  color: #ffffff;
+  font-size: 30px;
+  line-height: 1.1;
+}
+
+.demo-side-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  padding: 18px;
+  position: sticky;
+  top: 24px;
+}
+
+.demo-hero-metric,
+.demo-section {
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+}
+
+.demo-hero-metric {
+  background: #f8fafc;
+}
+
+.demo-hero-metric.accent {
+  background: #ecfdf5;
+  border-color: #99f6e4;
+}
+
+.demo-hero-metric span,
+.demo-metric-card span,
+.demo-section-header span {
+  color: #475569;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.demo-hero-metric strong {
+  color: #0f172a;
+  font-size: 32px;
+  line-height: 1.1;
+}
+
+.demo-hero-metric small,
+.demo-metric-card small,
+.demo-section-header small {
+  color: #64748b;
+  line-height: 1.35;
+}
+
+.demo-metrics-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.demo-metrics-grid.compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.demo-metric-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  display: grid;
+  gap: 5px;
+  min-height: 112px;
+  padding: 13px;
+}
+
+.demo-metric-card strong {
+  color: #0f172a;
+  font-size: 22px;
+  line-height: 1.14;
+  overflow-wrap: anywhere;
+}
+
+.demo-section-header {
+  align-items: start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.demo-section-header small {
+  max-width: 170px;
+  text-align: right;
+}
+
+.demo-status-strip {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 12px;
+}
+
+.demo-status-strip span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+@media (max-width: 1100px) {
+  .demo-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .demo-side-panel {
+    max-height: none;
+    position: static;
+  }
+}
+
+@media (max-width: 640px) {
+  .demo-stage-panel {
+    min-height: 620px;
+  }
+
+  .demo-camera-stage {
+    min-height: 420px;
+    padding: 12px;
+  }
+
+  .demo-metrics-grid.compact,
+  .demo-status-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .demo-action-badge {
+    left: 12px;
+    right: 12px;
+    text-align: left;
+  }
+}
+</style>

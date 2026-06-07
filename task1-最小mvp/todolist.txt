@@ -22,7 +22,7 @@
       → 文件: frontend/src/styles.css
       → 页面直接进入识别界面
       → 不做首页、介绍页、营销页
-      → 已完成: 页面已进入视觉识别 MVP 界面
+      → 已完成: 页面已进入视觉识别 界面
 - [x] 1.3 明确依赖和脚本
       → 依赖: @mediapipe/tasks-vision
       → 脚本: dev / build

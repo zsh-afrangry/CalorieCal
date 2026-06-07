@@ -63,6 +63,12 @@ type UpperBodyMotionFeatures = {
   movementAmplitude: number;
   activeUpperBodyMs: number;
 };
+type UpperBodyIntensityLevel = "静止" | "低强度" | "中强度" | "高强度";
+type BasicActionCandidate = {
+  label: string;
+  score: number;
+  reason: string;
+};
 
 const MEDIAPIPE_TASKS_VERSION = "0.10.22-rc.20250304";
 const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_TASKS_VERSION}/wasm`;
@@ -81,6 +87,7 @@ const WAVE_SIGNAL_MIN_SCORE = 55;
 const WAVE_SIGNAL_GRACE_FRAMES = 4;
 const UPPER_BODY_HISTORY_MS = 1200;
 const UPPER_BODY_ACTIVE_DISTANCE_THRESHOLD = 0.025;
+const UPPER_BODY_INTENSITY_HOLD_MS = 450;
 const MIN_POSE_VISIBILITY = 0.45;
 const POSE_LANDMARK_INDEX = {
   leftShoulder: 11,
@@ -139,6 +146,12 @@ const upperBodyMotionFeatures = ref<UpperBodyMotionFeatures>({
   movementAmplitude: 0,
   activeUpperBodyMs: 0,
 });
+const upperBodyActivityScore = ref(0);
+const upperBodyIntensityLevel = ref<UpperBodyIntensityLevel>("静止");
+const lastActiveUpperBodyScore = ref(0);
+const lastActiveUpperBodyLevel = ref<UpperBodyIntensityLevel>("静止");
+const lastActiveUpperBodyAt = ref(0);
+const upperBodyBasicActions = ref<BasicActionCandidate[]>([]);
 const currentGesture = ref<GestureLabel>("等待检测");
 const motionDirection = ref("等待检测");
 const instantMotion = ref("等待检测");
@@ -180,6 +193,17 @@ const topGestureCandidatesText = computed(() => {
   }
 
   return gestureCandidates.value
+    .slice(0, 3)
+    .map((candidate) => `${candidate.label} ${candidate.score}`)
+    .join(" / ");
+});
+
+const topUpperBodyBasicActionsText = computed(() => {
+  if (!upperBodyBasicActions.value.length) {
+    return "暂无基本动作";
+  }
+
+  return upperBodyBasicActions.value
     .slice(0, 3)
     .map((candidate) => `${candidate.label} ${candidate.score}`)
     .join(" / ");
@@ -229,6 +253,14 @@ const debugDetails = computed(() => [
     label: "上肢有效时长",
     value: formatElapsedTime(upperBodyMotionFeatures.value.activeUpperBodyMs),
   },
+  { label: "上肢活动分数", value: String(upperBodyActivityScore.value) },
+  { label: "上肢强度档位", value: upperBodyIntensityLevel.value },
+  { label: "上肢 MET", value: currentUpperBodyMet.value.toFixed(1) },
+  { label: "上肢 kcal", value: upperBodyCalories.value.toFixed(2) },
+  { label: "上肢关键点完整率", value: `${upperBodyJointCompleteness.value.toFixed(0)}%` },
+  { label: "上肢估算置信度", value: upperBodyConfidence.value },
+  { label: "上肢置信度原因", value: upperBodyConfidenceSummary.value },
+  { label: "基本动作候选", value: topUpperBodyBasicActionsText.value },
   { label: "实际推理 FPS", value: inferenceFps.value.toFixed(1) },
   { label: "左右手", value: lastHandedness.value },
   { label: "手部模型", value: HAND_LANDMARKER_MODEL_URL },
@@ -257,6 +289,112 @@ const currentWaveMet = computed(() => {
 const waveCalories = computed(() => {
   const elapsedMinutes = waveElapsedMs.value / 60_000;
   return (currentWaveMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200;
+});
+
+const currentUpperBodyMet = computed(() => {
+  if (upperBodyIntensityLevel.value === "高强度") {
+    return 3.0;
+  }
+
+  if (upperBodyIntensityLevel.value === "中强度") {
+    return 2.2;
+  }
+
+  if (upperBodyIntensityLevel.value === "低强度") {
+    return 1.5;
+  }
+
+  return 1.0;
+});
+
+const upperBodyCalories = computed(() => {
+  const activeMinutes = upperBodyMotionFeatures.value.activeUpperBodyMs / 60_000;
+  return (currentUpperBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200;
+});
+
+const upperBodyJointCompleteness = computed(() => {
+  const latest = upperBodyMotionHistory[upperBodyMotionHistory.length - 1];
+
+  if (!latest) {
+    return 0;
+  }
+
+  const joints = [
+    latest.left.shoulder,
+    latest.left.elbow,
+    latest.left.wrist,
+    latest.left.handCenter,
+    latest.right.shoulder,
+    latest.right.elbow,
+    latest.right.wrist,
+    latest.right.handCenter,
+  ];
+
+  return (joints.filter(Boolean).length / joints.length) * 100;
+});
+
+const upperBodyConfidence = computed<ConfidenceLevel>(() => {
+  if (
+    cameraStatus.value !== "ready" ||
+    poseModelStatus.value !== "ready" ||
+    poseStatus.value !== "detected" ||
+    upperBodyJointCompleteness.value < 45
+  ) {
+    return "低";
+  }
+
+  if (
+    upperBodyJointCompleteness.value >= 75 &&
+    upperBodyMotionFeatures.value.activeUpperBodyMs >= 5000 &&
+    upperBodyActivityScore.value >= 35 &&
+    upperBodyMotionFeatures.value.movementAmplitude >= 0.08
+  ) {
+    return "高";
+  }
+
+  return "中";
+});
+
+const upperBodyConfidenceReasons = computed(() => {
+  const reasons: string[] = [];
+
+  if (cameraStatus.value !== "ready") {
+    reasons.push("摄像头未就绪");
+  }
+
+  if (poseModelStatus.value !== "ready") {
+    reasons.push("姿态模型未就绪");
+  }
+
+  if (poseStatus.value !== "detected") {
+    reasons.push("未稳定检测到上肢姿态");
+  }
+
+  if (upperBodyJointCompleteness.value < 45) {
+    reasons.push("肩肘腕或手部关键点不足");
+  } else if (upperBodyJointCompleteness.value >= 75) {
+    reasons.push("上肢关键点较完整");
+  }
+
+  if (upperBodyMotionFeatures.value.activeUpperBodyMs < 3000) {
+    reasons.push("有效活动时间较短");
+  }
+
+  if (upperBodyActivityScore.value < 15) {
+    reasons.push("上肢运动量较低");
+  } else if (upperBodyActivityScore.value >= 35) {
+    reasons.push("上肢运动量稳定");
+  }
+
+  if (upperBodyMotionFeatures.value.movementAmplitude < 0.04) {
+    reasons.push("运动幅度较小");
+  }
+
+  return reasons.length ? reasons : ["等待上肢活动数据"];
+});
+
+const upperBodyConfidenceSummary = computed(() => {
+  return upperBodyConfidenceReasons.value.slice(0, 3).join("；");
 });
 
 const waveConfidence = computed<ConfidenceLevel>(() => {
@@ -624,6 +762,12 @@ function stopCamera() {
     movementAmplitude: 0,
     activeUpperBodyMs: 0,
   };
+  upperBodyActivityScore.value = 0;
+  upperBodyIntensityLevel.value = "静止";
+  lastActiveUpperBodyScore.value = 0;
+  lastActiveUpperBodyLevel.value = "静止";
+  lastActiveUpperBodyAt.value = 0;
+  upperBodyBasicActions.value = [];
   currentGesture.value = "等待检测";
   motionDirection.value = "等待检测";
   instantMotion.value = "等待检测";
@@ -803,6 +947,94 @@ function getSideAmplitude(samples: UpperBodySideSample[], key: keyof UpperBodySi
   return Math.hypot(getRange(xs), getRange(ys));
 }
 
+function getRaisedArmScore(side: UpperBodySideSample) {
+  const handOrWrist = side.wrist ?? side.handCenter;
+
+  if (!side.shoulder || !handOrWrist) {
+    return 0;
+  }
+
+  const verticalLift = side.shoulder.y - handOrWrist.y;
+
+  return scoreFromRange(verticalLift, 0.02, 0.22);
+}
+
+function getUpperBodyIntensityLevel(score: number): UpperBodyIntensityLevel {
+  if (score < 15) {
+    return "静止";
+  }
+
+  if (score < 40) {
+    return "低强度";
+  }
+
+  if (score < 70) {
+    return "中强度";
+  }
+
+  return "高强度";
+}
+
+function updateUpperBodyActivityClassification(sample: UpperBodyMotionSample, now: number) {
+  const features = upperBodyMotionFeatures.value;
+  const distanceScore = scoreFromRange(features.movementDistance, 0.015, 0.12);
+  const speedScore = scoreFromRange(features.movementSpeed, 0.12, 0.8);
+  const amplitudeScore = scoreFromRange(features.movementAmplitude, 0.04, 0.28);
+  const rawActivityScore = clampScore(
+    distanceScore * 0.35 + speedScore * 0.35 + amplitudeScore * 0.3,
+  );
+  let activityScore = rawActivityScore;
+  let intensityLevel = getUpperBodyIntensityLevel(rawActivityScore);
+
+  if (intensityLevel !== "静止") {
+    lastActiveUpperBodyScore.value = rawActivityScore;
+    lastActiveUpperBodyLevel.value = intensityLevel;
+    lastActiveUpperBodyAt.value = now;
+  } else if (
+    lastActiveUpperBodyLevel.value !== "静止" &&
+    now - lastActiveUpperBodyAt.value <= UPPER_BODY_INTENSITY_HOLD_MS
+  ) {
+    activityScore = Math.max(rawActivityScore, Math.min(lastActiveUpperBodyScore.value, 18));
+    intensityLevel = "低强度";
+  }
+
+  const leftRaisedScore = getRaisedArmScore(sample.left);
+  const rightRaisedScore = getRaisedArmScore(sample.right);
+  const candidates: BasicActionCandidate[] = [
+    {
+      label: "手向前移动",
+      score: instantMotion.value === "手向前移动中" ? motionEvidence.value.depthMoveScore : 0,
+      reason: "手部尺度变大，表示向镜头方向移动",
+    },
+    {
+      label: "手向后移动",
+      score: instantMotion.value === "手向后收回中" ? motionEvidence.value.depthMoveScore : 0,
+      reason: "手部尺度变小，表示从镜头方向收回",
+    },
+    {
+      label: "左抬胳膊",
+      score: leftRaisedScore,
+      reason: "左手/腕高于左肩",
+    },
+    {
+      label: "右抬胳膊",
+      score: rightRaisedScore,
+      reason: "右手/腕高于右肩",
+    },
+    {
+      label: "双臂活动",
+      score: Math.min(100, Math.round((leftRaisedScore + rightRaisedScore) / 2)),
+      reason: "左右上肢同时出现抬起证据",
+    },
+  ]
+    .filter((candidate) => candidate.score >= 20)
+    .sort((left, right) => right.score - left.score);
+
+  upperBodyActivityScore.value = activityScore;
+  upperBodyIntensityLevel.value = intensityLevel;
+  upperBodyBasicActions.value = candidates;
+}
+
 function getUpperBodyMotionSample(now: number): UpperBodyMotionSample {
   const leftHand = latestHands[0];
   const rightHand = latestHands[1];
@@ -887,6 +1119,7 @@ function updateUpperBodyMotionFeatures(now: number) {
     movementAmplitude,
     activeUpperBodyMs: nextActiveMs,
   };
+  updateUpperBodyActivityClassification(sample, now);
 }
 
 function countDirectionChanges(values: number[]) {
@@ -1139,6 +1372,168 @@ function updateGestureAnalysis(now: number, hands: LandmarkPoint[][]) {
   updateWaveCounter(now, waveSignal, sample);
 }
 
+function drawLandmarkPoint(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  point: LandmarkPoint,
+  radius: number,
+  fillStyle: string,
+) {
+  context.beginPath();
+  context.fillStyle = fillStyle;
+  context.strokeStyle = "rgba(15, 23, 42, 0.82)";
+  context.lineWidth = 2;
+  context.arc(point.x * canvas.width, point.y * canvas.height, radius, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+}
+
+function drawLandmarkLine(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  from: LandmarkPoint | null,
+  to: LandmarkPoint | null,
+  strokeStyle: string,
+  lineWidth: number,
+) {
+  if (!from || !to) {
+    return;
+  }
+
+  context.beginPath();
+  context.strokeStyle = strokeStyle;
+  context.lineWidth = lineWidth;
+  context.moveTo(from.x * canvas.width, from.y * canvas.height);
+  context.lineTo(to.x * canvas.width, to.y * canvas.height);
+  context.stroke();
+}
+
+function findNearestHandToWrist(
+  poseWrist: LandmarkPoint | null,
+  usedHandIndexes: Set<number>,
+) {
+  if (!poseWrist) {
+    return null;
+  }
+
+  let nearestIndex = -1;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  latestHands.forEach((hand, index) => {
+    const handWrist = hand[0];
+
+    if (!handWrist || usedHandIndexes.has(index)) {
+      return;
+    }
+
+    const distance = getDistance(poseWrist, handWrist);
+
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  });
+
+  if (nearestIndex < 0 || nearestDistance > 0.24) {
+    return null;
+  }
+
+  usedHandIndexes.add(nearestIndex);
+  return latestHands[nearestIndex][0] ?? null;
+}
+
+function drawUpperBody(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+) {
+  if (!latestPoseLandmarks?.length) {
+    return;
+  }
+
+  const left = {
+    shoulder: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.leftShoulder),
+    elbow: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.leftElbow),
+    wrist: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.leftWrist),
+  };
+  const right = {
+    shoulder: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.rightShoulder),
+    elbow: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.rightElbow),
+    wrist: getVisiblePosePoint(latestPoseLandmarks, POSE_LANDMARK_INDEX.rightWrist),
+  };
+  const usedHandIndexes = new Set<number>();
+  const leftHandWrist = findNearestHandToWrist(left.wrist, usedHandIndexes);
+  const rightHandWrist = findNearestHandToWrist(right.wrist, usedHandIndexes);
+  const jointRadius = Math.max(5, canvas.width / 220);
+  const lineWidth = Math.max(5, canvas.width / 180);
+
+  context.save();
+  context.lineCap = "round";
+  context.lineJoin = "round";
+
+  drawLandmarkLine(
+    context,
+    canvas,
+    left.shoulder,
+    left.elbow,
+    "rgba(20, 184, 166, 0.96)",
+    lineWidth,
+  );
+  drawLandmarkLine(
+    context,
+    canvas,
+    left.elbow,
+    left.wrist,
+    "rgba(20, 184, 166, 0.96)",
+    lineWidth,
+  );
+  drawLandmarkLine(
+    context,
+    canvas,
+    left.wrist,
+    leftHandWrist,
+    "rgba(20, 184, 166, 0.78)",
+    Math.max(3, lineWidth - 1),
+  );
+
+  drawLandmarkLine(
+    context,
+    canvas,
+    right.shoulder,
+    right.elbow,
+    "rgba(59, 130, 246, 0.96)",
+    lineWidth,
+  );
+  drawLandmarkLine(
+    context,
+    canvas,
+    right.elbow,
+    right.wrist,
+    "rgba(59, 130, 246, 0.96)",
+    lineWidth,
+  );
+  drawLandmarkLine(
+    context,
+    canvas,
+    right.wrist,
+    rightHandWrist,
+    "rgba(59, 130, 246, 0.78)",
+    Math.max(3, lineWidth - 1),
+  );
+
+  [left.shoulder, left.elbow, left.wrist].forEach((point) => {
+    if (point) {
+      drawLandmarkPoint(context, canvas, point, jointRadius, "#2dd4bf");
+    }
+  });
+  [right.shoulder, right.elbow, right.wrist].forEach((point) => {
+    if (point) {
+      drawLandmarkPoint(context, canvas, point, jointRadius, "#60a5fa");
+    }
+  });
+
+  context.restore();
+}
+
 function drawHands(
   context: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
@@ -1249,6 +1644,7 @@ function renderFrame() {
   const now = performance.now();
   updateWaveElapsed(now);
   runInference(now);
+  drawUpperBody(context, canvas);
   drawHands(context, canvas);
 
   animationFrameId = requestAnimationFrame(renderFrame);
@@ -1299,7 +1695,7 @@ onBeforeUnmount(() => {
       <div class="stage-toolbar">
         <div>
           <p class="eyebrow">Gesture</p>
-          <h1>手势识别</h1>
+          <h1>上肢活动估算</h1>
         </div>
         <span class="status-pill" :class="`status-${appRuntimeStatus}`">
           {{ appRuntimeLabel }}
@@ -1337,121 +1733,190 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <aside class="side-panel" aria-label="手势识别指标">
-      <label class="weight-field">
-        <span>体重 kg</span>
-        <input
-          type="number"
-          min="20"
-          max="200"
-          :value="weightKg"
-          @input="updateWeight"
-        />
-      </label>
+    <aside class="side-panel" aria-label="上肢活动估算指标">
+      <section class="metric-section">
+        <div class="metric-section-header">
+          <span>记录设置</span>
+          <small>体重和记录周期</small>
+        </div>
 
-      <div class="controls-row compact-controls">
-        <button type="button" @click="startWaveCounter">开始</button>
-        <button type="button" class="secondary" @click="finishWaveCounter">结束</button>
-        <button type="button" class="secondary" @click="resetWaveCounter">重置</button>
-      </div>
+        <label class="weight-field">
+          <span>体重 kg</span>
+          <input
+            type="number"
+            min="20"
+            max="200"
+            :value="weightKg"
+            @input="updateWeight"
+          />
+        </label>
 
-      <div class="metrics-grid">
-        <section class="metric-card">
-          <span>挥手次数</span>
-          <strong>{{ waveCount }}</strong>
-          <small>{{ waveCounterReason }}</small>
-        </section>
-        <section class="metric-card">
-          <span>挥手时长</span>
-          <strong>{{ formatElapsedTime(waveElapsedMs) }}</strong>
-          <small>{{ waveRuntimeLabel }}</small>
-        </section>
-        <section class="metric-card">
-          <span>挥手频率</span>
-          <strong>{{ waveFrequencyPerMin.toFixed(1) }}</strong>
-          <small>次/分钟</small>
-        </section>
-        <section class="metric-card">
-          <span>挥手 MET</span>
-          <strong>{{ currentWaveMet.toFixed(1) }}</strong>
-          <small>粗略档位</small>
-        </section>
-        <section class="metric-card">
-          <span>估算热量</span>
-          <strong>{{ waveCalories.toFixed(2) }}</strong>
-          <small>kcal，仅手部动作粗略估算</small>
-        </section>
-        <section class="metric-card">
-          <span>估算置信度</span>
-          <strong>{{ waveConfidence }}</strong>
-          <small>{{ waveConfidenceSummary }}</small>
-        </section>
-        <section class="metric-card">
-          <span>当前周期换向</span>
-          <strong>{{ waveCycleTurnCount }}</strong>
-          <small>本段挥手帧 {{ waveCycleGestureFrames }}</small>
-        </section>
-        <section class="metric-card">
-          <span>当前动作</span>
-          <strong>{{ currentGesture }}</strong>
-          <small>{{ gestureReason }}</small>
-        </section>
-        <section class="metric-card">
-          <span>即时运动</span>
-          <strong>{{ instantMotion }}</strong>
-          <small>短窗口反馈，动作名以候选状态为准</small>
-        </section>
-        <section class="metric-card">
-          <span>候选状态</span>
-          <strong>{{ topGestureCandidatesText }}</strong>
-          <small>各状态独立评分，不共享 100</small>
-        </section>
-        <section class="metric-card">
-          <span>挥手证据</span>
-          <strong>{{ motionEvidence.waveCycleScore }}</strong>
-          <small>{{ waveCounterSignalReason }}</small>
-        </section>
-        <section class="metric-card">
-          <span>运动证据</span>
-          <strong>{{ motionEvidence.horizontalSwingScore }} / {{ motionEvidence.depthMoveScore }}</strong>
-          <small>横向摆动 / 前后移动</small>
-        </section>
-        <section class="metric-card">
-          <span>稳定证据</span>
-          <strong>{{ motionEvidence.stabilityScore }}</strong>
-          <small>手指弯曲 {{ motionEvidence.fingerCurlScore }}</small>
-        </section>
-        <section class="metric-card">
-          <span>上肢有效时长</span>
-          <strong>{{ formatElapsedTime(upperBodyMotionFeatures.activeUpperBodyMs) }}</strong>
-          <small>{{ upperBodyJointState }}</small>
-        </section>
-        <section class="metric-card">
-          <span>上肢位移</span>
-          <strong>{{ upperBodyMotionFeatures.movementDistance.toFixed(3) }}</strong>
-          <small>肩肘腕手综合位移</small>
-        </section>
-        <section class="metric-card">
-          <span>上肢速度</span>
-          <strong>{{ upperBodyMotionFeatures.movementSpeed.toFixed(3) }}</strong>
-          <small>最近帧归一化速度</small>
-        </section>
-        <section class="metric-card">
-          <span>上肢幅度</span>
-          <strong>{{ upperBodyMotionFeatures.movementAmplitude.toFixed(3) }}</strong>
-          <small>最近窗口最大活动幅度</small>
-        </section>
-        <section class="metric-card">
-          <span>手部数量</span>
-          <strong>{{ handCount }}</strong>
-          <small>最多 2 只手</small>
-        </section>
-        <section class="metric-card">
-          <span>推理 FPS</span>
-          <strong>{{ inferenceFps.toFixed(1) }}</strong>
-          <small>目标 20 FPS</small>
-        </section>
-      </div>
+        <div class="controls-row compact-controls">
+          <button type="button" @click="startWaveCounter">开始</button>
+          <button type="button" class="secondary" @click="finishWaveCounter">结束</button>
+          <button type="button" class="secondary" @click="resetWaveCounter">重置</button>
+        </div>
+      </section>
+
+      <section class="metric-section">
+        <div class="metric-section-header">
+          <span>上肢活动估算</span>
+          <small>通用活动强度和消耗</small>
+        </div>
+
+        <div class="metrics-grid">
+          <section class="metric-card">
+            <span>有效时长</span>
+            <strong>{{ formatElapsedTime(upperBodyMotionFeatures.activeUpperBodyMs) }}</strong>
+            <small>{{ upperBodyJointState }}</small>
+          </section>
+          <section class="metric-card">
+            <span>活动分数</span>
+            <strong>{{ upperBodyActivityScore }}</strong>
+            <small>{{ upperBodyIntensityLevel }}</small>
+          </section>
+          <section class="metric-card">
+            <span>上肢 MET</span>
+            <strong>{{ currentUpperBodyMet.toFixed(1) }}</strong>
+            <small>按强度档位估算</small>
+          </section>
+          <section class="metric-card">
+            <span>上肢 kcal</span>
+            <strong>{{ upperBodyCalories.toFixed(2) }}</strong>
+            <small>通用上肢活动粗略估算</small>
+          </section>
+          <section class="metric-card">
+            <span>估算置信度</span>
+            <strong>{{ upperBodyConfidence }}</strong>
+            <small>{{ upperBodyConfidenceSummary }}</small>
+          </section>
+        </div>
+      </section>
+
+      <section class="metric-section">
+        <div class="metric-section-header">
+          <span>基本动作和运动证据</span>
+          <small>动作名不是热量唯一入口</small>
+        </div>
+
+        <div class="metrics-grid">
+          <section class="metric-card">
+            <span>基本动作候选</span>
+            <strong>{{ topUpperBodyBasicActionsText }}</strong>
+            <small>基本动作不等于完整运动名</small>
+          </section>
+          <section class="metric-card">
+            <span>当前动作</span>
+            <strong>{{ currentGesture }}</strong>
+            <small>{{ gestureReason }}</small>
+          </section>
+          <section class="metric-card">
+            <span>即时运动</span>
+            <strong>{{ instantMotion }}</strong>
+            <small>短窗口反馈，动作名以候选状态为准</small>
+          </section>
+          <section class="metric-card">
+            <span>候选状态</span>
+            <strong>{{ topGestureCandidatesText }}</strong>
+            <small>各状态独立评分，不共享 100</small>
+          </section>
+          <section class="metric-card">
+            <span>运动证据</span>
+            <strong>{{ motionEvidence.horizontalSwingScore }} / {{ motionEvidence.depthMoveScore }}</strong>
+            <small>横向摆动 / 前后移动</small>
+          </section>
+          <section class="metric-card">
+            <span>稳定证据</span>
+            <strong>{{ motionEvidence.stabilityScore }}</strong>
+            <small>手指弯曲 {{ motionEvidence.fingerCurlScore }}</small>
+          </section>
+        </div>
+      </section>
+
+      <details class="metric-section">
+        <summary class="metric-section-header">
+          <span>挥手示例指标</span>
+          <small>Task1 保留示例</small>
+        </summary>
+
+        <div class="metrics-grid">
+          <section class="metric-card">
+            <span>挥手次数</span>
+            <strong>{{ waveCount }}</strong>
+            <small>{{ waveCounterReason }}</small>
+          </section>
+          <section class="metric-card">
+            <span>挥手时长</span>
+            <strong>{{ formatElapsedTime(waveElapsedMs) }}</strong>
+            <small>{{ waveRuntimeLabel }}</small>
+          </section>
+          <section class="metric-card">
+            <span>挥手频率</span>
+            <strong>{{ waveFrequencyPerMin.toFixed(1) }}</strong>
+            <small>次/分钟</small>
+          </section>
+          <section class="metric-card">
+            <span>挥手 MET</span>
+            <strong>{{ currentWaveMet.toFixed(1) }}</strong>
+            <small>粗略档位</small>
+          </section>
+          <section class="metric-card">
+            <span>挥手 kcal</span>
+            <strong>{{ waveCalories.toFixed(2) }}</strong>
+            <small>kcal，仅挥手示例粗略估算</small>
+          </section>
+          <section class="metric-card">
+            <span>挥手置信度</span>
+            <strong>{{ waveConfidence }}</strong>
+            <small>{{ waveConfidenceSummary }}</small>
+          </section>
+          <section class="metric-card">
+            <span>当前周期换向</span>
+            <strong>{{ waveCycleTurnCount }}</strong>
+            <small>本段挥手帧 {{ waveCycleGestureFrames }}</small>
+          </section>
+          <section class="metric-card">
+            <span>挥手证据</span>
+            <strong>{{ motionEvidence.waveCycleScore }}</strong>
+            <small>{{ waveCounterSignalReason }}</small>
+          </section>
+        </div>
+      </details>
+
+      <details class="metric-section">
+        <summary class="metric-section-header">
+          <span>运动学调试</span>
+          <small>位移、速度和推理状态</small>
+        </summary>
+
+        <div class="metrics-grid">
+          <section class="metric-card">
+            <span>上肢位移</span>
+            <strong>{{ upperBodyMotionFeatures.movementDistance.toFixed(3) }}</strong>
+            <small>肩肘腕手综合位移</small>
+          </section>
+          <section class="metric-card">
+            <span>上肢速度</span>
+            <strong>{{ upperBodyMotionFeatures.movementSpeed.toFixed(3) }}</strong>
+            <small>最近帧归一化速度</small>
+          </section>
+          <section class="metric-card">
+            <span>上肢幅度</span>
+            <strong>{{ upperBodyMotionFeatures.movementAmplitude.toFixed(3) }}</strong>
+            <small>最近窗口最大活动幅度</small>
+          </section>
+          <section class="metric-card">
+            <span>手部数量</span>
+            <strong>{{ handCount }}</strong>
+            <small>最多 2 只手</small>
+          </section>
+          <section class="metric-card">
+            <span>推理 FPS</span>
+            <strong>{{ inferenceFps.toFixed(1) }}</strong>
+            <small>目标 20 FPS</small>
+          </section>
+        </div>
+      </details>
 
       <details class="debug-panel">
         <summary>

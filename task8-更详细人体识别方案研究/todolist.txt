@@ -1,76 +1,389 @@
 # Task8 更详细人体识别方案研究 — 实施清单
 
-> 状态：待 Task7 显示优化完成后开始。  
-> 目标：研究比 MediaPipe Pose 33 点更细的人体识别、人体表面、人体分割或 3D mesh 方案，判断是否能改善侧身、遮挡、躯干基准不稳定和空间幅度估算。  
-> 原则：先研究和小实验，不急于接入实时 /#/demo；必须服务运动强度和热量估算，不为了 3D 而 3D。  
+> 状态：已开始，先评估当前已有轻量方向。  
+> 目标：研究比 MediaPipe Pose 33 点更细的人体识别、人体表面、Whole-Body Pose 和 RGB-D 区域融合方案，判断是否能改善侧身、遮挡、躯干基准不稳定和空间幅度估算。  
+> 原则：优先选择轻量、可实时、能接入现有 Pose/Hand/RGB-D 链路的方案；SAM 3D Body、重型 HMR 和完整 mesh 暂缓，不为了 3D 而 3D。  
 
 ---
 
 ## Phase 1: 当前能力边界确认
 
-- [ ] 1.1 记录 MediaPipe Pose 上限
+- [x] 1.1 记录 MediaPipe Pose 上限
       → 33 个关键点足够做骨架运动量估算
       → 不能直接提供大腿、小腿、躯干表面轮廓或人体 mesh
       → 已发现问题: “双脚合拢”置信度偏高，双腿已经分开时仍可能显示合拢
-      → 待研究: 脚距、膝距、肩宽归一化阈值、关键点可见度和时序稳定性是否需要重新校准
+      → 已确认: 当前 /#/pose 和 /#/demo 的 PoseLandmarker 只输出关键点，未启用 segmentation mask
+      → 已确认: MediaPipe Pose 的 33 点适合实时骨架、关节位移、频率、幅度和大致强度估算；不适合直接表达大腿、小腿、躯干表面、身体轮廓、肌肉或完整人体网格
+      → 已确认: “双脚合拢 / 下蹲”一类问题优先从脚距、膝距、肩宽归一化、关键点可见度和时序稳定性继续校准，不应直接上重模型
 
-- [ ] 1.2 区分显示增强和识别增强
+- [x] 1.2 区分显示增强和识别增强
       → Task7: 显示更详细
       → Task8: 识别更详细
+      → 已确认: Task7 负责把已有关键点画得更清楚、更适合外场屏幕；不负责提升模型识别精度
+      → 已确认: Task8 负责研究 segmentation mask、RGB-D 区域采样、人体分割、DensePose 或 mesh 等识别增强方向
+      → 已确认: /#/demo 暂时不碰；Task8 的新实验若进入前端，应单独开测试 tab，不影响演示页
+
+- [x] 1.3 将现有问题按解决路径分类
+      → 阈值 / 时序可调: 双脚合拢、下蹲、静息与活动中切换、基础动作弱证据抢占
+      → 需要 depth 区域采样: 手前后移动、出拳前向位移、躯干基准 depth 不稳定、单点采样偏差
+      → 需要人体分割: depth 采到背景、侧身/遮挡时人体区域不清、轮廓参与度估算
+      → 可能需要更重模型: 侧身人体表面、遮挡下的肢体推断、个体化人体 mesh 或身体参数
+      → 已分类: 双脚合拢、下蹲、静息 / 活动中切换、上肢活动过多，优先属于阈值、归一化和状态机问题
+      → 已分类: 单手挥手、出拳和手前后移动的混淆，部分属于基础动作规则问题，部分需要更稳定的 depth 前后方向证据
+      → 已分类: 躯干基准 depth、手腕单点 depth 偏差、采到背景，优先属于 RGB-D 区域采样和人体分割过滤问题
+      → 已分类: 侧身时躯干识别不稳、遮挡下肢体推断、个体化人体比例，才可能进入 DensePose、SAM 3D Body 或 HMR 等后续重模型研究
+
+- [x] 1.4 明确 Task8 当前优先级
+      → 第一优先: MediaPipe segmentation mask 可行性
+      → 第二优先: RGB-D depth + 骨架周围区域采样
+      → 第三优先: Whole-Body Pose Estimation 可行性测评
+      → 第四优先: 普通人体分割或 DensePose 的研究记录
+      → 暂缓: SAM 3D Body / Human Mesh Recovery 实现
+      → 已确认: Phase 2 优先评估 MediaPipe segmentation mask 是否能直接复用当前浏览器 MediaPipe 链路
+      → 已确认: Phase 3 再评估 RGB-D depth 的多点 / 区域采样，减少 wrist 单点和躯干单点误差
+      → 已确认: Whole-Body Pose Estimation 可加入 Task8 测评；它仍属于关键点估计路线，比 mesh / HMR 更贴近当前实时链路
+      → 已确认: DensePose 暂作为细粒度人体区域研究记录，不作为第一批实时实现
+      → 已确认: SAM 3D Body / HMR 暂缓，只保留未来离线建模、个体化身体参数或论文展示价值
+
+- [x] 1.5 收敛当前前端入口
+      → 已完成: 前端导航只保留“姿态检测”和“演示版”
+      → 已完成: “手势识别”和“人脸检测”不再作为主入口展示
+      → 已确认: /#/demo 暂时不碰；后续如果尝试 segmentation、depth 区域采样或其他新方法，再新增独立测试 tab
+
+- [x] 1.6 Phase 1 收尾结论
+      → 已完成: 当前能力边界、显示增强 / 识别增强边界、问题分类和 Task8 优先级确认
+      → 当前主链路: MediaPipe Pose 33 点 + Hand Landmarker + OpenNI RGB-D depth server
+      → 当前策略: 不先换重模型，先用 segmentation mask、depth 区域采样和 Whole-Body Pose 测评补足背景过滤、前后方向、身体区域稳定性和关键点密度
+      → 下一步: 进入 Phase 2，评估 MediaPipe segmentation mask 的输出方式、实时性和是否能辅助 depth 背景过滤
 
 ## Phase 2: 人体分割方案评估
 
-- [ ] 2.1 评估 MediaPipe segmentation mask
+- [x] 2.1 评估 MediaPipe segmentation mask
       → 能否提供人体轮廓
       → 能否辅助过滤 depth 背景
       → 是否适合浏览器实时运行
+      → 是否能直接复用当前 MediaPipe Pose Landmarker 输出
+      → 已确认: MediaPipe Pose Landmarker Web 支持 `outputSegmentationMasks` 选项，默认值为 false；开启后结果中可返回 `segmentationMasks`
+      → 已确认: segmentation mask 表示像素属于检测到的人体的可能性，可用于人体轮廓、背景过滤和 depth 采样辅助
+      → 已确认: 当前项目使用的 `@mediapipe/tasks-vision` 类型定义中也存在 `outputSegmentationMasks?: boolean` 和 `PoseLandmarkerResult.segmentationMasks`
+      → 可行性判断: 可以优先在 /#/pose 或新增测试 tab 中开启，不需要先引入 Python 后端
+      → 风险: 开启 mask 会增加推理和内存成本，需要实际观察 FPS、延迟和浏览器稳定性
 
-- [ ] 2.2 评估普通人体分割模型
+- [x] 2.2 评估普通人体分割模型
       → 是否能稳定区分人体和背景
       → 是否能辅助 RGB-D depth 采样
+      → 若需要 Python 后端或 GPU，先只记录，不优先接入
+      → 已确认: MediaPipe Image Segmenter Web 可作为独立人体 / 图像分割方案，但 `segment()` / `segmentForVideo()` 是同步调用，处理摄像头视频帧时会阻塞 UI 线程
+      → 已确认: 若后续使用独立 Image Segmenter 做实时视频分割，建议放到 Web Worker 或独立测试 tab，避免影响 /#/demo
+      → 可行性判断: 普通人体分割模型适合用于对比实验或 mask 质量验证，不作为第一优先主链路
+      → 风险: 独立分割模型需要额外模型加载、额外推理时延和 mask 对齐逻辑；若再叠加 Pose/Hand/RGB-D，外场设备性能压力会增加
 
-## Phase 3: DensePose / 细粒度人体区域
+- [x] 2.3 Phase 2 收尾结论
+      → 第一选择: 优先评估 Pose Landmarker 自带 segmentation mask，因为它和当前 Pose 关键点来自同一条 MediaPipe 链路，接入成本最低
+      → 第二选择: 独立 Image Segmenter / 普通人体分割模型只作为对比或备选，不先接入 /#/demo
+      → 对 RGB-D 的预期价值: 用 mask 判断骨架采样点是否落在人体区域内，过滤明显背景 depth；后续 Phase 3 再评估 mask + depth 区域采样的融合口径
+      → 下一步建议: 新增独立 segmentation 测试 tab，显示原视频、人体 mask、mask 命中率、FPS 和关键点是否落在人像区域内；/#/demo 暂时不碰
 
-- [ ] 3.1 评估 DensePose
+- [x] 2.4 新增独立 segmentation 测试 tab
+      → 目标: 在不影响 /#/demo 的前提下验证 Pose Landmarker 自带 segmentation mask
+      → 路由建议: 新增 /#/segmentation 或 /#/mask-test，作为 Task8 专用测试入口
+      → 展示内容: 原视频、人体 mask 叠加层、Pose 关键点、mask 命中率、FPS、模型状态
+      → 评估内容: 关键点是否落在人像区域、手腕 / 躯干 / 脚踝采样点是否踩到背景、侧身或遮挡时 mask 是否稳定
+      → 验收口径: 能看见人体轮廓 mask；检测到人体时关键点命中率可读；关闭或异常时不影响 /#/pose 和 /#/demo
+      → 已完成: 新增 /#/segmentation 独立测试页，侧边栏入口为“分割测试”
+      → 已完成: 测试页开启 Pose Landmarker 的 `outputSegmentationMasks`，绘制半透明人体 mask、Pose 关键点、mask 覆盖率、关键点命中率和 FPS
+      → 已验收: 能看到半透明人体轮廓，关键点能够正常识别
+      → 结论: Pose 自带 segmentation mask 在当前设备和浏览器链路中基本可用，可进入 Phase 3 评估 mask + RGB-D depth 区域采样融合
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+## Phase 3: RGB-D depth 区域采样融合
+
+- [x] 3.1 评估 depth + 骨架区域采样
+      → 不只采 wrist 单点
+      → 在肢体附近采样局部区域，提升稳定性
+      → 对手腕、肘部、肩部、躯干、膝盖、脚踝分别设计采样半径或采样区域
+      → 已完成: /#/segmentation 测试页接入 RGB-D depth server POST 多点采样
+      → 已完成: 第一批采样点覆盖左腕、右腕、肩中心、髋中心、左踝、右踝
+      → 已完成: 每个采样点使用独立 radius / searchRadius，请求 depthMm、medianDepthMm、foregroundDepthMm 和 validRatio
+      → 已验证: npm.cmd --prefix frontend run build 通过
+
+- [x] 3.2 评估 depth + 人体分割
+      → 用人体 mask 过滤背景 depth
+      → 减少采到背景的问题
+      → 判断前景 depth、median depth 和骨架点 depth 的融合口径
+      → 已完成: /#/segmentation 使用 segmentation mask 判断 depth 采样点是否落在人像区域
+      → 已完成: 画面中用绿色 / 红色标注 depth 采样点，绿色表示落在人像 mask 内，红色表示疑似踩到背景
+      → 已完成: 右侧展示 Depth 命中率、各采样点 depth、mask 命中值、median / foreground / validRatio
+      → 当前融合口径: 先不改 depth server，只在前端把 mask 命中作为质量反馈；后续再决定是否把 mask 坐标或人体区域传给 depth server
+
+- [x] 3.3 评估 depth 对动作识别的实际收益
+      → 出拳: 前后方向是否更稳定
+      → 手向前 / 手向后: 是否减少误报
+      → 躯干基准: 是否减少侧身或遮挡造成的异常
+      → 已完成: 在 /#/segmentation 中提供手腕、肩中心、髋中心、脚踝的 depth + mask 命中观测入口
+      → 验收重点: 正对摄像头时手腕 / 肩髋中心 / 脚踝采样点应多数为绿色；手或脚移出人体轮廓、遮挡或侧身时，应能看到红色或命中率下降
+      → 已验收: 正对摄像头时手腕、肩 / 髋中心、脚踝点多数为绿色；手脚离开人体轮廓、被遮挡或侧身时，会出现红色点或 Depth 命中率下降
+      → 预期收益: 若手腕 depth 点落在人像 mask 内且 foregroundDepthMm 稳定，则后续可用于出拳、手向前 / 手向后；若肩髋中心命中稳定，则可用于躯干 depth 基准
+      → 结论: mask + RGB-D 可以先作为动作识别接入前的质量门控和采样可信度反馈，不急于直接改 /#/demo
+      → 边界: 本阶段只做测试页评估，不把结果接入 /#/demo 的动作识别状态机
+
+## Phase 4: Whole-Body Pose Estimation 测评
+
+- [x] 4.1 记录 Whole-Body Pose 关键点规模和价值
+      → COCO-WholeBody 常见为 133 个关键点: 身体 17、脚 6、脸 68、双手 42
+      → 价值: 比 MediaPipe Pose 33 点更细，尤其补足脚部、手部和面部密集关键点
+      → 边界: 仍是 2D/关键点估计，不等于人体表面 mesh，也不直接提供肌肉或身体体积
+      → 定位: Whole-Body Pose 仍属于关键点路线，优先级高于 DensePose / SAM 3D Body 这类更重的区域或 mesh 方案
+      → 已确认: COCO-WholeBody / MMPose 方向适合评估“更多关键点是否能增强动作识别”，尤其是脚、手、脸这些当前 MediaPipe Pose/Hand 组合仍需手动拼接的部位
+      → 已确认: Whole-Body Pose 的价值不是替代 segmentation mask 或 RGB-D，而是补足关键点密度；mask + depth 仍负责人体区域和前后距离可信度
+
+- [x] 4.2 评估候选技术栈
+      → OpenMMLab MMPose / RTMPose / RTMW
+      → 推理后端: Python、ONNXRuntime、TensorRT、ncnn 或 MMDeploy
+      → 判断是否适合当前 Windows 开发环境和未来外场设备
+      → 已确认: MMPose 支持 whole-body pose estimation，RTMPose / RTMW 是主要候选
+      → 已确认: RTMPose 强调实时多人体姿态估计，论文报告了较高实时性能；RTMW 面向 2D/3D whole-body，覆盖 body / hands / face / feet
+      → 已确认: MMDeploy 支持将 MMPose 模型转换到 ONNXRuntime、TensorRT、ncnn、OpenVINO 等后端，可用于后续部署评估
+      → 技术路线建议: 第一轮先做 Python + MMPose/RTMW 单帧或视频离线验证；第二轮再考虑 ONNXRuntime 或 TensorRT；暂不直接塞进 Vue 前端
+
+- [x] 4.3 评估对本项目动作识别的收益
+      → 脚部关键点: 双脚打开 / 合拢、高抬腿、开合跳、深蹲边界
+      → 手部关键点: 挥手、出拳、握拳、手臂姿态
+      → 面部关键点: 点头、摇头、转头质量反馈
+      → 目标: 判断是否能增强脚部、手部和面部动作识别，而不是追求更复杂的人体建模
+      → 风险: 133 点可能增加计算量、部署复杂度和前端显示拥挤
+      → 预期收益: 脚部 6 点可能改善“双脚打开 / 合拢”和下肢动作边界；手部 42 点可减少单独 Hand Landmarker 与 Pose 拼接误差；脸部 68 点可增强头部动作和朝向质量反馈
+      → 现实边界: 当前项目已有 MediaPipe Hand 和 Face 旧实现，Whole-Body Pose 的新增价值主要是统一模型和统一坐标，不一定天然比现有单项模型更准
+      → 风险记录: 133 点会让显示层更拥挤，也可能引入较重 Python 环境、模型权重、检测框前处理和多后端部署复杂度
+
+- [x] 4.4 判断是否进入实验 tab
+      → 若实时性可接受，新增独立测试 tab，不影响 /#/demo
+      → 若实时性一般，先做 Python 后端或离线视频测评
+      → 若部署成本过高，只保留为研究记录
+      → 结论: 值得后续进入独立实验链路，但不建议立即做 Vue 端实时接入
+      → 建议新增后续任务: 先创建 Python 脚本或小服务，读取摄像头 / 视频帧并输出 133 点 JSON；验证 FPS、关键点稳定性和与现有 MediaPipe 关键点的差异
+      → 实验 tab 条件: 当 Python/ONNX 链路能稳定输出 133 点 JSON 后，再新增 /#/wholebody-test 可视化，不影响 /#/demo
+      → 暂不接入原因: 当前 mask + RGB-D 已经能解决一部分质量反馈问题；Whole-Body Pose 应先证明它对动作识别收益大于部署成本
+
+## Phase 5: DensePose / 细粒度人体区域研究记录
+
+- [x] 5.1 评估 DensePose
       → 是否能区分躯干、大腿、小腿、手臂等人体区域
       → 是否适合 Python 后端
       → 是否能服务运动幅度和置信度
+      → 已确认: DensePose 的核心是把 RGB 图像中的人体像素映射到人体 3D 表面表示，属于 dense correspondence / body surface 路线，不是普通关键点检测
+      → 已确认: DensePose-COCO 标注了 COCO 中约 50K 人体实例的图像到身体表面对应关系；Detectron2 中包含 DensePose 项目和模型 zoo，可作为 Python 后端研究入口
+      → 对本项目的潜在价值: 可把人体像素划分到更细的人体表面区域，用于躯干、大腿、小腿、手臂等区域级运动量和 depth 区域过滤
+      → 与 Whole-Body Pose 的区别: Whole-Body Pose 提供更多关键点，更适合动作边界；DensePose 提供人体表面区域，更适合区域 mask、身体表面参与度和展示/离线分析
+      → 与 segmentation mask 的区别: segmentation mask 只告诉“是不是人体”，DensePose 可进一步告诉“人体的哪个表面区域”
+      → 结论: DensePose 对“细粒度人体区域”有研究价值，但当前优先级低于 segmentation mask、RGB-D 区域采样和 Whole-Body Pose
 
-- [ ] 3.2 判断实时性和部署成本
+- [x] 5.2 判断实时性和部署成本
       → 是否需要 GPU
       → 是否能在当前演示设备上运行
       → 是否只适合离线实验
+      → 若成本过高，保留为后续研究，不进入当前实时链路
+      → 已确认: DensePose 当前主要通过 Detectron2 / Python / PyTorch 链路使用，浏览器端直接实时接入成本较高
+      → 已确认: Detectron2 官方 model zoo 支持加载配置和预训练权重，DensePose 也已整合到 Detectron2 项目中；但 Windows 本机安装、CUDA/PyTorch 版本、模型权重和推理速度都需要单独验证
+      → 部署判断: 不建议直接接入 /#/demo；若要验证，先做 Python 离线图片 / 视频脚本，或独立后端服务输出区域 mask / IUV，再考虑 /#/densepose-test
+      → 性能风险: 即使论文和模型报告过实时或多帧性能，实际外场设备还要叠加 Pose/Hand/RGB-D/前端展示，整体延迟可能不可接受
+      → 维护风险: DensePose 输出 IUV / body surface 区域，后续还需要把区域结果映射到本项目的动作强度、幅度、频率和 cal 解释口径，工程工作量不小
 
-## Phase 4: SAM 3D Body / Human Mesh Recovery
+- [x] 5.3 Phase 5 收尾结论
+      → 当前不实现 DensePose，不新增前端 tab
+      → 近期优先级: 继续沿用 segmentation mask + RGB-D 质量门控；Whole-Body Pose 若要推进，先做 Python/ONNX 133 点 JSON 验证
+      → DensePose 后续用途: 作为离线分析、论文展示、人体表面区域参与度、肢体区域 depth 过滤和未来 3D/mesh 方向的过渡研究
+      → 接入条件: 只有当“人体区域细分”成为动作强度估算的关键瓶颈，并且现有 segmentation / depth / Whole-Body Pose 仍不足时，再创建 DensePose 独立验证任务
 
-- [ ] 4.1 离线核对 SAM 3D Body
-      → checkpoint、许可证、显存、推理速度
-      → 是否能改善侧身、遮挡和躯干参考面
+## Phase 6: SAM 3D Body / Human Mesh Recovery 暂缓记录
 
-- [ ] 4.2 与 RGB-D 方案比较
-      → RGB-D 正面前后方向已可用
-      → SAM 3D Body 的价值主要在侧身、遮挡、人体表面和 mesh 展示
+- [x] 6.1 记录 SAM 3D Body 暂缓原因
+      → 实时 kcal 计算必须低延迟
+      → SAM 3D Body / HMR 更适合离线建模、个体化身体参数或论文展示
+      → 当前不作为 Task8 实现重点
+      → 已确认: Task8 当前重点是 segmentation mask、RGB-D 区域采样和 Whole-Body Pose；SAM 3D Body / HMR 暂不进入实时链路
+      → 暂缓原因: 模型较重、部署复杂、实时性不确定，且当前已有轻量方案能先解决质量反馈和采样可信度问题
 
-## Phase 5: RGB-D 点云和人体区域融合
+- [x] 6.2 记录未来可能用途
+      → 使用者正面照、侧面照、背面照做秒级到 2 分钟内建模
+      → 后续实时检测仍由轻量 Pose/Hand/RGB-D 主链路承担
+      → mesh 主要辅助个体化身体比例、展示和离线校准
+      → 已记录: 未来可用于个体化身体比例、离线体态建模、论文展示、外场体验中的预建模流程
+      → 接入条件: 当实时主链路已经稳定，且需要个体化身体模型或更真实人体展示时，再单独开启新 task
 
-- [ ] 5.1 评估 depth + 人体分割
-      → 用人体 mask 过滤背景 depth
-      → 减少采到背景的问题
+## Phase 7: Whole-Body Pose 测试和探索
 
-- [ ] 5.2 评估 depth + 骨架区域采样
-      → 不只采 wrist 单点
-      → 在肢体附近采样局部区域，提升稳定性
+- [x] 7.1 前置调查和资料确认
+      → 调查目标: 确认 Whole-Body Pose 是否值得进入独立测试链路，是否可能优于当前 /#/demo 的关键点稳定性和动作识别解释能力
+      → 已确认: MMPose Inferencer 支持图片、视频、文件夹和 webcam 输入，也可保存 predictions JSON
+      → 已确认: MMPose 模型别名中存在 `wholebody`，对应 RTMPose-m + RTMDet-m 的 human wholebody pose estimation
+      → 已确认: COCO-WholeBody / MMPose whole-body 常见 133 点包含身体、脚、双手和面部关键点
+      → 已确认: RTMW 是 OpenMMLab 发布的 2D/3D whole-body pose estimation 方向，面向 body / hands / face / feet 的统一关键点输出
+      → 已确认: MMDeploy 支持 MMPose 模型导出到 ONNXRuntime、TensorRT、ncnn、OpenVINO 等后端，后续可评估部署路线
+      → 初步判断: Whole-Body Pose 值得做独立测试，但先走 Python/JSON 验证，不直接改 /#/demo
 
-## Phase 6: 结论和后续路线
+- [x] 7.2 环境和候选模型确认
+      → 确认当前 Windows / Python / CUDA / PyTorch 环境能否安装 MMPose、MMDetection、MMEngine、MMCV
+      → 候选一: MMPose `wholebody` inferencer，优先快速验证 133 点 JSON 输出
+      → 候选二: RTMW / RTMW3D，评估是否比普通 wholebody alias 更适合本项目
+      → 候选三: ONNXRuntime / MMDeploy 导出链路，作为后续部署优化方向
+      → 输出要求: 记录安装步骤、模型权重来源、是否需要 GPU、CPU/GPU FPS 和失败原因
+      → 已确认候选一: MMPose 官方 Inferencer 支持 `wholebody` alias，对应 `rtmpose-m_8xb64-270e_coco-wholebody-256x192`，检测器为 RTMDet-m，可用于快速输出 whole-body 关键点和 predictions JSON
+      → 已确认候选二: RTMW 是 OpenMMLab 的 Real-Time Multi-Person 2D/3D Whole-body Pose Estimation 方向，覆盖 body / hands / face / feet，适合后续更高质量 whole-body 测试
+      → 已确认候选三: MMDeploy 支持 MMPose 模型转换到 ONNXRuntime、TensorRT、ncnn、OpenVINO 等后端；该路线适合后续部署优化，不作为第一轮验证入口
+      → 初步路线: 第一轮先用 Python + MMPose `wholebody` inferencer 跑通图片 / 视频 / webcam 和 JSON 输出；第二轮再考虑 RTMW 或 MMDeploy
+      → 成功环境: conda env `CalorieCalPose`，Python 3.10
+      → 成功依赖组合: torch 2.1.2+cu121 / CUDA 12.1 / numpy 1.26.4 / mmcv 2.1.0 / mmengine 0.10.7 / mmdet 3.2.0 / mmpose 1.3.2 / xtcocotools 1.14.3
+      → 成功安装要点: 使用兼容 PyTorch 2.1 + CUDA 12.1 的 OpenMMLab 组合；`mmcv._ext` 必须能导入；NumPy 固定为 1.26.4，避免 NumPy 2.x 二进制兼容问题
+      → 成功验证命令: `python -c "import mmcv; import mmcv._ext; print('mmcv', mmcv.__version__, 'ext ok')"` 输出 `mmcv 2.1.0 ext ok`
+      → 成功验证命令: `python -c "import xtcocotools._mask; print('xtcocotools ok')"` 输出 `xtcocotools ok`
+      → 成功验证命令: `python -c "from mmpose.apis import MMPoseInferencer; inferencer = MMPoseInferencer('wholebody'); print('wholebody inferencer ok')"` 输出 `wholebody inferencer ok`
+      → 已下载模型权重: RTMPose wholebody checkpoint `rtmpose-m_simcc-coco-wholebody_pt-aic-coco_270e-256x192-cd5e845c_20230123.pth`
+      → 已下载检测器权重: RTMDet person checkpoint `rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth`
+      → 当前注意事项: RTX 5060 Laptop GPU 会提示 `sm_120` 不在 torch 2.1.2+cu121 支持列表内；这不影响 inferencer 初始化，但 GPU 实际推理是否可用必须在 7.3 离线图片 / 视频推理中验证
+      → Phase 7.2 结论: Whole-Body Pose 的 MMPose 环境已完成初始化并可加载模型，进入 7.3；若 7.3 GPU 实推失败，再评估 CPU 离线验证、更新 PyTorch/MMCV 组合、WSL/Docker 或 ONNXRuntime 路线
 
-- [ ] 6.1 给出接入判断
-      → 暂缓 / 离线实验 / Python 后端 / 实时演示接入
+- [x] 7.3 离线图片 / 视频推理验证
+      → 先用本地图片或短视频跑 MMPose wholebody
+      → 输出 133 点 JSON，并记录关键点索引、置信度、检测框和推理耗时
+      → 验证脚部、手部、脸部关键点是否稳定，是否比当前 MediaPipe Pose/Hand 组合更容易解释
+      → 若离线推理失败，记录依赖、权重、CUDA 或模型配置问题，不进入前端
+      → 已新增离线探针脚本: `task8-更详细人体识别方案研究/wholebody_offline_probe.py`
+      → 脚本能力: 支持图片 / 视频输入，输出统一 JSON；记录 environment、keypointLayout、summary、frames、instances、bbox、133 点 keypoints、keypointScores 和 body/foot/face/hand 分组统计
+      → 已处理 Windows 中文路径问题: 图片读取使用 `np.fromfile + cv2.imdecode`；视频读取在必要时临时复制到 ASCII 路径再交给 OpenCV
+      → 已验证 CPU 自测: `--self-test --device cpu` 可输出 `wholebody_self_test_cpu.json`；空白图也可能出现低质量预测，因此后续判断应关注 `keypointScoreMean` 和分组有效点数量，而不是只看 bbox
+      → 已验证真实图片推理: 使用 MMPose COCO 示例图 `wholebody_sample_coco.jpg`，CPU 输出 `wholebody_sample_coco_cpu.json` 和可视化 `wholebody_sample_coco_cpu_vis/frame_000000.jpg`
+      → 图片结果: 单帧 CPU 推理约 900ms；检测到 1 人；输出 133 个关键点；平均关键点分数约 0.863；body 17、left_foot 3、right_foot 3、face 68、left_hand 21、right_hand 21 均达到 `kptThr=0.3`
+      → 已验证短视频通路: 使用同图合成 `wholebody_sample_coco_short.mp4`，CPU 读取 3 帧并输出 `wholebody_sample_video_cpu.json`
+      → 视频结果: 3 帧 CPU 平均约 577ms/帧；平均关键点分数约 0.8613；证明视频输入和多帧 JSON 结构可用
+      → 已验证 CUDA 当前不可用: `--device cuda` 在 RTX 5060 Laptop GPU 上失败，错误为 `CUDA error: no kernel image is available for execution on the device`
+      → CUDA 失败原因判断: 当前 torch 2.1.2+cu121 支持 sm_50 / sm_60 / sm_61 / sm_70 / sm_75 / sm_80 / sm_86 / sm_90，不支持 RTX 5060 的 sm_120；这不是 MMPose 模型本身不可用，而是 PyTorch CUDA kernel 架构支持不足
+      → Phase 7.3 结论: Whole-Body Pose 离线图片 / 视频 JSON 链路已经跑通；当前可用 CPU 做研究验证，但不适合实时；若要进入摄像头准实时或前端测试页，需要先解决 GPU / ONNXRuntime / WSL-Docker / 新版 PyTorch+MMCV 兼容路线
 
-- [ ] 6.2 记录收益和风险
-      → 侧身改善
-      → 遮挡改善
-      → depth 背景过滤
-      → 性能和部署复杂度
+- [x] 7.3.1 Ubuntu 22.04 + RTX 3060 新主机交接
+      → 目标: 新主机用于继续 Task8 Phase 7.4 摄像头 / 准实时 Whole-Body Pose 验证
+      → 目标硬件: RTX 3060 12GB，compute capability `sm_86`，与 torch 2.1.2+cu121 支持范围匹配
+      → 目标系统: Ubuntu 22.04 LTS；Windows 也可用，但新主机优先按 Ubuntu 路线交接，减少 OpenMMLab / CUDA / 编译扩展环境不确定性
+      → 推荐驱动: NVIDIA Driver 使用 535+ / 550+ / 更新稳定版；以 `nvidia-smi` 能正确显示 RTX 3060 和驱动版本为第一验收项
+      → Python 环境: conda env `CalorieCalPose`，Python 3.10
+      → 固定依赖组合: torch 2.1.2+cu121、torchvision 0.16.2+cu121、torchaudio 2.1.2+cu121、numpy 1.26.4、opencv-python 4.10.0.84、mmengine 0.10.7、mmcv 2.1.0 full、mmdet 3.2.0、mmpose 1.3.2、xtcocotools 1.14.3、openmim 0.3.9
+      → 关键要求: `mmcv` 必须是 full mmcv，不能是 `mmcv-lite`；必须验证 `import mmcv._ext` 成功
+      → 推荐安装顺序:
+        1. `conda create -n CalorieCalPose python=3.10 -y`
+        2. `conda activate CalorieCalPose`
+        3. `python -m pip install --upgrade "pip<25" "setuptools<70" wheel`
+        4. `pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121`
+        5. `pip install numpy==1.26.4 opencv-python==4.10.0.84 openmim==0.3.9`
+        6. `mim install "mmcv==2.1.0"`
+        7. `mim install "mmdet==3.2.0"`
+        8. `pip install "mmpose==1.3.2" "xtcocotools==1.14.3"`
+      → 环境验收命令:
+        1. `nvidia-smi`
+        2. `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))"`
+        3. `python -c "import mmcv; import mmcv._ext; print('mmcv', mmcv.__version__, 'ext ok')"`
+        4. `python -c "import numpy, cv2, mmengine, mmdet, mmpose; print(numpy.__version__, cv2.__version__, mmengine.__version__, mmdet.__version__, mmpose.__version__)"`
+        5. `python -c "from mmpose.apis import MMPoseInferencer; inferencer = MMPoseInferencer('wholebody', device='cuda'); print('wholebody cuda ok')"`
+      → 项目交接步骤:
+        1. 拉取当前仓库代码
+        2. 在仓库根目录执行 `python "task8-更详细人体识别方案研究/wholebody_offline_probe.py" --self-test --device cuda --output "task8-更详细人体识别方案研究/wholebody_self_test_cuda_rtx3060.json"`
+        3. 执行 `python "task8-更详细人体识别方案研究/wholebody_offline_probe.py" --input "task8-更详细人体识别方案研究/wholebody_sample_coco.jpg" --device cuda --output "task8-更详细人体识别方案研究/wholebody_sample_coco_cuda_rtx3060.json" --save-vis`
+        4. 若 CUDA 输出正常且无 `no kernel image` 错误，则进入 7.4 摄像头 / 准实时验证
+      → 前端交接步骤: 在 `frontend` 目录执行 `npm install` 和 `npm run build`，确认现有 /#/pose、/#/segmentation、/#/demo 可构建；Task8 仍不直接改 /#/demo
+      → 验收标准: `torch.cuda.is_available() = True`；GPU 名称为 RTX 3060；capability 约为 `(8, 6)`；`mmcv._ext` 成功；`MMPoseInferencer('wholebody', device='cuda')` 成功；`wholebody_offline_probe.py --device cuda` 能输出 133 点 JSON
+      → 失败处理: 若 `mmcv._ext` 失败，优先检查是否装成 `mmcv-lite` 或 torch/cu121/mmcv 版本不匹配；若 NumPy 报二进制兼容问题，固定回 `numpy==1.26.4` 并重装 `xtcocotools`
+      → 交接结论: RTX 3060 是当前 MMPose GPU 验证路线的稳妥硬件；若新主机验收通过，7.4 可以改用 GPU 实测 FPS、延迟和关键点稳定性
+      → 已验收: Ubuntu 22.04 + RTX 3060 环境可用，`torch.cuda.is_available() = True`，GPU 为 `NVIDIA GeForce RTX 3060`
+      → 已验收: `wholebody_self_test_cuda_rtx3060.json`、`wholebody_sample_coco_cuda_rtx3060.json`、`wholebody_sample_video_cuda_rtx3060.json` 均生成成功
+      → 已验收: 示例图片输出 1 人、133 点、平均关键点分数约 0.8634；短视频 5 帧均输出 133 点
+      → 性能记录: 短视频第 1 帧约 490ms 属于模型预热，后续帧约 39~42ms/帧，约 24~25 FPS；GPU 离线链路已闭合
+
+- [x] 7.4 摄像头 / 准实时验证
+      → 使用 webcam 输入测试实时或准实时推理
+      → 记录 FPS、延迟、关键点抖动、遮挡表现和多人场景表现
+      → 重点动作: 静息、挥手、出拳、双脚打开/合拢、高抬腿、深蹲、点头/摇头
+      → 目标: 判断 Whole-Body Pose 是否在动作识别层面可能优于当前 /#/demo
+      → 已新增摄像头探针脚本: `task8-更详细人体识别方案研究/wholebody_webcam_probe.py`
+      → 探针能力: 读取 webcam，运行 MMPose `wholebody`，可实时 OpenCV overlay 显示 133 点，可输出性能 JSON，可保存一张 overlay snapshot
+      → 无窗口测试命令:
+        `python "task8-更详细人体识别方案研究/wholebody_webcam_probe.py" --device cuda --camera 0 --duration 10 --max-frames 120 --warmup-frames 3 --mirror --output "task8-更详细人体识别方案研究/wholebody_webcam_cuda_rtx3060.json" --save-snapshot "task8-更详细人体识别方案研究/wholebody_webcam_cuda_rtx3060_snapshot.jpg"`
+      → 实时显示测试命令:
+        `python "task8-更详细人体识别方案研究/wholebody_webcam_probe.py" --device cuda --camera 0 --duration 20 --max-frames 300 --warmup-frames 3 --mirror --show --output "task8-更详细人体识别方案研究/wholebody_webcam_cuda_rtx3060_show.json" --save-snapshot "task8-更详细人体识别方案研究/wholebody_webcam_cuda_rtx3060_show_snapshot.jpg"`
+      → 量化字段: `meanInferMs`、`p50InferMs`、`p95InferMs`、`wallFps`、`modelOnlyFpsEstimate`、`maxKeypointCount`、`meanKeypointScore`
+      → 当前状态: 本对话运行环境没有可用 `/dev/video*` 摄像头设备，需在 Ubuntu 主机本地运行上述命令后再补记录
+      → 完成判定: 生成 `wholebody_webcam_cuda_rtx3060.json` 和 snapshot；`maxKeypointCount = 133`；预热后 `meanInferMs`、`p50InferMs`、`p95InferMs`、`wallFps` 可读；画面能看到人体框和 133 点 overlay
+      → 若本机摄像头被占用或 camera 0 不可用，先尝试 `--camera 1`；若远程 / 容器环境无摄像头，本项只记录为“探针已准备，等待本机执行”
+      → 已验收: 用户在 Ubuntu 22.04 + RTX 3060 主机运行实时窗口测试，效果良好
+      → 已生成: `wholebody_webcam_cuda_rtx3060_show.json` 和 `wholebody_webcam_cuda_rtx3060_show_snapshot.jpg`
+      → 实测性能: 300 帧，实测 `wallFps = 22.81`，`meanInferMs = 36.96`，`p50InferMs = 36.05`，`p95InferMs = 38.82`，`modelOnlyFpsEstimate = 27.05`
+      → 实测输出: `maxKeypointCount = 133`，`meanKeypointScore = 0.5978`；snapshot 可见人体框、脸部 / 手部 / 身体关键点 overlay
+      → 结论: Whole-Body Pose 摄像头准实时链路已闭合，可作为 Python 探针保留
+
+- [x] 7.5 JSON 服务或数据桥设计
+      → 若 Python 推理可行，设计一个轻量后端输出 133 点 JSON
+      → 前端可通过 HTTP/WebSocket 获取最新 whole-body keypoints
+      → JSON 字段建议: time、fps、instances、bbox、keypoints、scores、modelName、backend
+      → 不直接混入现有 Pose/Demo 状态机，先保持独立测试数据源
+      → 已完成设计判断: 暂不实现常驻 JSON 服务 / WebSocket 数据桥
+      → 原因: Whole-Body 133 点主要增量集中在脸和手，动作收益有限；把 Python GPU 推理常驻为服务会引入摄像头同步、GPU 占用、前后端延迟和部署维护成本
+      → 替代闭合方式: 使用 `wholebody_webcam_probe.py` 输出同等结构的性能 JSON 和 overlay snapshot，作为 Phase 7 的可复现验证产物
+      → 后续条件: 只有当 7.4 实测显示关键点稳定性明显优于 MediaPipe Pose/Hand，或后续确实需要统一 133 点数据源时，再单独创建服务化任务
+
+- [x] 7.6 新增 /#/wholebody-test 独立测试 tab
+      → 前提: Python/ONNX 链路能稳定输出 133 点 JSON
+      → 页面定位: 与 /#/segmentation 平级的 Task8 测试页
+      → 展示内容: 原视频或后端帧、133 点关键点、关键点分组、FPS、置信度、关键动作候选
+      → 对比内容: 同屏或指标对比 MediaPipe Pose/Hand 与 Whole-Body Pose 的脚、手、脸关键点稳定性
+      → 边界: 不影响 /#/demo；只有验证优于当前方案后，才考虑后续迁移或融合
+      → 已完成接入决策: 当前不新增 /#/wholebody-test 前端 tab
+      → 原因: Python 探针已经能完成 133 点可视化和 FPS 记录；再做前端 tab 需要后端视频流 / JSON 同步桥，当前收益不足
+      → 替代验证入口: OpenCV overlay 窗口和 snapshot 足够关闭 Task8 的 Whole-Body 实验链路
+      → 保留后续入口: 若未来 Task10 后端算法层需要对比 Whole-Body 和 MediaPipe 点位，可重新开新 task 设计独立测试页
+
+- [x] 7.7 动作识别收益验证
+      → 对比双脚打开 / 合拢: 是否减少误报
+      → 对比出拳 / 挥手: 是否因统一手部关键点而更稳定
+      → 对比点头 / 摇头 / 转头: 是否比简化面部点更可靠
+      → 对比下肢动作: 高抬腿、深蹲、开合跳边界是否更清楚
+      → 记录是否能达到“优于当前 /#/demo”的效果，尤其是稳定性、延迟和解释性
+      → 当前定性判断: 133 点结构中面部 68 点、双手 42 点，占 110/133；身体和脚部共 23 点，因此对躯干、大腿、小腿等全身动作的新增收益有限
+      → 预期可能有收益: 手部姿态、握拳、点头 / 摇头 / 转头质量反馈、脚部细节
+      → 预期收益有限: 深蹲、高抬腿、开合跳、双脚打开 / 合拢这类主要依赖髋膝踝和时序算法的动作
+      → 最终验证方式: 待 7.4 webcam JSON 和 snapshot 生成后，观察实时稳定性、抖动和延迟，再决定是否把 7.7 勾选为“收益一般，保留研究记录”
+      → 已完成定性验证: 实时窗口证明 133 点显示和性能可用，但关键点密度主要集中在面部和手部，不改变“现有点位基本够用，核心问题在算法层”的判断
+      → 动作收益判断: 不建议为了深蹲、高抬腿、开合跳等全身动作继续投入 Whole-Body 接入；这些动作更需要后端算法层的时序、平滑、模板和状态机
+      → 保留价值: Whole-Body 可作为后续手势 / 表情 / 头部反馈、论文展示或技术储备，不进入当前产品主链路
+
+- [x] 7.8 阶段结论和接入决策
+      → 可选结论: 暂缓 / 离线使用 / Python 后端测试 / 前端测试 tab / 后续融合到 demo
+      → 若收益明显: 进入新 task，设计 Whole-Body Pose 与现有 segmentation + RGB-D 的融合方案
+      → 若收益一般: 保留为研究记录，继续优化当前 MediaPipe + RGB-D 主链路
+      → 若部署成本过高: 只保留为论文/展示/离线分析方向
+      → 当前倾向: Whole-Body Pose 链路先闭合为 Python 探针和性能记录；由于 133 点主要集中在面部和手部，动作收益可能有限，暂不优先做 /#/wholebody-test 或接入 /#/demo
+      → 与 Task10 衔接: Task8 收尾后，优先进入后端算法层快速验证，用更好的时序、平滑、模板和状态机利用现有点位
+      → 收尾条件: 7.4 本机 webcam 探针跑通后，若结果与离线短视频一致达到准实时，则 7.8 结论建议为“Python 探针闭合 / 暂不服务化 / 暂不接 demo / 转入 Task10”
+      → 最终结论: Whole-Body Pose 链路已闭合为 Python 离线 / 摄像头探针；性能达到准实时，但动作识别收益不足以支撑当前阶段服务化或接入 /#/demo
+      → 接入决策: 暂不实现 JSON 服务、暂不新增 /#/wholebody-test、暂不融合到演示页
+      → 后续方向: Task8 收尾，转入 Task10 后端算法层快速验证，重点提升“如何更有效地利用现有点位”
+
+---
+
+## 附录：Phase 7 环境失败记录
+
+### A.1 `CalorieCal` 环境失败记录
+
+- 失败环境: conda env `CalorieCal`，Python 3.10
+- 失败组合: torch 2.11.0+cu128 / CUDA 12.8 / numpy 1.26.4 / mmcv 2.1.0 / mmengine 0.10.7 / mmdet 3.2.0 / mmpose 1.3.2
+- 失败现象: `MMPoseInferencer('wholebody')` 导入失败，出现 `ModuleNotFoundError: No module named 'mmcv._ext'`
+- 失败原因判断: 当前安装链路实际缺少 OpenMMLab 编译扩展，类似 `mmcv-lite` 或无匹配 wheel 状态；MMPose 导入 transformer heads 时触发 `MultiScaleDeformableAttention` / `mmcv.ops`
+- 处理结论: torch 2.11.0+cu128 太新，Windows 下难以获得匹配的 mmcv 预编译 wheel；不建议在该环境继续源码编译 mmcv
+
+### A.2 `CalorieCalPose` NumPy 2.x 失败记录
+
+- 失败环境: conda env `CalorieCalPose`，Python 3.10
+- 失败组合: torch 2.1.2+cu121 / mmcv 2.1.0 / mmdet 3.2.0 / mmpose 1.3.2 / numpy 2.2.6
+- 失败现象: import torch / mmcv / mmpose 时出现 `_ARRAY_API not found`；导入 `xtcocotools._mask` 时出现 `numpy.dtype size changed`
+- 失败原因判断: torch 2.1.2、mmcv、xtcocotools 等二进制包按 NumPy 1.x 编译，不能直接运行在 NumPy 2.2.6 上
+- 处理结论: 将 NumPy 固定到 `1.26.4` 并重装 `xtcocotools` 后，`mmcv._ext`、`xtcocotools._mask` 和 `MMPoseInferencer('wholebody')` 均验证通过
 
 ---
 
@@ -79,3 +392,35 @@
 ### Task8 的定位
 
 Task8 才负责“识别更详细”。Task7 只负责把已有关键点画得更像人体结构，避免 UI 优化阶段被重模型和后端研究拖偏。
+
+### 当前方向确认
+
+已确认 Task8 暂时不用 SAM 3D Body 等重模型，先评估当前已有方向的可行性，尤其是 MediaPipe segmentation mask、RGB-D depth 区域采样和现有 Pose/Hand 阈值边界。
+
+补充：
+(CalorieCalPose) PS C:\Users\afrangry\PycharmProjects\CalorieCal> python -c "import sys, platform, importlib.metadata as md; import numpy, torch, cv2, mmcv, mmengine, mmdet, mmpose; print('python:', sys.version.replace(chr(10),' ')); print('executable:', sys.executable); print('platform:', platform.platform()); print('numpy:', numpy.__version__); print('torch:', torch.__version__); print('torch cuda:', torch.version.cuda); print('cuda available:', torch.cuda.is_available()); print('gpu count:', torch.cuda.device_count()); print('gpu name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'); print('gpu capability:', torch.cuda.get_device_capability(0) if torch.cuda.is_available() else 'cpu'); print('torchvision:', md.version('torchvision') if 'torchvision' in [d.metadata['Name'] for d in md.distributions()] else 'not installed'); print('torchaudio:', md.version('torchaudio') if 'torchaudio' in [d.metadata['Name'] for d in md.distributions()] else 'not installed'); print('opencv:', cv2.__version__); print('mmcv:', mmcv.__version__); print('mmengine:', mmengine.__version__); print('mmdet:', mmdet.__version__); print('mmpose:', mmpose.__version__); print('xtcocotools:', md.version('xtcocotools')); print('openmim:', md.version('openmim') if 'openmim' in [d.metadata['Name'] for d in md.distributions()] else 'not installed')"
+python: 3.10.20 | packaged by Anaconda, Inc. | (main, Mar 11 2026, 17:42:35) [MSC v.1942 64 bit (AMD64)]
+executable: C:\Users\afrangry\anaconda3\envs\CalorieCalPose\python.exe
+platform: Windows-10-10.0.26200-SP0
+numpy: 1.26.4
+torch: 2.1.2+cu121
+torch cuda: 12.1
+cuda available: True
+gpu count: 1
+C:\Users\afrangry\anaconda3\envs\CalorieCalPose\lib\site-packages\torch\cuda\__init__.py:215: UserWarning: 
+NVIDIA GeForce RTX 5060 Laptop GPU with CUDA capability sm_120 is not compatible with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_61 sm_70 sm_75 sm_80 sm_86 sm_90.
+If you want to use the NVIDIA GeForce RTX 5060 Laptop GPU GPU with PyTorch, please check the instructions at https://pytorch.org/get-started/locally/
+
+  warnings.warn(
+gpu name: NVIDIA GeForce RTX 5060 Laptop GPU
+gpu capability: (12, 0)
+torchvision: 0.16.2+cu121
+torchaudio: 2.1.2+cu121
+opencv: 4.10.0
+mmcv: 2.1.0
+mmengine: 0.10.7
+mmdet: 3.2.0
+mmpose: 1.3.2
+xtcocotools: 1.14.3
+openmim: 0.3.9

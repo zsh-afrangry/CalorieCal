@@ -1,17 +1,16 @@
 import { createRouter, createWebHashHistory } from "vue-router";
 import PoseView from "./views/PoseView.vue";
-import GestureView from "./views/GestureView.vue";
-import FaceView from "./views/FaceView.vue";
 import DemoView from "./views/DemoView.vue";
+import SegmentationView from "./views/SegmentationView.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: "/", redirect: "/gesture" },
+    { path: "/", redirect: "/pose" },
     { path: "/pose", name: "pose", component: PoseView },
-    { path: "/gesture", name: "gesture", component: GestureView },
-    { path: "/face", name: "face", component: FaceView },
+    { path: "/segmentation", name: "segmentation", component: SegmentationView },
     { path: "/demo", name: "demo", component: DemoView },
+    { path: "/:pathMatch(.*)*", redirect: "/pose" },
   ],
 });
 

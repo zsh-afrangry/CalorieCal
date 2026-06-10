@@ -10,3 +10,14 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 OpenNI_2.3.0.86/
+
+__pycache__/
+*.py[cod]
+
+# Task10 local data, generated pose outputs, realtime logs, and downloaded model assets
+/task10-后端算法层快速验证/datasets/raw/public/
+/task10-后端算法层快速验证/datasets/raw/self_recorded/images/
+/task10-后端算法层快速验证/datasets/raw/self_recorded/videos/
+/task10-后端算法层快速验证/datasets/pose/
+/task10-后端算法层快速验证/models/*.task
+/数据集/*

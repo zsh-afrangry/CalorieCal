@@ -1,0 +1,143 @@
+{
+  "action_name": "squat",
+  "version": "0.1.0",
+  "status": "draft_from_task10_asset_audit",
+  "source_report": "task10-后端算法层快速验证/datasets/pose/reports/asset_audit.csv",
+  "description": "Initial summary-level squat spec derived from self-recorded Task10 samples. This is not the final frame-level state machine.",
+  "action_type": "cyclic",
+  "supported_views": ["front", "side"],
+  "required_landmarks": [
+    "LEFT_HIP",
+    "RIGHT_HIP",
+    "LEFT_KNEE",
+    "RIGHT_KNEE",
+    "LEFT_ANKLE",
+    "RIGHT_ANKLE"
+  ],
+  "strong_features": [
+    "mean_knee_angle_min",
+    "mean_knee_angle_range",
+    "hip_height_range",
+    "motion_energy_mean"
+  ],
+  "weak_or_ignored_features": [
+    {
+      "feature": "hand_posture",
+      "policy": "ignore_as_required_condition",
+      "reason": "Valid squat samples include arms forward, hands on waist, hands behind hips, and hands pressing knees inward."
+    },
+    {
+      "feature": "wrist_spread_range",
+      "policy": "ignore_for_squat",
+      "reason": "Arm posture varies across valid squat samples."
+    }
+  ],
+  "summary_rules": {
+    "front": {
+      "enabled": true,
+      "quality_gates": {
+        "detected_ratio_min": 0.95,
+        "mean_visibility_min": 0.85,
+        "mean_core_visible_ratio_min": 0.85
+      },
+      "accept_all": [
+        {
+          "feature": "mean_knee_angle_min",
+          "op": "<=",
+          "value": 120.0,
+          "reason": "Front squat positives reached about 75-117 deg; front bend-only confusion was about 125 deg."
+        },
+        {
+          "feature": "mean_knee_angle_range",
+          "op": ">=",
+          "value": 45.0,
+          "reason": "Require clear knee flexion cycle."
+        },
+        {
+          "feature": "hip_height_range",
+          "op": ">=",
+          "value": 0.30,
+          "reason": "Require visible vertical hip movement."
+        }
+      ],
+      "reject_any": [
+        {
+          "feature": "hip_height_range",
+          "op": ">",
+          "value": 2.0,
+          "reason": "Very large normalized hip range usually indicates torso-scale instability during bend-over confusion."
+        },
+        {
+          "feature": "mean_knee_angle_min",
+          "op": ">",
+          "value": 125.0,
+          "reason": "Reject bend-over cases without enough knee flexion."
+        }
+      ]
+    },
+    "side": {
+      "enabled": true,
+      "quality_gates": {
+        "detected_ratio_min": 0.95,
+        "mean_visibility_min": 0.70,
+        "mean_core_visible_ratio_min": 0.65
+      },
+      "accept_all": [
+        {
+          "feature": "mean_knee_angle_min",
+          "op": "<=",
+          "value": 65.0,
+          "reason": "Side squat positives reached about 26-61 deg; side bend/not-enough-bend confusions were about 66+ deg."
+        },
+        {
+          "feature": "mean_knee_angle_range",
+          "op": ">=",
+          "value": 85.0,
+          "reason": "Require large knee angle cycle from standing to squat."
+        },
+        {
+          "feature": "motion_energy_mean",
+          "op": ">=",
+          "value": 0.010,
+          "reason": "Reject near-static side samples."
+        }
+      ],
+      "reject_any": [
+        {
+          "feature": "mean_knee_angle_min",
+          "op": ">",
+          "value": 75.0,
+          "reason": "Reject bend-over cases without deep knee flexion."
+        }
+      ]
+    }
+  },
+  "state_machine_hint": {
+    "stages": ["stand", "downing", "down", "rising"],
+    "enter": "knee angle starts decreasing and hip moves downward",
+    "down": "mean knee angle near minimum and hip height above ankles near minimum",
+    "exit": "knee angle returns near standing angle",
+    "count": "stand -> down -> stand"
+  },
+  "frame_state_machine": {
+    "score_formula": "0.65 * normalized_knee_flexion + 0.35 * normalized_hip_drop",
+    "smoothing_window_frames": 5,
+    "stage_thresholds": {
+      "stand_max": 0.20,
+      "down_min": 0.75
+    },
+    "count_pattern": ["stand", "down", "stand"],
+    "min_down_hold_frames": 2,
+    "min_return_to_stand_frames": 2
+  },
+  "confusion_suppression": [
+    {
+      "name": "bend_over_without_knee_flexion",
+      "required_rejection_evidence": ["mean_knee_angle_min too high", "torso/hip motion without enough knee flexion"]
+    },
+    {
+      "name": "arm_posture_variation",
+      "policy": "do_not_reject_based_on_hands"
+    }
+  ]
+}

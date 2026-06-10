@@ -1,1 +1,1 @@
-{"root":["./src/app.vue","./src/main.ts","./src/router.ts","./src/vite-env.d.ts","./src/views/demoview.vue","./src/views/faceview.vue","./src/views/gestureview.vue","./src/views/poseview.vue"],"version":"5.9.3"}
+{"root":["./src/app.vue","./src/main.ts","./src/router.ts","./src/vite-env.d.ts","./src/views/demoview.vue","./src/views/faceview.vue","./src/views/gestureview.vue","./src/views/poseview.vue","./src/views/segmentationview.vue"],"version":"5.9.3"}

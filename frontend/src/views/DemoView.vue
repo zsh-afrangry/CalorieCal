@@ -12,6 +12,10 @@ type PoseStatus = "idle" | "detected" | "missing";
 type JumpingJackState = "unknown" | "closed" | "open";
 type FullBodyIntensityLevel = "静止" | "低强度" | "中强度" | "高强度";
 type ConfidenceLevel = "高" | "中" | "低";
+type WaveCompositeDirection = -1 | 0 | 1;
+type PunchCompositePhase = "idle" | "extended" | "recovering";
+type HighKneeCompositeSide = "unknown" | "left" | "right";
+type SquatCompositePhase = "idle" | "down" | "rising";
 
 type LandmarkPoint = {
   x: number;
@@ -21,6 +25,9 @@ type LandmarkPoint = {
 };
 
 type FullBodyTrackedKey =
+  | "nose"
+  | "leftEar"
+  | "rightEar"
   | "leftShoulder"
   | "rightShoulder"
   | "leftElbow"
@@ -37,6 +44,11 @@ type FullBodyTrackedKey =
 type FullBodyMotionSample = {
   time: number;
   points: Partial<Record<FullBodyTrackedKey, LandmarkPoint>>;
+};
+
+type DemoCalorieSample = {
+  time: number;
+  calories: number;
 };
 
 type FullBodyMotionFeatures = {
@@ -119,6 +131,8 @@ const DEPTH_MAX_REASONABLE_OFFSET_MM = 2000;
 const DEPTH_BASELINE_HOLD_MS = 500;
 const DEPTH_BASELINE_JUMP_MM = 900;
 const DEMO_WEIGHT_KG = 60;
+const DEMO_CALORIE_WINDOW_MS = 1000;
+const DEMO_CALORIE_MAX_DELTA_MS = 250;
 const MIN_LANDMARK_VISIBILITY = 0.5;
 const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
 const DISPLAY_FACE_LANDMARK_INDICES = [0, 3, 6, 9, 10];
@@ -131,7 +145,82 @@ const ARM_OPEN_MAX_TORSO_RATIO = 0.25;
 const ARM_CLOSED_MIN_TORSO_RATIO = 0.38;
 const ACTION_DEBOUNCE_FRAMES = 3;
 const COMPOSITE_ACTION_HOLD_MS = 900;
+const FULL_BODY_COMPOSITE_MIN_ACTION_SCORE = 55;
+const FULL_BODY_COMPOSITE_MIN_UPPER_DISTANCE = 0.018;
+const FULL_BODY_COMPOSITE_MIN_LOWER_DISTANCE = 0.025;
+const REST_COMPOSITE_ENTER_HOLD_MS = 600;
+const REST_COMPOSITE_EXIT_HOLD_MS = 280;
+const REST_COMPOSITE_MAX_ACTIVITY_SCORE = 28;
+const REST_COMPOSITE_MAX_MOVEMENT_DISTANCE = 0.022;
+const REST_COMPOSITE_MAX_UPPER_DISTANCE = 0.018;
+const REST_COMPOSITE_MAX_LOWER_DISTANCE = 0.018;
+const REST_COMPOSITE_EXIT_ACTIVITY_SCORE = 38;
+const REST_COMPOSITE_EXIT_ACTION_SCORE = 58;
+const REST_COMPOSITE_EXIT_UPPER_DISTANCE = 0.026;
+const REST_COMPOSITE_EXIT_LOWER_DISTANCE = 0.03;
+const REST_COMPOSITE_EXIT_TORSO_DISTANCE = 0.02;
+const WAVE_COMPOSITE_MIN_SWING_SCORE = 50;
+const WAVE_COMPOSITE_MIN_UPPER_DISTANCE = 0.012;
+const WAVE_COMPOSITE_DIRECTION_RATIO = 0.028;
+const WAVE_COMPOSITE_TURN_WINDOW_MS = 1300;
+const WAVE_COMPOSITE_HOLD_MS = 850;
+const WAVE_COMPOSITE_DEPTH_CONFLICT_SCORE = 72;
+const WAVE_COMPOSITE_EXTENSION_CONFLICT_SCORE = 68;
+const PUNCH_COMPOSITE_MIN_FORWARD_SCORE = 55;
+const PUNCH_COMPOSITE_MIN_EXTENSION_SCORE = 48;
+const PUNCH_COMPOSITE_MIN_FIST_SCORE = 45;
+const PUNCH_COMPOSITE_MIN_BODY_LEVEL_SCORE = 52;
+const PUNCH_COMPOSITE_MIN_UPPER_DISTANCE = 0.012;
+const PUNCH_COMPOSITE_RECOVERY_SCORE = 45;
+const PUNCH_COMPOSITE_HOLD_MS = 900;
+const JUMPING_JACK_BASIC_MIN_ARM_SCORE = 55;
+const JUMPING_JACK_BASIC_MIN_FOOT_SCORE = 45;
+const JUMPING_JACK_BASIC_MIN_UPPER_DISTANCE = 0.018;
+const JUMPING_JACK_BASIC_MIN_LOWER_DISTANCE = 0.018;
+const HIGH_KNEE_COMPOSITE_MIN_SCORE = 58;
+const HIGH_KNEE_COMPOSITE_MIN_LOWER_DISTANCE = 0.012;
+const HIGH_KNEE_COMPOSITE_ALTERNATE_WINDOW_MS = 1800;
+const HIGH_KNEE_COMPOSITE_HOLD_MS = 950;
+const SQUAT_COMPOSITE_MIN_DOWN_SCORE = 55;
+const SQUAT_COMPOSITE_MIN_UP_SCORE = 45;
+const SQUAT_COMPOSITE_MIN_LOWER_DISTANCE = 0.01;
+const SQUAT_COMPOSITE_HOLD_MS = 1100;
+const UPPER_BODY_BASIC_ACTION_LABELS = [
+  "左手上抬",
+  "右手上抬",
+  "双臂上抬",
+  "手臂回落",
+  "手向前移动",
+  "手向后移动",
+  "手水平摆动",
+  "手臂伸展",
+  "手臂弯曲",
+];
+const LOWER_BODY_BASIC_ACTION_LABELS = [
+  "双脚打开",
+  "双脚合拢",
+  "左抬腿",
+  "右抬腿",
+  "膝盖上抬",
+  "下蹲",
+  "起身",
+];
+const TORSO_OR_HEAD_BASIC_ACTION_LABELS = [
+  "身体前倾",
+  "身体后仰",
+  "身体左倾",
+  "身体右倾",
+  "身体左转",
+  "身体右转",
+  "点头",
+  "摇头",
+  "左转头",
+  "右转头",
+];
 const LANDMARK_INDEX = {
+  nose: 0,
+  leftEar: 7,
+  rightEar: 8,
   leftShoulder: 11,
   rightShoulder: 12,
   leftElbow: 13,
@@ -158,6 +247,11 @@ const FULL_BODY_TRACKED_KEYS: FullBodyTrackedKey[] = [
   "rightKnee",
   "leftAnkle",
   "rightAnkle",
+];
+const HEAD_TRACKED_KEYS: FullBodyTrackedKey[] = ["nose", "leftEar", "rightEar"];
+const SAMPLE_TRACKED_KEYS: FullBodyTrackedKey[] = [
+  ...FULL_BODY_TRACKED_KEYS,
+  ...HEAD_TRACKED_KEYS,
 ];
 const UPPER_BODY_TRACKED_KEYS: FullBodyTrackedKey[] = [
   "leftShoulder",
@@ -276,6 +370,8 @@ const fullBodyMotionFeatures = ref<FullBodyMotionFeatures>({
   movementAmplitude: 0,
   activeFullBodyMs: 0,
 });
+const demoElapsedMs = ref(0);
+const demoWindowCalories = ref(0);
 const fullBodyActivityScore = ref(0);
 const fullBodyIntensityLevel = ref<FullBodyIntensityLevel>("静止");
 const fullBodyBasicActions = ref<BasicActionCandidate[]>([]);
@@ -294,6 +390,7 @@ let isInferencing = false;
 let lastInferenceStartedAt = 0;
 let lastFpsSampleAt = 0;
 let inferenceFrameCount = 0;
+let lastDemoElapsedAt = 0;
 let lastDepthRequestAt = 0;
 let isDepthRequesting = false;
 let lastStableBodyDepthMm: number | null = null;
@@ -302,8 +399,23 @@ let smoothedLandmarks: LandmarkPoint[] | null = null;
 let latestHands: LandmarkPoint[][] = [];
 let pendingJumpingJackState: JumpingJackState = "unknown";
 let pendingJumpingJackFrames = 0;
+let restCompositeActive = false;
+let restCompositeCandidateStartedAt = 0;
+let restCompositeExitStartedAt = 0;
+let waveCompositeDirection: WaveCompositeDirection = 0;
+let waveCompositeTurnTimes: number[] = [];
+let lastWaveCompositeEvidenceAt = 0;
+let lastWaveCompositeSampleAt = 0;
+let punchCompositePhase: PunchCompositePhase = "idle";
+let lastPunchCompositeEvidenceAt = 0;
+let highKneeCompositeSide: HighKneeCompositeSide = "unknown";
+let highKneeCompositeSideChanges: number[] = [];
+let lastHighKneeCompositeEvidenceAt = 0;
+let squatCompositePhase: SquatCompositePhase = "idle";
+let lastSquatCompositeEvidenceAt = 0;
 const landmarkHistory: LandmarkPoint[][] = [];
 const fullBodyMotionHistory: FullBodyMotionSample[] = [];
+const demoCalorieHistory: DemoCalorieSample[] = [];
 
 const topFullBodyBasicActionsText = computed(() => {
   if (!fullBodyBasicActions.value.length) {
@@ -333,9 +445,7 @@ const currentFullBodyMet = computed(() => {
 });
 
 const fullBodyCalories = computed(() => {
-  const activeMinutes = fullBodyMotionFeatures.value.activeFullBodyMs / 60_000;
-
-  return (currentFullBodyMet.value * 3.5 * DEMO_WEIGHT_KG * activeMinutes) / 200;
+  return demoWindowCalories.value;
 });
 
 const fullBodyIntensityTone = computed<DemoMetric["tone"]>(() => {
@@ -689,9 +799,45 @@ function stopCamera() {
   smoothedLandmarks = null;
   latestHands = [];
   handCount.value = 0;
+  demoElapsedMs.value = 0;
+  demoWindowCalories.value = 0;
+  lastDemoElapsedAt = 0;
+  demoCalorieHistory.length = 0;
   resetJumpingJackAnalysis("等待完整关键点");
   resetFullBodyMotionFeatures();
   resetDepthServiceStatus();
+}
+
+function pauseDemoElapsed() {
+  lastDemoElapsedAt = 0;
+  demoWindowCalories.value = 0;
+  demoCalorieHistory.length = 0;
+}
+
+function updateDemoElapsed(now: number) {
+  if (lastDemoElapsedAt > 0) {
+    const elapsedMs = Math.min(now - lastDemoElapsedAt, DEMO_CALORIE_MAX_DELTA_MS);
+    const elapsedMinutes = elapsedMs / 60_000;
+    const calories =
+      ((currentFullBodyMet.value * 3.5 * DEMO_WEIGHT_KG * elapsedMinutes) / 200) * 1000;
+
+    demoElapsedMs.value += elapsedMs;
+    demoCalorieHistory.push({ time: now, calories });
+
+    while (
+      demoCalorieHistory.length &&
+      now - demoCalorieHistory[0].time > DEMO_CALORIE_WINDOW_MS
+    ) {
+      demoCalorieHistory.shift();
+    }
+
+    demoWindowCalories.value = demoCalorieHistory.reduce(
+      (total, sample) => total + sample.calories,
+      0,
+    );
+  }
+
+  lastDemoElapsedAt = now;
 }
 
 function disposePoseLandmarker() {
@@ -839,6 +985,12 @@ function resetJumpingJackAnalysis(reason: string) {
   jumpingJackState.value = "unknown";
   pendingJumpingJackState = "unknown";
   pendingJumpingJackFrames = 0;
+
+  if (poseStatus.value === "detected") {
+    updateCompositeActionDisplay(performance.now(), reason);
+    return;
+  }
+
   compositeActionLabel.value = "未识别组合动作";
   compositeActionDetail.value = reason;
 }
@@ -1181,7 +1333,7 @@ function getFullBodyMotionSample(
   landmarks: LandmarkPoint[],
   now: number,
 ): FullBodyMotionSample {
-  const points = FULL_BODY_TRACKED_KEYS.reduce<
+  const points = SAMPLE_TRACKED_KEYS.reduce<
     Partial<Record<FullBodyTrackedKey, LandmarkPoint>>
   >((acc, key) => {
     const point = getVisibleTrackedPoint(landmarks, key);
@@ -1309,6 +1461,21 @@ function getAverageTrackedY(
   return points.reduce((total, point) => total + point.y, 0) / points.length;
 }
 
+function getAverageTrackedX(
+  sample: FullBodyMotionSample,
+  keys: FullBodyTrackedKey[],
+) {
+  const points = keys
+    .map((key) => sample.points[key])
+    .filter((point): point is LandmarkPoint => Boolean(point));
+
+  if (!points.length) {
+    return null;
+  }
+
+  return points.reduce((total, point) => total + point.x, 0) / points.length;
+}
+
 function getTrackedDistance(
   sample: FullBodyMotionSample,
   leftKey: FullBodyTrackedKey,
@@ -1367,27 +1534,447 @@ function getHipVerticalDelta(
   return currentHipY - previousHipY;
 }
 
+function getTrackedDistanceRatio(
+  sample: FullBodyMotionSample,
+  firstKey: FullBodyTrackedKey,
+  secondKey: FullBodyTrackedKey,
+  baseDistance: number,
+) {
+  const distance = getTrackedDistance(sample, firstKey, secondKey);
+
+  return distance && baseDistance > 0 ? distance / baseDistance : null;
+}
+
+function getLowerBodyMovementScore(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+) {
+  if (!previous) {
+    return 0;
+  }
+
+  const distance = getAverageTrackedDistance(previous, sample, LOWER_BODY_TRACKED_KEYS);
+
+  return scoreFromRange(distance, 0.018, 0.07);
+}
+
+function getSquatPostureScore(sample: FullBodyMotionSample) {
+  const torsoHeight = getTorsoHeight(sample);
+  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
+  const kneeY = getAverageTrackedY(sample, ["leftKnee", "rightKnee"]);
+  const ankleY = getAverageTrackedY(sample, ["leftAnkle", "rightAnkle"]);
+
+  if (torsoHeight <= 0 || hipY === null || kneeY === null || ankleY === null) {
+    return 0;
+  }
+
+  const kneeToHipRatio = (kneeY - hipY) / torsoHeight;
+  const ankleToHipRatio = (ankleY - hipY) / torsoHeight;
+  const kneeBendScore = scoreFromInverseRange(kneeToHipRatio, 0.55, 1.25);
+  const hipDropScore = scoreFromInverseRange(ankleToHipRatio, 1.1, 2.25);
+
+  return clampScore(kneeBendScore * 0.65 + hipDropScore * 0.35);
+}
+
+function getTrackedDelta(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+  key: FullBodyTrackedKey,
+) {
+  const current = sample.points[key];
+  const last = previous?.points[key];
+
+  if (!current || !last) {
+    return null;
+  }
+
+  return {
+    x: current.x - last.x,
+    y: current.y - last.y,
+    distance: getPointDistance(current, last),
+  };
+}
+
+function getElbowAngleScore(
+  sample: FullBodyMotionSample,
+  side: "left" | "right",
+  target: "extend" | "bend",
+) {
+  const shoulder = sample.points[side === "left" ? "leftShoulder" : "rightShoulder"];
+  const elbow = sample.points[side === "left" ? "leftElbow" : "rightElbow"];
+  const wrist = sample.points[side === "left" ? "leftWrist" : "rightWrist"];
+
+  if (!shoulder || !elbow || !wrist) {
+    return 0;
+  }
+
+  const shoulderVector = { x: shoulder.x - elbow.x, y: shoulder.y - elbow.y };
+  const wristVector = { x: wrist.x - elbow.x, y: wrist.y - elbow.y };
+  const shoulderLength = Math.hypot(shoulderVector.x, shoulderVector.y);
+  const wristLength = Math.hypot(wristVector.x, wristVector.y);
+
+  if (shoulderLength <= 0 || wristLength <= 0) {
+    return 0;
+  }
+
+  const cosine =
+    (shoulderVector.x * wristVector.x + shoulderVector.y * wristVector.y) /
+    (shoulderLength * wristLength);
+  const angle = (Math.acos(Math.min(Math.max(cosine, -1), 1)) * 180) / Math.PI;
+
+  return target === "extend"
+    ? scoreFromRange(angle, 135, 170)
+    : scoreFromInverseRange(angle, 75, 135);
+}
+
+function getArmLiftScore(sample: FullBodyMotionSample, side: "left" | "right") {
+  const shoulder = sample.points[side === "left" ? "leftShoulder" : "rightShoulder"];
+  const elbow = sample.points[side === "left" ? "leftElbow" : "rightElbow"];
+  const wrist = sample.points[side === "left" ? "leftWrist" : "rightWrist"];
+  const torsoHeight = getTorsoHeight(sample);
+
+  if (!shoulder || !wrist || torsoHeight <= 0) {
+    return 0;
+  }
+
+  const wristLiftRatio = (shoulder.y - wrist.y) / torsoHeight;
+  const elbowLiftRatio = elbow ? (shoulder.y - elbow.y) / torsoHeight : 0;
+
+  return clampScore(
+    scoreFromRange(wristLiftRatio, -0.02, 0.42) * 0.75 +
+      scoreFromRange(elbowLiftRatio, -0.08, 0.26) * 0.25,
+  );
+}
+
+function getArmDropScore(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+) {
+  const torsoHeight = getTorsoHeight(sample);
+
+  if (!previous || torsoHeight <= 0) {
+    return 0;
+  }
+
+  const deltas = ["leftWrist", "rightWrist"]
+    .map((key) => getTrackedDelta(sample, previous, key as FullBodyTrackedKey))
+    .filter((delta): delta is { x: number; y: number; distance: number } => Boolean(delta));
+
+  if (!deltas.length) {
+    return 0;
+  }
+
+  const downwardRatio =
+    deltas.reduce((total, delta) => total + Math.max(delta.y, 0), 0) /
+    deltas.length /
+    torsoHeight;
+
+  return scoreFromRange(downwardRatio, 0.04, 0.22);
+}
+
+function getHorizontalHandSwingScore(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+  shoulderWidth: number,
+) {
+  if (!previous || shoulderWidth <= 0) {
+    return 0;
+  }
+
+  const deltas = ["leftWrist", "rightWrist"]
+    .map((key) => getTrackedDelta(sample, previous, key as FullBodyTrackedKey))
+    .filter((delta): delta is { x: number; y: number; distance: number } => Boolean(delta));
+
+  if (!deltas.length) {
+    return 0;
+  }
+
+  const horizontalRatios = deltas.map((delta) => Math.abs(delta.x) / shoulderWidth);
+  const maxHorizontalRatio = Math.max(...horizontalRatios);
+  const averageHorizontalRatio =
+    horizontalRatios.reduce((total, ratio) => total + ratio, 0) / horizontalRatios.length;
+
+  return clampScore(
+    scoreFromRange(maxHorizontalRatio, 0.055, 0.26) * 0.72 +
+      scoreFromRange(averageHorizontalRatio, 0.05, 0.24) * 0.28,
+  );
+}
+
+function getHandStaticFistScore(hand: LandmarkPoint[]) {
+  const wrist = hand[0];
+  const indexMcp = hand[5];
+  const middleMcp = hand[9];
+  const ringMcp = hand[13];
+  const pinkyMcp = hand[17];
+
+  if (!wrist || !indexMcp || !middleMcp || !ringMcp || !pinkyMcp) {
+    return 0;
+  }
+
+  const palmWidth = Math.max(getPointDistance(indexMcp, pinkyMcp), 0.015);
+  const palmCenter = {
+    x: (wrist.x + indexMcp.x + middleMcp.x + ringMcp.x + pinkyMcp.x) / 5,
+    y: (wrist.y + indexMcp.y + middleMcp.y + ringMcp.y + pinkyMcp.y) / 5,
+  };
+  const fingerPairs = [
+    [8, 5],
+    [12, 9],
+    [16, 13],
+    [20, 17],
+  ] as const;
+  const tipToMcpRatios = fingerPairs
+    .map(([tipIndex, mcpIndex]) => {
+      const tip = hand[tipIndex];
+      const mcp = hand[mcpIndex];
+
+      return tip && mcp ? getPointDistance(tip, mcp) / palmWidth : null;
+    })
+    .filter((ratio): ratio is number => ratio !== null);
+  const tipToPalmRatios = [8, 12, 16, 20]
+    .map((tipIndex) => {
+      const tip = hand[tipIndex];
+
+      return tip ? getPointDistance(tip, palmCenter) / palmWidth : null;
+    })
+    .filter((ratio): ratio is number => ratio !== null);
+
+  if (!tipToMcpRatios.length || !tipToPalmRatios.length) {
+    return 0;
+  }
+
+  const averageTipToMcp =
+    tipToMcpRatios.reduce((total, ratio) => total + ratio, 0) / tipToMcpRatios.length;
+  const averageTipToPalm =
+    tipToPalmRatios.reduce((total, ratio) => total + ratio, 0) / tipToPalmRatios.length;
+
+  return clampScore(
+    scoreFromInverseRange(averageTipToMcp, 0.45, 0.95) * 0.65 +
+      scoreFromInverseRange(averageTipToPalm, 0.75, 1.45) * 0.35,
+  );
+}
+
+function getPunchFistScore() {
+  if (!latestHands.length) {
+    return 0;
+  }
+
+  return Math.max(...latestHands.map(getHandStaticFistScore));
+}
+
+function getPunchBodyLevelScore(sample: FullBodyMotionSample | undefined) {
+  if (!sample) {
+    return 0;
+  }
+
+  const shoulderY = getAverageTrackedY(sample, ["leftShoulder", "rightShoulder"]);
+  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
+  const torsoCenterX = getAverageTrackedX(sample, ["leftShoulder", "rightShoulder", "leftHip", "rightHip"]);
+  const shoulderWidth = Math.max(
+    getTrackedDistance(sample, "leftShoulder", "rightShoulder") ?? 0,
+    MIN_SHOULDER_WIDTH,
+  );
+  const torsoHeight = getTorsoHeight(sample);
+
+  if (shoulderY === null || hipY === null || torsoCenterX === null || torsoHeight <= 0) {
+    return 0;
+  }
+
+  const scores = (["leftWrist", "rightWrist"] as FullBodyTrackedKey[])
+    .map((key) => {
+      const wrist = sample.points[key];
+
+      if (!wrist) {
+        return null;
+      }
+
+      const wristLiftRatio = (shoulderY - wrist.y) / torsoHeight;
+      const verticalScore =
+        wristLiftRatio >= -0.25 && wristLiftRatio <= 0.28
+          ? 100
+          : wristLiftRatio > 0.28
+            ? scoreFromInverseRange(wristLiftRatio, 0.28, 0.7)
+            : scoreFromRange(wristLiftRatio, -0.65, -0.25);
+      const lateralRatio = Math.abs(wrist.x - torsoCenterX) / shoulderWidth;
+      const lateralScore = scoreFromInverseRange(lateralRatio, 0.95, 1.55);
+
+      return clampScore(verticalScore * 0.78 + lateralScore * 0.22);
+    })
+    .filter((score): score is number => score !== null);
+
+  return scores.length ? Math.max(...scores) : 0;
+}
+
+function getDepthMotionScore(offsetMm: number | null, direction: "front" | "back") {
+  if (
+    offsetMm === null ||
+    depthServiceStatus.value !== "ready" ||
+    Math.abs(offsetMm) >= DEPTH_MAX_REASONABLE_OFFSET_MM
+  ) {
+    return 0;
+  }
+
+  const signedOffset = direction === "front" ? -offsetMm : offsetMm;
+
+  return scoreFromRange(
+    signedOffset,
+    DEPTH_FRONT_BACK_THRESHOLD_MM,
+    DEPTH_ACTION_MAX_SCORE_OFFSET_MM,
+  );
+}
+
+function getHandForwardScore() {
+  return Math.max(
+    getDepthMotionScore(leftWristDepthOffsetMm.value, "front"),
+    getDepthMotionScore(rightWristDepthOffsetMm.value, "front"),
+  );
+}
+
+function getHandBackwardScore() {
+  return Math.max(
+    getDepthMotionScore(leftWristDepthOffsetMm.value, "back"),
+    getDepthMotionScore(rightWristDepthOffsetMm.value, "back"),
+  );
+}
+
+function getTorsoLeanScores(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+  shoulderWidth: number,
+) {
+  const shoulderX = getAverageTrackedX(sample, ["leftShoulder", "rightShoulder"]);
+  const hipX = getAverageTrackedX(sample, ["leftHip", "rightHip"]);
+  const shoulderY = getAverageTrackedY(sample, ["leftShoulder", "rightShoulder"]);
+  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
+  const lastShoulderY = previous
+    ? getAverageTrackedY(previous, ["leftShoulder", "rightShoulder"])
+    : null;
+  const lastHipY = previous ? getAverageTrackedY(previous, ["leftHip", "rightHip"]) : null;
+
+  const lateralRatio =
+    shoulderX !== null && hipX !== null && shoulderWidth > 0
+      ? (shoulderX - hipX) / shoulderWidth
+      : 0;
+  const shoulderHipDelta =
+    shoulderY !== null && hipY !== null && lastShoulderY !== null && lastHipY !== null
+      ? (shoulderY - lastShoulderY) - (hipY - lastHipY)
+      : 0;
+  const torsoHeight = getTorsoHeight(sample);
+  const pitchRatio = torsoHeight > 0 ? shoulderHipDelta / torsoHeight : 0;
+  const leftShoulder = sample.points.leftShoulder;
+  const rightShoulder = sample.points.rightShoulder;
+  const shoulderZDelta =
+    leftShoulder?.z !== undefined && rightShoulder?.z !== undefined
+      ? leftShoulder.z - rightShoulder.z
+      : 0;
+
+  return {
+    leftLean: scoreFromRange(-lateralRatio, 0.18, 0.55),
+    rightLean: scoreFromRange(lateralRatio, 0.18, 0.55),
+    forwardLean: scoreFromRange(pitchRatio, 0.06, 0.24),
+    backwardLean: scoreFromRange(-pitchRatio, 0.06, 0.24),
+    leftTurn: scoreFromRange(shoulderZDelta, 0.08, 0.24),
+    rightTurn: scoreFromRange(-shoulderZDelta, 0.08, 0.24),
+  };
+}
+
+function getHeadMotionScores(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+) {
+  const noseDelta = getTrackedDelta(sample, previous, "nose");
+  const earDistance = getTrackedDistance(sample, "leftEar", "rightEar");
+  const earCenterX = getAverageTrackedX(sample, ["leftEar", "rightEar"]);
+  const nose = sample.points.nose;
+  const headBase = Math.max(earDistance ?? 0, MIN_SHOULDER_WIDTH);
+  const noseOffsetRatio =
+    nose && earCenterX !== null && headBase > 0 ? (nose.x - earCenterX) / headBase : 0;
+  const horizontalRatio = noseDelta ? Math.abs(noseDelta.x) / headBase : 0;
+  const verticalRatio = noseDelta ? Math.abs(noseDelta.y) / headBase : 0;
+
+  return {
+    nod: scoreFromRange(verticalRatio, 0.08, 0.28),
+    shake: scoreFromRange(horizontalRatio, 0.08, 0.28),
+    leftTurn: scoreFromRange(-noseOffsetRatio, 0.18, 0.5),
+    rightTurn: scoreFromRange(noseOffsetRatio, 0.18, 0.5),
+  };
+}
+
 function getFullBodyBasicActionCandidates(
   sample: FullBodyMotionSample,
   previous: FullBodyMotionSample | null,
 ) {
   const shoulderDistance = getTrackedDistance(sample, "leftShoulder", "rightShoulder");
   const ankleDistance = getTrackedDistance(sample, "leftAnkle", "rightAnkle");
+  const kneeDistance = getTrackedDistance(sample, "leftKnee", "rightKnee");
   const wristDistance = getTrackedDistance(sample, "leftWrist", "rightWrist");
   const torsoHeight = getTorsoHeight(sample);
   const shoulderY = getAverageTrackedY(sample, ["leftShoulder", "rightShoulder"]);
   const wristY = getAverageTrackedY(sample, ["leftWrist", "rightWrist"]);
-  const hipToAnkleDistance = getTrackedDistance(sample, "leftHip", "leftAnkle");
   const hipDelta = getHipVerticalDelta(sample, previous);
   const shoulderWidth = Math.max(shoulderDistance ?? 0, MIN_SHOULDER_WIDTH);
   const ankleRatio = ankleDistance ? ankleDistance / shoulderWidth : 0;
+  const kneeRatio = kneeDistance ? kneeDistance / shoulderWidth : 0;
+  const previousShoulderWidth = previous
+    ? Math.max(
+        getTrackedDistance(previous, "leftShoulder", "rightShoulder") ?? 0,
+        MIN_SHOULDER_WIDTH,
+      )
+    : shoulderWidth;
+  const previousAnkleRatio = previous
+    ? getTrackedDistanceRatio(previous, "leftAnkle", "rightAnkle", previousShoulderWidth)
+    : null;
+  const ankleRatioDelta = previousAnkleRatio === null ? 0 : ankleRatio - previousAnkleRatio;
+  const lowerBodyMovementScore = getLowerBodyMovementScore(sample, previous);
+  const footClosingScore = scoreFromRange(-ankleRatioDelta, 0.04, 0.22);
+  const footClosedPostureScore = scoreFromInverseRange(ankleRatio, 0.6, 0.95);
+  const kneeClosedPostureScore = scoreFromInverseRange(kneeRatio, 0.75, 1.2);
+  const footClosedScore =
+    Math.min(footClosedPostureScore, kneeClosedPostureScore + 20) *
+    (Math.max(footClosingScore, lowerBodyMovementScore * 0.55) / 100);
   const wristRatio = wristDistance ? wristDistance / shoulderWidth : 0;
   const wristLiftRatio =
     wristY !== null && shoulderY !== null && torsoHeight > 0
       ? (shoulderY - wristY) / torsoHeight
       : 0;
-  const hipToAnkleRatio =
-    hipToAnkleDistance && torsoHeight > 0 ? hipToAnkleDistance / torsoHeight : 0;
+  const leftArmLiftScore = getArmLiftScore(sample, "left");
+  const rightArmLiftScore = getArmLiftScore(sample, "right");
+  const bothArmsLiftScore =
+    Math.min(leftArmLiftScore, rightArmLiftScore) * 0.75 +
+    Math.max(leftArmLiftScore, rightArmLiftScore) * 0.25;
+  const armDropScore = getArmDropScore(sample, previous);
+  const handForwardScore = getHandForwardScore();
+  const handBackwardScore = getHandBackwardScore();
+  const horizontalHandSwingScore = getHorizontalHandSwingScore(sample, previous, shoulderWidth);
+  const upperBodyContextScore = Math.max(
+    leftArmLiftScore,
+    rightArmLiftScore,
+    armDropScore,
+    handForwardScore,
+    handBackwardScore,
+    horizontalHandSwingScore,
+  );
+  const rawArmExtensionScore = Math.max(
+    getElbowAngleScore(sample, "left", "extend"),
+    getElbowAngleScore(sample, "right", "extend"),
+  );
+  const armExtensionScore =
+    rawArmExtensionScore * (Math.max(upperBodyContextScore, 20) / 100);
+  const armBendScore = Math.max(
+    getElbowAngleScore(sample, "left", "bend"),
+    getElbowAngleScore(sample, "right", "bend"),
+  );
+  const torsoScores = getTorsoLeanScores(sample, previous, shoulderWidth);
+  const headScores = getHeadMotionScores(sample, previous);
+  const squatPostureScore = getSquatPostureScore(sample);
+  const previousSquatPostureScore = previous ? getSquatPostureScore(previous) : 0;
+  const squatDescentScore =
+    scoreFromRange(hipDelta, 0.012, 0.055) * (squatPostureScore / 100);
+  const squatHoldScore = squatPostureScore >= 68 ? squatPostureScore * 0.75 : 0;
+  const standUpScore =
+    scoreFromRange(-hipDelta, 0.012, 0.055) *
+    (Math.max(previousSquatPostureScore, squatPostureScore) / 100);
+  const leftLegLiftScore = getLimbLiftScore(sample, "leftHip", "leftKnee");
+  const rightLegLiftScore = getLimbLiftScore(sample, "rightHip", "rightKnee");
   const candidates: BasicActionCandidate[] = [
     {
       label: "双脚打开",
@@ -1396,39 +1983,132 @@ function getFullBodyBasicActionCandidates(
     },
     {
       label: "双脚合拢",
-      score: scoreFromInverseRange(ankleRatio, 0.85, 1.1),
-      reason: "脚踝距离接近或小于肩宽",
+      score: footClosedScore,
+      reason: "脚踝和膝盖距离收窄，并出现合拢变化",
+    },
+    {
+      label: "左手上抬",
+      score: leftArmLiftScore,
+      reason: "左腕和左肘相对左肩上抬",
+    },
+    {
+      label: "右手上抬",
+      score: rightArmLiftScore,
+      reason: "右腕和右肘相对右肩上抬",
     },
     {
       label: "双臂上抬",
       score: Math.max(
+        bothArmsLiftScore,
         scoreFromRange(wristLiftRatio, 0.05, 0.45),
         scoreFromRange(wristRatio, 0.9, 1.35) * 0.7,
       ),
       reason: "手腕高于肩部或双手横向打开",
     },
     {
+      label: "手臂回落",
+      score: armDropScore,
+      reason: "手腕相对上一帧向下移动",
+    },
+    {
+      label: "手向前移动",
+      score: handForwardScore,
+      reason: "RGB-D 显示手腕接近摄像头",
+    },
+    {
+      label: "手向后移动",
+      score: handBackwardScore,
+      reason: "RGB-D 显示手腕远离摄像头",
+    },
+    {
+      label: "手水平摆动",
+      score: horizontalHandSwingScore,
+      reason: "手腕横向位移明显",
+    },
+    {
+      label: "手臂伸展",
+      score: armExtensionScore,
+      reason: "肩肘腕夹角接近伸直，并伴随上肢活动证据",
+    },
+    {
+      label: "手臂弯曲",
+      score: armBendScore,
+      reason: "肩肘腕夹角变小",
+    },
+    {
       label: "左抬腿",
-      score: getLimbLiftScore(sample, "leftHip", "leftKnee"),
+      score: leftLegLiftScore,
       reason: "左膝相对左髋上抬",
     },
     {
       label: "右抬腿",
-      score: getLimbLiftScore(sample, "rightHip", "rightKnee"),
+      score: rightLegLiftScore,
       reason: "右膝相对右髋上抬",
     },
     {
+      label: "膝盖上抬",
+      score: Math.max(leftLegLiftScore, rightLegLiftScore),
+      reason: "任一膝盖相对髋部上抬",
+    },
+    {
       label: "下蹲",
-      score: Math.max(
-        scoreFromRange(hipDelta, 0.004, 0.035),
-        scoreFromInverseRange(hipToAnkleRatio, 1.25, 2.4) * 0.8,
-      ),
-      reason: "髋部下移或髋踝距离缩短",
+      score: Math.max(squatDescentScore, squatHoldScore),
+      reason: "髋部下移并伴随膝髋结构变化",
     },
     {
       label: "起身",
-      score: scoreFromRange(-hipDelta, 0.004, 0.035),
-      reason: "髋部上移",
+      score: standUpScore,
+      reason: "从下蹲结构中髋部上移",
+    },
+    {
+      label: "身体前倾",
+      score: torsoScores.forwardLean,
+      reason: "肩部相对髋部向下移动",
+    },
+    {
+      label: "身体后仰",
+      score: torsoScores.backwardLean,
+      reason: "肩部相对髋部向上移动",
+    },
+    {
+      label: "身体左倾",
+      score: torsoScores.leftLean,
+      reason: "肩部中心相对髋部中心左移",
+    },
+    {
+      label: "身体右倾",
+      score: torsoScores.rightLean,
+      reason: "肩部中心相对髋部中心右移",
+    },
+    {
+      label: "身体左转",
+      score: torsoScores.leftTurn,
+      reason: "左右肩 z 差显示身体旋转",
+    },
+    {
+      label: "身体右转",
+      score: torsoScores.rightTurn,
+      reason: "左右肩 z 差显示身体旋转",
+    },
+    {
+      label: "点头",
+      score: headScores.nod,
+      reason: "鼻尖纵向位移明显",
+    },
+    {
+      label: "摇头",
+      score: headScores.shake,
+      reason: "鼻尖横向位移明显",
+    },
+    {
+      label: "左转头",
+      score: headScores.leftTurn,
+      reason: "鼻尖相对双耳中心左移",
+    },
+    {
+      label: "右转头",
+      score: headScores.rightTurn,
+      reason: "鼻尖相对双耳中心右移",
     },
   ];
 
@@ -1437,7 +2117,7 @@ function getFullBodyBasicActionCandidates(
       ...candidate,
       score: clampScore(candidate.score),
     }))
-    .filter((candidate) => candidate.score >= 20)
+    .filter((candidate) => candidate.score >= 35)
     .sort((left, right) => right.score - left.score);
 }
 
@@ -1465,6 +2145,8 @@ function updateFullBodyActivityClassification(
 
 function resetFullBodyMotionFeatures() {
   fullBodyMotionHistory.length = 0;
+  resetRestCompositeState();
+  resetMotionCompositeStates();
   fullBodyJointState.value = "等待全身关键点";
   fullBodyMotionFeatures.value = {
     movementDistance: 0,
@@ -1615,23 +2297,523 @@ function classifyArms(
   return "unknown";
 }
 
-function updateCompositeActionDisplay(now: number) {
-  const isRecentComposite = now - lastCompositeEvidenceAt.value <= COMPOSITE_ACTION_HOLD_MS;
+function getTopBasicActionLabels() {
+  return fullBodyBasicActions.value.slice(0, 3).map((candidate) => candidate.label);
+}
+
+function getBasicActionScore(labels: string[]) {
+  return fullBodyBasicActions.value
+    .filter((candidate) => labels.includes(candidate.label))
+    .reduce((maxScore, candidate) => Math.max(maxScore, candidate.score), 0);
+}
+
+function resetRestCompositeState() {
+  restCompositeActive = false;
+  restCompositeCandidateStartedAt = 0;
+  restCompositeExitStartedAt = 0;
+}
+
+function updateRestCompositeState(
+  now: number,
+  isRestCandidate: boolean,
+  hasExitEvidence: boolean,
+) {
+  if (isRestCandidate) {
+    restCompositeExitStartedAt = 0;
+
+    if (!restCompositeCandidateStartedAt) {
+      restCompositeCandidateStartedAt = now;
+    }
+
+    if (
+      restCompositeActive ||
+      now - restCompositeCandidateStartedAt >= REST_COMPOSITE_ENTER_HOLD_MS
+    ) {
+      restCompositeActive = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  restCompositeCandidateStartedAt = 0;
+
+  if (!restCompositeActive) {
+    return false;
+  }
+
+  if (!hasExitEvidence) {
+    restCompositeExitStartedAt = 0;
+    return true;
+  }
+
+  if (!restCompositeExitStartedAt) {
+    restCompositeExitStartedAt = now;
+    return true;
+  }
+
+  if (now - restCompositeExitStartedAt < REST_COMPOSITE_EXIT_HOLD_MS) {
+    return true;
+  }
+
+  resetRestCompositeState();
+  return false;
+}
+
+function resetWaveCompositeState() {
+  waveCompositeDirection = 0;
+  waveCompositeTurnTimes = [];
+  lastWaveCompositeEvidenceAt = 0;
+  lastWaveCompositeSampleAt = 0;
+}
+
+function resetPunchCompositeState() {
+  punchCompositePhase = "idle";
+  lastPunchCompositeEvidenceAt = 0;
+}
+
+function resetHighKneeCompositeState() {
+  highKneeCompositeSide = "unknown";
+  highKneeCompositeSideChanges = [];
+  lastHighKneeCompositeEvidenceAt = 0;
+}
+
+function resetSquatCompositeState() {
+  squatCompositePhase = "idle";
+  lastSquatCompositeEvidenceAt = 0;
+}
+
+function resetMotionCompositeStates() {
+  resetWaveCompositeState();
+  resetPunchCompositeState();
+  resetHighKneeCompositeState();
+  resetSquatCompositeState();
+}
+
+function getDominantWristHorizontalDirection(
+  previous: FullBodyMotionSample,
+  current: FullBodyMotionSample,
+) {
+  const shoulderWidth = Math.max(
+    getTrackedDistance(current, "leftShoulder", "rightShoulder") ?? 0,
+    MIN_SHOULDER_WIDTH,
+  );
+  const deltas = (["leftWrist", "rightWrist"] as FullBodyTrackedKey[])
+    .map((key) => getTrackedDelta(current, previous, key))
+    .filter((delta): delta is { x: number; y: number; distance: number } => Boolean(delta))
+    .sort((left, right) => Math.abs(right.x) - Math.abs(left.x));
+  const dominantDelta = deltas[0];
+
+  if (!dominantDelta || shoulderWidth <= 0) {
+    return { direction: 0 as WaveCompositeDirection, horizontalRatio: 0 };
+  }
+
+  const horizontalRatio = Math.abs(dominantDelta.x) / shoulderWidth;
+  const direction: WaveCompositeDirection =
+    horizontalRatio >= WAVE_COMPOSITE_DIRECTION_RATIO
+      ? dominantDelta.x > 0
+        ? 1
+        : -1
+      : 0;
+
+  return { direction, horizontalRatio };
+}
+
+function updateWaveCompositeState(now: number) {
+  const current = fullBodyMotionHistory[fullBodyMotionHistory.length - 1];
+  const previous = fullBodyMotionHistory[fullBodyMotionHistory.length - 2];
+  const swingScore = getBasicActionScore(["手水平摆动"]);
+  const depthConflictScore = Math.max(
+    getBasicActionScore(["手向前移动"]),
+    getBasicActionScore(["手向后移动"]),
+  );
+  const armExtensionScore = getBasicActionScore(["手臂伸展"]);
+  const fistScore = getPunchFistScore();
+  const bodyLevelScore = getPunchBodyLevelScore(current);
+  const features = fullBodyMotionFeatures.value;
+  const visibleWristCount = current
+    ? (current.points.leftWrist ? 1 : 0) + (current.points.rightWrist ? 1 : 0)
+    : 0;
+  let horizontalRatio = 0;
+
+  if (previous && current && current.time !== lastWaveCompositeSampleAt) {
+    if (lastWaveCompositeSampleAt && current.time - lastWaveCompositeSampleAt > 650) {
+      waveCompositeDirection = 0;
+      waveCompositeTurnTimes = [];
+    }
+
+    const wristMotion = getDominantWristHorizontalDirection(previous, current);
+    horizontalRatio = wristMotion.horizontalRatio;
+    lastWaveCompositeSampleAt = current.time;
+
+    if (wristMotion.direction !== 0) {
+      if (
+        waveCompositeDirection !== 0 &&
+        wristMotion.direction !== waveCompositeDirection
+      ) {
+        waveCompositeTurnTimes.push(now);
+      }
+
+      waveCompositeDirection = wristMotion.direction;
+    }
+  }
+
+  waveCompositeTurnTimes = waveCompositeTurnTimes.filter(
+    (time) => now - time <= WAVE_COMPOSITE_TURN_WINDOW_MS,
+  );
+
+  const turnCount = waveCompositeTurnTimes.length;
+  const hasPunchLikeConflict =
+    depthConflictScore >= WAVE_COMPOSITE_DEPTH_CONFLICT_SCORE &&
+    armExtensionScore >= WAVE_COMPOSITE_EXTENSION_CONFLICT_SCORE &&
+    fistScore >= PUNCH_COMPOSITE_MIN_FIST_SCORE &&
+    bodyLevelScore >= PUNCH_COMPOSITE_MIN_BODY_LEVEL_SCORE;
+  const hasWaveEvidence =
+    visibleWristCount > 0 &&
+    swingScore >= WAVE_COMPOSITE_MIN_SWING_SCORE &&
+    features.upperBodyDistance >= WAVE_COMPOSITE_MIN_UPPER_DISTANCE &&
+    (turnCount >= 1 || horizontalRatio >= WAVE_COMPOSITE_DIRECTION_RATIO * 1.8) &&
+    !(hasPunchLikeConflict && turnCount < 2 && swingScore < 82);
+
+  if (hasWaveEvidence) {
+    lastWaveCompositeEvidenceAt = now;
+  }
+
+  const active = now - lastWaveCompositeEvidenceAt <= WAVE_COMPOSITE_HOLD_MS;
+  const reasonParts = [
+    `手水平摆动 ${swingScore}`,
+    `${turnCount} 次换向`,
+    `腕点可见 ${visibleWristCount}/2`,
+  ];
+
+  if (hasPunchLikeConflict) {
+    reasonParts.push(`疑似出拳: 握拳 ${fistScore}，水平前侧 ${bodyLevelScore}`);
+  }
+
+  return {
+    active,
+    reason: reasonParts.join("，"),
+  };
+}
+
+function updatePunchCompositeState(now: number) {
+  const current = fullBodyMotionHistory[fullBodyMotionHistory.length - 1];
+  const forwardScore = getBasicActionScore(["手向前移动"]);
+  const backwardScore = getBasicActionScore(["手向后移动"]);
+  const extensionScore = getBasicActionScore(["手臂伸展"]);
+  const bendScore = getBasicActionScore(["手臂弯曲"]);
+  const swingScore = getBasicActionScore(["手水平摆动"]);
+  const fistScore = getPunchFistScore();
+  const bodyLevelScore = getPunchBodyLevelScore(current);
+  const features = fullBodyMotionFeatures.value;
+  const hasExtendEvidence =
+    forwardScore >= PUNCH_COMPOSITE_MIN_FORWARD_SCORE &&
+    extensionScore >= PUNCH_COMPOSITE_MIN_EXTENSION_SCORE &&
+    fistScore >= PUNCH_COMPOSITE_MIN_FIST_SCORE &&
+    bodyLevelScore >= PUNCH_COMPOSITE_MIN_BODY_LEVEL_SCORE &&
+    features.upperBodyDistance >= PUNCH_COMPOSITE_MIN_UPPER_DISTANCE &&
+    swingScore < 78;
+  const hasRecoveryEvidence =
+    punchCompositePhase !== "idle" &&
+    (backwardScore >= PUNCH_COMPOSITE_RECOVERY_SCORE ||
+      bendScore >= PUNCH_COMPOSITE_RECOVERY_SCORE);
+
+  if (hasExtendEvidence) {
+    punchCompositePhase = "extended";
+    lastPunchCompositeEvidenceAt = now;
+  } else if (hasRecoveryEvidence) {
+    punchCompositePhase = "recovering";
+    lastPunchCompositeEvidenceAt = now;
+  }
+
+  const active = now - lastPunchCompositeEvidenceAt <= PUNCH_COMPOSITE_HOLD_MS;
+
+  if (!active) {
+    punchCompositePhase = "idle";
+  }
+
+  return {
+    active,
+    reason:
+      punchCompositePhase === "recovering"
+        ? `手向前 ${forwardScore}，握拳 ${fistScore}，回收 ${Math.max(backwardScore, bendScore)}`
+        : `手向前 ${forwardScore}，伸展 ${extensionScore}，握拳 ${fistScore}，水平前侧 ${bodyLevelScore}`,
+  };
+}
+
+function updateJumpingJackCompositeState(now: number) {
+  const armsOpenScore = getBasicActionScore(["双臂上抬"]);
+  const armsCloseScore = getBasicActionScore(["手臂回落"]);
+  const feetOpenScore = getBasicActionScore(["双脚打开"]);
+  const feetCloseScore = getBasicActionScore(["双脚合拢"]);
+  const features = fullBodyMotionFeatures.value;
+  const hasOpenEvidence =
+    armsOpenScore >= JUMPING_JACK_BASIC_MIN_ARM_SCORE &&
+    feetOpenScore >= JUMPING_JACK_BASIC_MIN_FOOT_SCORE &&
+    features.upperBodyDistance >= JUMPING_JACK_BASIC_MIN_UPPER_DISTANCE &&
+    features.lowerBodyDistance >= JUMPING_JACK_BASIC_MIN_LOWER_DISTANCE;
+  const hasCloseEvidence =
+    armsCloseScore >= JUMPING_JACK_BASIC_MIN_ARM_SCORE &&
+    feetCloseScore >= JUMPING_JACK_BASIC_MIN_FOOT_SCORE &&
+    features.upperBodyDistance >= JUMPING_JACK_BASIC_MIN_UPPER_DISTANCE &&
+    features.lowerBodyDistance >= JUMPING_JACK_BASIC_MIN_LOWER_DISTANCE;
+
+  if (hasOpenEvidence || hasCloseEvidence) {
+    lastCompositeEvidenceAt.value = now;
+  }
+
+  return {
+    active:
+      lastCompositeEvidenceAt.value > 0 &&
+      now - lastCompositeEvidenceAt.value <= COMPOSITE_ACTION_HOLD_MS,
+    reason: hasOpenEvidence
+      ? `双臂上抬 ${armsOpenScore}，双脚打开 ${feetOpenScore}`
+      : hasCloseEvidence
+        ? `手臂回落 ${armsCloseScore}，双脚合拢 ${feetCloseScore}`
+        : `脚 ${feetState.value} / 手 ${armsState.value}`,
+  };
+}
+
+function updateHighKneeCompositeState(now: number) {
+  const leftScore = getBasicActionScore(["左抬腿"]);
+  const rightScore = getBasicActionScore(["右抬腿"]);
+  const kneeLiftScore = getBasicActionScore(["膝盖上抬"]);
+  const features = fullBodyMotionFeatures.value;
+  const dominantSide: HighKneeCompositeSide =
+    leftScore >= HIGH_KNEE_COMPOSITE_MIN_SCORE && leftScore >= rightScore
+      ? "left"
+      : rightScore >= HIGH_KNEE_COMPOSITE_MIN_SCORE
+        ? "right"
+        : "unknown";
+
+  if (
+    dominantSide !== "unknown" &&
+    features.lowerBodyDistance >= HIGH_KNEE_COMPOSITE_MIN_LOWER_DISTANCE
+  ) {
+    if (highKneeCompositeSide !== "unknown" && dominantSide !== highKneeCompositeSide) {
+      highKneeCompositeSideChanges.push(now);
+    }
+
+    highKneeCompositeSide = dominantSide;
+    lastHighKneeCompositeEvidenceAt = now;
+  }
+
+  highKneeCompositeSideChanges = highKneeCompositeSideChanges.filter(
+    (time) => now - time <= HIGH_KNEE_COMPOSITE_ALTERNATE_WINDOW_MS,
+  );
+
+  const active =
+    now - lastHighKneeCompositeEvidenceAt <= HIGH_KNEE_COMPOSITE_HOLD_MS &&
+    kneeLiftScore >= HIGH_KNEE_COMPOSITE_MIN_SCORE;
+
+  if (!active && now - lastHighKneeCompositeEvidenceAt > HIGH_KNEE_COMPOSITE_HOLD_MS) {
+    highKneeCompositeSide = "unknown";
+  }
+
+  return {
+    active,
+    reason: `${dominantSide === "left" ? "左" : dominantSide === "right" ? "右" : "膝"}膝上抬 ${kneeLiftScore}，左右交替 ${highKneeCompositeSideChanges.length} 次`,
+  };
+}
+
+function updateSquatCompositeState(now: number) {
+  const squatScore = getBasicActionScore(["下蹲"]);
+  const standUpScore = getBasicActionScore(["起身"]);
+  const features = fullBodyMotionFeatures.value;
+  const hasDownEvidence =
+    squatScore >= SQUAT_COMPOSITE_MIN_DOWN_SCORE &&
+    features.lowerBodyDistance >= SQUAT_COMPOSITE_MIN_LOWER_DISTANCE;
+  const hasRiseEvidence =
+    squatCompositePhase !== "idle" &&
+    standUpScore >= SQUAT_COMPOSITE_MIN_UP_SCORE &&
+    features.lowerBodyDistance >= SQUAT_COMPOSITE_MIN_LOWER_DISTANCE;
+
+  if (hasDownEvidence) {
+    squatCompositePhase = "down";
+    lastSquatCompositeEvidenceAt = now;
+  } else if (hasRiseEvidence) {
+    squatCompositePhase = "rising";
+    lastSquatCompositeEvidenceAt = now;
+  }
+
+  const active = now - lastSquatCompositeEvidenceAt <= SQUAT_COMPOSITE_HOLD_MS;
+
+  if (!active) {
+    squatCompositePhase = "idle";
+  }
+
+  return {
+    active,
+    reason:
+      squatCompositePhase === "rising"
+        ? `下蹲 ${squatScore}，起身 ${standUpScore}`
+        : `下蹲 ${squatScore}，下肢位移 ${features.lowerBodyDistance.toFixed(3)}`,
+  };
+}
+
+function getCompositeDetail(reason = "") {
+  const actionText = topFullBodyBasicActionsText.value;
+
+  if (!fullBodyBasicActions.value.length) {
+    return reason || "等待稳定基础动作证据";
+  }
+
+  return reason ? `${actionText} / ${reason}` : `基础动作: ${actionText}`;
+}
+
+function updateCompositeActionDisplay(now: number, reason = "") {
+  const isRecentComposite =
+    lastCompositeEvidenceAt.value > 0 &&
+    now - lastCompositeEvidenceAt.value <= COMPOSITE_ACTION_HOLD_MS;
 
   if (jumpingJackState.value === "open" || isRecentComposite) {
+    resetRestCompositeState();
+    resetMotionCompositeStates();
     compositeActionLabel.value = "开合跳";
     compositeActionDetail.value = `脚 ${feetState.value} / 手 ${armsState.value}`;
     return;
   }
 
-  if (fullBodyActivityScore.value >= 25) {
+  if (poseStatus.value !== "detected") {
+    resetRestCompositeState();
+    resetMotionCompositeStates();
+    compositeActionLabel.value = "未识别组合动作";
+    compositeActionDetail.value = reason || "等待人体入镜";
+    return;
+  }
+
+  const actionLabels = getTopBasicActionLabels();
+  const hasUpperBodyAction = actionLabels.some((label) =>
+    UPPER_BODY_BASIC_ACTION_LABELS.includes(label),
+  );
+  const hasLowerBodyAction = actionLabels.some((label) =>
+    LOWER_BODY_BASIC_ACTION_LABELS.includes(label),
+  );
+  const hasTorsoOrHeadAction = actionLabels.some((label) =>
+    TORSO_OR_HEAD_BASIC_ACTION_LABELS.includes(label),
+  );
+  const upperBodyCompositeScore = getBasicActionScore(UPPER_BODY_BASIC_ACTION_LABELS);
+  const lowerBodyCompositeScore = getBasicActionScore(LOWER_BODY_BASIC_ACTION_LABELS);
+  const torsoOrHeadCompositeScore = getBasicActionScore(TORSO_OR_HEAD_BASIC_ACTION_LABELS);
+  const features = fullBodyMotionFeatures.value;
+  const hasStableFullBodyEvidence =
+    upperBodyCompositeScore >= FULL_BODY_COMPOSITE_MIN_ACTION_SCORE &&
+    lowerBodyCompositeScore >= FULL_BODY_COMPOSITE_MIN_ACTION_SCORE &&
+    features.upperBodyDistance >= FULL_BODY_COMPOSITE_MIN_UPPER_DISTANCE &&
+    features.lowerBodyDistance >= FULL_BODY_COMPOSITE_MIN_LOWER_DISTANCE;
+  const jumpingJackComposite = updateJumpingJackCompositeState(now);
+  const squatComposite = updateSquatCompositeState(now);
+  const highKneeComposite = updateHighKneeCompositeState(now);
+  const punchComposite = updatePunchCompositeState(now);
+  const waveComposite = updateWaveCompositeState(now);
+  const isRestCandidate =
+    fullBodyActivityScore.value <= REST_COMPOSITE_MAX_ACTIVITY_SCORE &&
+    features.movementDistance <= REST_COMPOSITE_MAX_MOVEMENT_DISTANCE &&
+    features.upperBodyDistance <= REST_COMPOSITE_MAX_UPPER_DISTANCE &&
+    features.lowerBodyDistance <= REST_COMPOSITE_MAX_LOWER_DISTANCE;
+  const hasRestExitEvidence =
+    fullBodyActivityScore.value >= REST_COMPOSITE_EXIT_ACTIVITY_SCORE ||
+    (upperBodyCompositeScore >= REST_COMPOSITE_EXIT_ACTION_SCORE &&
+      features.upperBodyDistance >= REST_COMPOSITE_EXIT_UPPER_DISTANCE) ||
+    (lowerBodyCompositeScore >= REST_COMPOSITE_EXIT_ACTION_SCORE &&
+      features.lowerBodyDistance >= REST_COMPOSITE_EXIT_LOWER_DISTANCE) ||
+    (torsoOrHeadCompositeScore >= REST_COMPOSITE_EXIT_ACTION_SCORE &&
+      features.torsoDistance >= REST_COMPOSITE_EXIT_TORSO_DISTANCE);
+  const shouldShowRest = updateRestCompositeState(
+    now,
+    isRestCandidate,
+    hasRestExitEvidence,
+  );
+
+  if (shouldShowRest) {
+    compositeActionLabel.value = "静息";
+    compositeActionDetail.value = reason
+      ? `${reason} / 低运动量持续稳定`
+      : "检测到人体，低运动量持续稳定";
+    return;
+  }
+
+  if (hasStableFullBodyEvidence) {
+    resetRestCompositeState();
+  }
+
+  if (jumpingJackComposite.active) {
+    resetRestCompositeState();
+    resetPunchCompositeState();
+    resetWaveCompositeState();
+    compositeActionLabel.value = "开合跳";
+    compositeActionDetail.value = getCompositeDetail(jumpingJackComposite.reason);
+    return;
+  }
+
+  if (squatComposite.active) {
+    resetRestCompositeState();
+    compositeActionLabel.value = "深蹲";
+    compositeActionDetail.value = getCompositeDetail(squatComposite.reason);
+    return;
+  }
+
+  if (highKneeComposite.active) {
+    resetRestCompositeState();
+    compositeActionLabel.value = "高抬腿";
+    compositeActionDetail.value = getCompositeDetail(highKneeComposite.reason);
+    return;
+  }
+
+  if (punchComposite.active) {
+    resetRestCompositeState();
+    resetWaveCompositeState();
+    compositeActionLabel.value = "出拳";
+    compositeActionDetail.value = getCompositeDetail(punchComposite.reason);
+    return;
+  }
+
+  if (hasStableFullBodyEvidence) {
     compositeActionLabel.value = "全身活动";
-    compositeActionDetail.value = "暂未匹配到明确组合动作";
+    compositeActionDetail.value = getCompositeDetail(
+      reason || "上肢和下肢都有稳定运动证据",
+    );
+    return;
+  }
+
+  if (waveComposite.active) {
+    compositeActionLabel.value = "挥手";
+    compositeActionDetail.value = getCompositeDetail(waveComposite.reason);
+    return;
+  }
+
+  if (hasUpperBodyAction) {
+    compositeActionLabel.value = "上肢活动";
+    compositeActionDetail.value = getCompositeDetail(reason);
+    return;
+  }
+
+  if (hasLowerBodyAction) {
+    compositeActionLabel.value = "下肢活动";
+    compositeActionDetail.value = getCompositeDetail(reason);
+    return;
+  }
+
+  if (hasTorsoOrHeadAction) {
+    compositeActionLabel.value = "姿态活动";
+    compositeActionDetail.value = getCompositeDetail(reason);
+    return;
+  }
+
+  if (poseStatus.value === "detected" && fullBodyIntensityLevel.value === "静止") {
+    compositeActionLabel.value = "静息";
+    compositeActionDetail.value = reason ? `${reason} / 当前运动量较低` : "检测到人体，当前运动量较低";
+    return;
+  }
+
+  if (fullBodyActivityScore.value >= 25) {
+    compositeActionLabel.value = "活动中";
+    compositeActionDetail.value = reason || "根据运动量判断为活动状态";
     return;
   }
 
   compositeActionLabel.value = "未识别组合动作";
-  compositeActionDetail.value = "当前主要看基础动作和运动量";
+  compositeActionDetail.value = reason || "当前主要看基础动作和运动量";
 }
 
 function updateDebouncedJumpingJackState(
@@ -1902,7 +3084,7 @@ function drawHandsOverlay(
   context.lineCap = "round";
   context.lineJoin = "round";
   context.strokeStyle = "rgba(250, 204, 21, 0.95)";
-  context.lineWidth = Math.max(3, canvas.width / 280);
+  context.lineWidth = Math.max(2, canvas.width / 420);
 
   latestHands.forEach((hand) => {
     HAND_CONNECTIONS.forEach(([fromIndex, toIndex]) => {
@@ -1923,8 +3105,14 @@ function drawHandsOverlay(
       context.beginPath();
       context.fillStyle = "#ffffff";
       context.strokeStyle = "rgba(15, 23, 42, 0.72)";
-      context.lineWidth = 2;
-      context.arc(point.x * canvas.width, point.y * canvas.height, 4, 0, Math.PI * 2);
+      context.lineWidth = 1.5;
+      context.arc(
+        point.x * canvas.width,
+        point.y * canvas.height,
+        Math.max(2.5, canvas.width / 520),
+        0,
+        Math.PI * 2,
+      );
       context.fill();
       context.stroke();
     });
@@ -1961,6 +3149,7 @@ async function runPoseInference(now: number) {
 
     if (!poseLandmarker) {
       updateInferenceFps(now);
+      pauseDemoElapsed();
       return;
     }
 
@@ -1974,6 +3163,7 @@ async function runPoseInference(now: number) {
       landmarkCompleteness.value = 0;
       landmarkHistory.length = 0;
       smoothedLandmarks = null;
+      pauseDemoElapsed();
       resetJumpingJackAnalysis("未检测到完整人体");
       resetFullBodyMotionFeatures();
       resetDepthServiceStatus("等待人体关键点 / 使用 2D 估算");
@@ -1981,13 +3171,16 @@ async function runPoseInference(now: number) {
     }
 
     poseStatus.value = "detected";
+    updateDemoElapsed(now);
     updateLandmarkCompleteness(landmarks);
     updateSmoothedLandmarks(landmarks);
     updateJumpingJackAnalysis(smoothedLandmarks, now);
     updateFullBodyMotionFeatures(smoothedLandmarks, now);
+    updateCompositeActionDisplay(now);
     void updateDepthServiceStatus(smoothedLandmarks, now);
   } catch {
     poseStatus.value = "missing";
+    pauseDemoElapsed();
     resetJumpingJackAnalysis("姿态推理失败");
     resetFullBodyMotionFeatures();
     resetDepthServiceStatus("姿态推理失败 / 使用 2D 估算");
@@ -2120,8 +3313,8 @@ onBeforeUnmount(() => {
 
       <section class="demo-hero-metric accent">
         <span>估算消耗</span>
-        <strong>{{ fullBodyCalories.toFixed(2) }} kcal</strong>
-        <small>当前为演示估算口径</small>
+        <strong>{{ fullBodyCalories.toFixed(2) }} cal</strong>
+        <small>最近 1 秒实时估算</small>
       </section>
 
       <div class="demo-metrics-grid">
@@ -2576,20 +3769,123 @@ onBeforeUnmount(() => {
   }
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 1100px), (orientation: portrait) {
   .demo-shell {
-    grid-template-columns: 1fr;
+    align-items: stretch;
+    gap: 12px;
+    grid-template-areas:
+      "toolbar toolbar"
+      "hero-main hero-kcal"
+      "primary primary"
+      "camera camera"
+      "motion motion"
+      "depth depth"
+      "status status";
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .demo-stage-panel,
   .demo-side-panel {
-    max-height: none;
-    position: static;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    display: contents;
+  }
+
+  .demo-stage-toolbar {
+    background: #ffffff;
+    border: 1px solid #dbe3ef;
+    border-radius: 8px;
+    grid-area: toolbar;
+    padding: 16px 20px;
+  }
+
+  .demo-stage-toolbar h1 {
+    font-size: 30px;
+  }
+
+  .demo-camera-stage {
+    border-radius: 8px;
+    grid-area: camera;
+    min-height: min(78vh, 1320px);
+    min-height: min(78dvh, 1320px);
+    padding: 18px;
+  }
+
+  .demo-camera-frame {
+    aspect-ratio: 9 / 16;
+    max-height: min(72vh, 1280px);
+    max-height: min(72dvh, 1280px);
+    max-width: 100%;
+    width: min(100%, 720px);
+  }
+
+  .demo-camera-frame video,
+  .demo-camera-frame canvas {
+    object-fit: contain;
+  }
+
+  .demo-side-panel > .demo-hero-metric:first-of-type {
+    grid-area: hero-main;
+  }
+
+  .demo-side-panel > .demo-hero-metric.accent {
+    grid-area: hero-kcal;
+  }
+
+  .demo-side-panel > .demo-metrics-grid {
+    grid-area: primary;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .demo-side-panel > .demo-section:nth-of-type(3) {
+    grid-area: motion;
+  }
+
+  .demo-side-panel > .demo-section:nth-of-type(4) {
+    grid-area: depth;
+  }
+
+  .demo-status-strip {
+    grid-area: status;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .demo-hero-metric {
+    min-height: 112px;
+    padding: 16px;
+  }
+
+  .demo-hero-metric strong {
+    font-size: 32px;
+  }
+
+  .demo-metric-card {
+    min-height: 108px;
+    padding: 13px;
+  }
+
+  .demo-section .demo-metrics-grid.compact {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .demo-section-header small {
+    max-width: 360px;
   }
 }
 
 @media (max-width: 640px) {
-  .demo-stage-panel {
-    min-height: 620px;
+  .demo-shell {
+    grid-template-areas:
+      "toolbar"
+      "hero-main"
+      "hero-kcal"
+      "primary"
+      "camera"
+      "motion"
+      "depth"
+      "status";
+    grid-template-columns: 1fr;
   }
 
   .demo-camera-stage {
@@ -2597,6 +3893,13 @@ onBeforeUnmount(() => {
     padding: 12px;
   }
 
+  .demo-camera-frame {
+    aspect-ratio: 3 / 4;
+    width: 100%;
+  }
+
+  .demo-side-panel > .demo-metrics-grid,
+  .demo-section .demo-metrics-grid.compact,
   .demo-metrics-grid.compact,
   .demo-status-strip {
     grid-template-columns: 1fr;

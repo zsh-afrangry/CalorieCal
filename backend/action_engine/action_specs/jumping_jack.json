@@ -1,0 +1,115 @@
+{
+  "action_name": "jumping_jack",
+  "version": "0.1.0",
+  "status": "draft_from_task10_asset_audit",
+  "source_report": "task10-后端算法层快速验证/datasets/pose/reports/asset_audit.csv",
+  "description": "Initial summary-level jumping-jack spec derived from self-recorded Task10 samples. Front view is supported first; side view is kept as experimental.",
+  "action_type": "cyclic",
+  "supported_views": ["front"],
+  "experimental_views": ["side"],
+  "required_landmarks": [
+    "LEFT_SHOULDER",
+    "RIGHT_SHOULDER",
+    "LEFT_WRIST",
+    "RIGHT_WRIST",
+    "LEFT_ANKLE",
+    "RIGHT_ANKLE"
+  ],
+  "strong_features": [
+    "foot_spread_range",
+    "wrist_spread_range",
+    "hands_above_shoulders_mean",
+    "motion_energy_mean"
+  ],
+  "summary_rules": {
+    "front": {
+      "enabled": true,
+      "quality_gates": {
+        "detected_ratio_min": 0.95,
+        "mean_visibility_min": 0.85,
+        "mean_core_visible_ratio_min": 0.85
+      },
+      "accept_all": [
+        {
+          "feature": "foot_spread_range",
+          "op": ">=",
+          "value": 0.80,
+          "reason": "Front positive samples had foot-spread range about 1.5+; one-arm confusions were below 0.2."
+        },
+        {
+          "feature": "wrist_spread_range",
+          "op": ">=",
+          "value": 2.0,
+          "reason": "Require visible arm opening. One-arm confusions can pass this, so foot-spread remains mandatory."
+        },
+        {
+          "feature": "hands_above_shoulders_mean",
+          "op": ">=",
+          "value": 0.25,
+          "reason": "Require hands to be above shoulder level for a meaningful part of the cycle."
+        },
+        {
+          "feature": "motion_energy_mean",
+          "op": ">=",
+          "value": 0.030,
+          "reason": "Require non-trivial whole-body motion."
+        }
+      ],
+      "reject_any": [
+        {
+          "feature": "foot_spread_range",
+          "op": "<",
+          "value": 0.50,
+          "reason": "Reject arm-only or one-arm clips without leg opening."
+        },
+        {
+          "feature": "hands_above_shoulders_mean",
+          "op": "<",
+          "value": 0.20,
+          "reason": "Reject jump-only clips without arms."
+        }
+      ]
+    },
+    "side": {
+      "enabled": false,
+      "reason": "Side-view jumping-jack samples show unstable spread ratios due to projection and normalization. Keep for later view-specific rules."
+    }
+  },
+  "state_machine_hint": {
+    "stages": ["closed", "opening", "open", "closing"],
+    "enter": "hands and feet start opening together",
+    "open": "hands above shoulder line and feet wider than closed stance",
+    "exit": "hands and feet return toward closed stance",
+    "count": "closed -> open -> closed"
+  },
+  "frame_state_machine": {
+    "score_formula": "0.45 * normalized_foot_spread + 0.35 * normalized_wrist_spread + 0.20 * hands_above_shoulders_ratio",
+    "smoothing_window_frames": 5,
+    "stage_thresholds": {
+      "closed_max": 0.25,
+      "open_min": 0.70
+    },
+    "count_pattern": ["closed", "open", "closed"],
+    "min_open_hold_frames": 1,
+    "min_return_to_closed_frames": 1,
+    "front_view_gates": {
+      "foot_spread_range_min": 0.50,
+      "wrist_spread_range_min": 1.50,
+      "hands_above_shoulders_mean_min": 0.20
+    }
+  },
+  "confusion_suppression": [
+    {
+      "name": "one_arm_raise",
+      "required_rejection_evidence": ["foot_spread_range too low", "left/right arm symmetry missing"]
+    },
+    {
+      "name": "jump_without_arms",
+      "required_rejection_evidence": ["hands_above_shoulders_mean too low"]
+    },
+    {
+      "name": "arms_without_feet",
+      "required_rejection_evidence": ["foot_spread_range too low"]
+    }
+  ]
+}

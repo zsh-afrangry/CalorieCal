@@ -220,7 +220,7 @@ const debugDetails = computed(() => [
   { label: "挥手次数", value: String(waveCount.value) },
   { label: "挥手频率", value: `${waveFrequencyPerMin.value.toFixed(1)} 次/分钟` },
   { label: "挥手 MET", value: currentWaveMet.value.toFixed(1) },
-  { label: "挥手 kcal", value: waveCalories.value.toFixed(2) },
+  { label: "挥手 cal", value: waveCalories.value.toFixed(2) },
   { label: "估算置信度", value: waveConfidence.value },
   { label: "置信度原因", value: waveConfidenceSummary.value },
   { label: "本段挥手帧", value: String(waveCycleGestureFrames.value) },
@@ -256,7 +256,7 @@ const debugDetails = computed(() => [
   { label: "上肢活动分数", value: String(upperBodyActivityScore.value) },
   { label: "上肢强度档位", value: upperBodyIntensityLevel.value },
   { label: "上肢 MET", value: currentUpperBodyMet.value.toFixed(1) },
-  { label: "上肢 kcal", value: upperBodyCalories.value.toFixed(2) },
+  { label: "上肢 cal", value: upperBodyCalories.value.toFixed(2) },
   { label: "上肢关键点完整率", value: `${upperBodyJointCompleteness.value.toFixed(0)}%` },
   { label: "上肢估算置信度", value: upperBodyConfidence.value },
   { label: "上肢置信度原因", value: upperBodyConfidenceSummary.value },
@@ -288,7 +288,7 @@ const currentWaveMet = computed(() => {
 
 const waveCalories = computed(() => {
   const elapsedMinutes = waveElapsedMs.value / 60_000;
-  return (currentWaveMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200;
+  return ((currentWaveMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200) * 1000;
 });
 
 const currentUpperBodyMet = computed(() => {
@@ -309,7 +309,7 @@ const currentUpperBodyMet = computed(() => {
 
 const upperBodyCalories = computed(() => {
   const activeMinutes = upperBodyMotionFeatures.value.activeUpperBodyMs / 60_000;
-  return (currentUpperBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200;
+  return ((currentUpperBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200) * 1000;
 });
 
 const upperBodyJointCompleteness = computed(() => {
@@ -1781,7 +1781,7 @@ onBeforeUnmount(() => {
             <small>按强度档位估算</small>
           </section>
           <section class="metric-card">
-            <span>上肢 kcal</span>
+            <span>上肢 cal</span>
             <strong>{{ upperBodyCalories.toFixed(2) }}</strong>
             <small>通用上肢活动粗略估算</small>
           </section>
@@ -1861,9 +1861,9 @@ onBeforeUnmount(() => {
             <small>粗略档位</small>
           </section>
           <section class="metric-card">
-            <span>挥手 kcal</span>
+            <span>挥手 cal</span>
             <strong>{{ waveCalories.toFixed(2) }}</strong>
-            <small>kcal，仅挥手示例粗略估算</small>
+            <small>cal，仅挥手示例粗略估算</small>
           </section>
           <section class="metric-card">
             <span>挥手置信度</span>

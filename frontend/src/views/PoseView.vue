@@ -29,6 +29,9 @@ type LandmarkPoint = {
 };
 
 type FullBodyTrackedKey =
+  | "nose"
+  | "leftEar"
+  | "rightEar"
   | "leftShoulder"
   | "rightShoulder"
   | "leftElbow"
@@ -117,6 +120,9 @@ const DEPTH_MAX_REASONABLE_OFFSET_MM = 2000;
 const REQUIRED_LANDMARK_INDICES = [11, 12, 15, 16, 23, 24, 27, 28];
 const MIN_LANDMARK_VISIBILITY = 0.5;
 const LANDMARK_INDEX = {
+  nose: 0,
+  leftEar: 7,
+  rightEar: 8,
   leftShoulder: 11,
   rightShoulder: 12,
   leftElbow: 13,
@@ -143,6 +149,11 @@ const FULL_BODY_TRACKED_KEYS: FullBodyTrackedKey[] = [
   "rightKnee",
   "leftAnkle",
   "rightAnkle",
+];
+const HEAD_TRACKED_KEYS: FullBodyTrackedKey[] = ["nose", "leftEar", "rightEar"];
+const SAMPLE_TRACKED_KEYS: FullBodyTrackedKey[] = [
+  ...FULL_BODY_TRACKED_KEYS,
+  ...HEAD_TRACKED_KEYS,
 ];
 const UPPER_BODY_TRACKED_KEYS: FullBodyTrackedKey[] = [
   "leftShoulder",
@@ -317,7 +328,7 @@ const currentFullBodyMet = computed(() => {
 const fullBodyCalories = computed(() => {
   const activeMinutes = fullBodyMotionFeatures.value.activeFullBodyMs / 60_000;
 
-  return (currentFullBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200;
+  return ((currentFullBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200) * 1000;
 });
 
 const jumpingJackFrequencyPerMin = computed(() => {
@@ -347,7 +358,7 @@ const currentJumpingJackMet = computed(() => {
 const jumpingJackCalories = computed(() => {
   const elapsedMinutes = jumpingJackElapsedMs.value / 60_000;
 
-  return (currentJumpingJackMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200;
+  return ((currentJumpingJackMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200) * 1000;
 });
 
 const fullBodyTrackedCompleteness = computed(() => {
@@ -467,7 +478,7 @@ const jumpingJackQualityFeedback = computed(() => {
     }
 
     if (jumpingJackCount.value < 2 && jumpingJackElapsedMs.value > 5000) {
-      feedback.push("完整周期样本较少，频率和 kcal 仅供参考");
+      feedback.push("完整周期样本较少，频率和 cal 仅供参考");
     }
   }
 
@@ -562,7 +573,7 @@ const metrics = computed<MetricCard[]>(() => [
     detail: "组合动作示例",
   },
   {
-    label: "开合跳 kcal",
+    label: "开合跳 cal",
     value: jumpingJackCalories.value.toFixed(2),
     detail: "组合动作估算",
   },
@@ -587,7 +598,7 @@ const metrics = computed<MetricCard[]>(() => [
     detail: fullBodyIntensityLevel.value,
   },
   {
-    label: "全身 kcal",
+    label: "全身 cal",
     value: fullBodyCalories.value.toFixed(2),
     detail: "通用活动估算",
   },
@@ -655,7 +666,7 @@ const poseDebugDetails = computed(() => [
   { label: "开合跳时长", value: formatElapsedTime(jumpingJackElapsedMs.value) },
   { label: "开合跳频率", value: jumpingJackFrequencyPerMin.value.toFixed(1) },
   { label: "开合跳 MET", value: currentJumpingJackMet.value.toFixed(1) },
-  { label: "开合跳 kcal", value: jumpingJackCalories.value.toFixed(2) },
+  { label: "开合跳 cal", value: jumpingJackCalories.value.toFixed(2) },
   { label: "组合动作阶段", value: jumpingJackCounterPhase.value },
   { label: "组合动作计数", value: jumpingJackCounterReason.value },
   { label: "防抖进度", value: actionDebounceProgress.value },
@@ -664,7 +675,7 @@ const poseDebugDetails = computed(() => [
   { label: "全身活动分数", value: String(fullBodyActivityScore.value) },
   { label: "全身强度档位", value: fullBodyIntensityLevel.value },
   { label: "全身 MET", value: currentFullBodyMet.value.toFixed(1) },
-  { label: "全身 kcal", value: fullBodyCalories.value.toFixed(2) },
+  { label: "全身 cal", value: fullBodyCalories.value.toFixed(2) },
   { label: "全身跟踪完整率", value: `${fullBodyTrackedCompleteness.value.toFixed(0)}%` },
   { label: "全身估算置信度", value: fullBodyConfidence.value },
   { label: "置信度原因", value: fullBodyConfidenceSummary.value },
@@ -1115,7 +1126,7 @@ function getFullBodyMotionSample(
 ): FullBodyMotionSample {
   const points: FullBodyMotionSample["points"] = {};
 
-  FULL_BODY_TRACKED_KEYS.forEach((key) => {
+  SAMPLE_TRACKED_KEYS.forEach((key) => {
     const landmark = getVisibleTrackedPoint(landmarks, key);
 
     if (landmark) {
@@ -1224,6 +1235,21 @@ function getAverageTrackedY(
   return points.reduce((sum, point) => sum + point.y, 0) / points.length;
 }
 
+function getAverageTrackedX(
+  sample: FullBodyMotionSample,
+  keys: FullBodyTrackedKey[],
+) {
+  const points = keys
+    .map((key) => sample.points[key])
+    .filter((point): point is LandmarkPoint => Boolean(point));
+
+  if (!points.length) {
+    return null;
+  }
+
+  return points.reduce((sum, point) => sum + point.x, 0) / points.length;
+}
+
 function getTrackedDistance(
   sample: FullBodyMotionSample,
   firstKey: FullBodyTrackedKey,
@@ -1259,7 +1285,9 @@ function getLimbLiftScore(
     return 0;
   }
 
-  return scoreFromRange((hip.y - knee.y) / torsoHeight, -0.05, 0.45);
+  const kneeGapRatio = Math.abs(knee.y - hip.y) / torsoHeight;
+
+  return scoreFromInverseRange(kneeGapRatio, 0.18, 0.62);
 }
 
 function getHipVerticalDelta(
@@ -1280,72 +1308,477 @@ function getHipVerticalDelta(
   return currentHipY - previousHipY;
 }
 
+function getTrackedDistanceRatio(
+  sample: FullBodyMotionSample,
+  firstKey: FullBodyTrackedKey,
+  secondKey: FullBodyTrackedKey,
+  baseDistance: number,
+) {
+  const distance = getTrackedDistance(sample, firstKey, secondKey);
+
+  return distance && baseDistance > 0 ? distance / baseDistance : null;
+}
+
+function getLowerBodyMovementScore(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+) {
+  if (!previous) {
+    return 0;
+  }
+
+  const distance = getAverageTrackedDistance(previous, sample, LOWER_BODY_TRACKED_KEYS);
+
+  return scoreFromRange(distance, 0.018, 0.07);
+}
+
+function getSquatPostureScore(sample: FullBodyMotionSample) {
+  const torsoHeight = getTorsoHeight(sample);
+  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
+  const kneeY = getAverageTrackedY(sample, ["leftKnee", "rightKnee"]);
+  const ankleY = getAverageTrackedY(sample, ["leftAnkle", "rightAnkle"]);
+
+  if (torsoHeight === null || hipY === null || kneeY === null || ankleY === null) {
+    return 0;
+  }
+
+  const kneeToHipRatio = (kneeY - hipY) / torsoHeight;
+  const ankleToHipRatio = (ankleY - hipY) / torsoHeight;
+  const kneeBendScore = scoreFromInverseRange(kneeToHipRatio, 0.55, 1.25);
+  const hipDropScore = scoreFromInverseRange(ankleToHipRatio, 1.1, 2.25);
+
+  return clampScore(kneeBendScore * 0.65 + hipDropScore * 0.35);
+}
+
+function getTrackedDelta(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+  key: FullBodyTrackedKey,
+) {
+  const current = sample.points[key];
+  const last = previous?.points[key];
+
+  if (!current || !last) {
+    return null;
+  }
+
+  return {
+    x: current.x - last.x,
+    y: current.y - last.y,
+    distance: getPointDistance(current, last),
+  };
+}
+
+function getElbowAngleScore(
+  sample: FullBodyMotionSample,
+  side: "left" | "right",
+  target: "extend" | "bend",
+) {
+  const shoulder = sample.points[side === "left" ? "leftShoulder" : "rightShoulder"];
+  const elbow = sample.points[side === "left" ? "leftElbow" : "rightElbow"];
+  const wrist = sample.points[side === "left" ? "leftWrist" : "rightWrist"];
+
+  if (!shoulder || !elbow || !wrist) {
+    return 0;
+  }
+
+  const shoulderVector = { x: shoulder.x - elbow.x, y: shoulder.y - elbow.y };
+  const wristVector = { x: wrist.x - elbow.x, y: wrist.y - elbow.y };
+  const shoulderLength = Math.hypot(shoulderVector.x, shoulderVector.y);
+  const wristLength = Math.hypot(wristVector.x, wristVector.y);
+
+  if (shoulderLength <= 0 || wristLength <= 0) {
+    return 0;
+  }
+
+  const cosine =
+    (shoulderVector.x * wristVector.x + shoulderVector.y * wristVector.y) /
+    (shoulderLength * wristLength);
+  const angle = (Math.acos(Math.min(Math.max(cosine, -1), 1)) * 180) / Math.PI;
+
+  return target === "extend"
+    ? scoreFromRange(angle, 135, 170)
+    : scoreFromInverseRange(angle, 75, 135);
+}
+
+function getArmLiftScore(sample: FullBodyMotionSample, side: "left" | "right") {
+  const shoulder = sample.points[side === "left" ? "leftShoulder" : "rightShoulder"];
+  const elbow = sample.points[side === "left" ? "leftElbow" : "rightElbow"];
+  const wrist = sample.points[side === "left" ? "leftWrist" : "rightWrist"];
+  const torsoHeight = getTorsoHeight(sample);
+
+  if (!shoulder || !wrist || torsoHeight === null) {
+    return 0;
+  }
+
+  const wristLiftRatio = (shoulder.y - wrist.y) / torsoHeight;
+  const elbowLiftRatio = elbow ? (shoulder.y - elbow.y) / torsoHeight : 0;
+
+  return clampScore(
+    scoreFromRange(wristLiftRatio, -0.02, 0.42) * 0.75 +
+      scoreFromRange(elbowLiftRatio, -0.08, 0.26) * 0.25,
+  );
+}
+
+function getArmDropScore(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+) {
+  const torsoHeight = getTorsoHeight(sample);
+
+  if (!previous || torsoHeight === null) {
+    return 0;
+  }
+
+  const deltas = ["leftWrist", "rightWrist"]
+    .map((key) => getTrackedDelta(sample, previous, key as FullBodyTrackedKey))
+    .filter((delta): delta is { x: number; y: number; distance: number } => Boolean(delta));
+
+  if (!deltas.length) {
+    return 0;
+  }
+
+  const downwardRatio =
+    deltas.reduce((total, delta) => total + Math.max(delta.y, 0), 0) /
+    deltas.length /
+    torsoHeight;
+
+  return scoreFromRange(downwardRatio, 0.04, 0.22);
+}
+
+function getHorizontalHandSwingScore(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+  shoulderWidth: number,
+) {
+  if (!previous || shoulderWidth <= 0) {
+    return 0;
+  }
+
+  const deltas = ["leftWrist", "rightWrist"]
+    .map((key) => getTrackedDelta(sample, previous, key as FullBodyTrackedKey))
+    .filter((delta): delta is { x: number; y: number; distance: number } => Boolean(delta));
+
+  if (!deltas.length) {
+    return 0;
+  }
+
+  const horizontalRatio =
+    deltas.reduce((total, delta) => total + Math.abs(delta.x), 0) /
+    deltas.length /
+    shoulderWidth;
+
+  return scoreFromRange(horizontalRatio, 0.08, 0.34);
+}
+
+function getDepthMotionScore(offsetMm: number | null, direction: "front" | "back") {
+  if (
+    offsetMm === null ||
+    depthServiceStatus.value !== "ready" ||
+    Math.abs(offsetMm) >= DEPTH_MAX_REASONABLE_OFFSET_MM
+  ) {
+    return 0;
+  }
+
+  const signedOffset = direction === "front" ? -offsetMm : offsetMm;
+
+  return scoreFromRange(
+    signedOffset,
+    DEPTH_FRONT_BACK_THRESHOLD_MM,
+    DEPTH_ACTION_MAX_SCORE_OFFSET_MM,
+  );
+}
+
+function getHandForwardScore() {
+  return Math.max(
+    getDepthMotionScore(leftWristDepthOffsetMm.value, "front"),
+    getDepthMotionScore(rightWristDepthOffsetMm.value, "front"),
+  );
+}
+
+function getHandBackwardScore() {
+  return Math.max(
+    getDepthMotionScore(leftWristDepthOffsetMm.value, "back"),
+    getDepthMotionScore(rightWristDepthOffsetMm.value, "back"),
+  );
+}
+
+function getTorsoLeanScores(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+  shoulderWidth: number,
+) {
+  const shoulderX = getAverageTrackedX(sample, ["leftShoulder", "rightShoulder"]);
+  const hipX = getAverageTrackedX(sample, ["leftHip", "rightHip"]);
+  const shoulderY = getAverageTrackedY(sample, ["leftShoulder", "rightShoulder"]);
+  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
+  const lastShoulderY = previous
+    ? getAverageTrackedY(previous, ["leftShoulder", "rightShoulder"])
+    : null;
+  const lastHipY = previous ? getAverageTrackedY(previous, ["leftHip", "rightHip"]) : null;
+
+  const lateralRatio =
+    shoulderX !== null && hipX !== null && shoulderWidth > 0
+      ? (shoulderX - hipX) / shoulderWidth
+      : 0;
+  const shoulderHipDelta =
+    shoulderY !== null && hipY !== null && lastShoulderY !== null && lastHipY !== null
+      ? (shoulderY - lastShoulderY) - (hipY - lastHipY)
+      : 0;
+  const torsoHeight = getTorsoHeight(sample);
+  const pitchRatio = torsoHeight !== null ? shoulderHipDelta / torsoHeight : 0;
+  const leftShoulder = sample.points.leftShoulder;
+  const rightShoulder = sample.points.rightShoulder;
+  const shoulderZDelta =
+    leftShoulder?.z !== undefined && rightShoulder?.z !== undefined
+      ? leftShoulder.z - rightShoulder.z
+      : 0;
+
+  return {
+    leftLean: scoreFromRange(-lateralRatio, 0.18, 0.55),
+    rightLean: scoreFromRange(lateralRatio, 0.18, 0.55),
+    forwardLean: scoreFromRange(pitchRatio, 0.06, 0.24),
+    backwardLean: scoreFromRange(-pitchRatio, 0.06, 0.24),
+    leftTurn: scoreFromRange(shoulderZDelta, 0.08, 0.24),
+    rightTurn: scoreFromRange(-shoulderZDelta, 0.08, 0.24),
+  };
+}
+
+function getHeadMotionScores(
+  sample: FullBodyMotionSample,
+  previous: FullBodyMotionSample | null,
+) {
+  const noseDelta = getTrackedDelta(sample, previous, "nose");
+  const earDistance = getTrackedDistance(sample, "leftEar", "rightEar");
+  const earCenterX = getAverageTrackedX(sample, ["leftEar", "rightEar"]);
+  const nose = sample.points.nose;
+  const headBase = Math.max(earDistance ?? 0, MIN_SHOULDER_WIDTH);
+  const noseOffsetRatio =
+    nose && earCenterX !== null && headBase > 0 ? (nose.x - earCenterX) / headBase : 0;
+  const horizontalRatio = noseDelta ? Math.abs(noseDelta.x) / headBase : 0;
+  const verticalRatio = noseDelta ? Math.abs(noseDelta.y) / headBase : 0;
+
+  return {
+    nod: scoreFromRange(verticalRatio, 0.08, 0.28),
+    shake: scoreFromRange(horizontalRatio, 0.08, 0.28),
+    leftTurn: scoreFromRange(-noseOffsetRatio, 0.18, 0.5),
+    rightTurn: scoreFromRange(noseOffsetRatio, 0.18, 0.5),
+  };
+}
+
 function getFullBodyBasicActionCandidates(
   sample: FullBodyMotionSample,
   previous: FullBodyMotionSample | null,
 ) {
   const shoulderDistance = getTrackedDistance(sample, "leftShoulder", "rightShoulder");
   const ankleDistance = getTrackedDistance(sample, "leftAnkle", "rightAnkle");
+  const kneeDistance = getTrackedDistance(sample, "leftKnee", "rightKnee");
   const wristDistance = getTrackedDistance(sample, "leftWrist", "rightWrist");
   const shoulderY = getAverageTrackedY(sample, ["leftShoulder", "rightShoulder"]);
   const wristY = getAverageTrackedY(sample, ["leftWrist", "rightWrist"]);
-  const hipY = getAverageTrackedY(sample, ["leftHip", "rightHip"]);
-  const ankleY = getAverageTrackedY(sample, ["leftAnkle", "rightAnkle"]);
   const torsoHeight = getTorsoHeight(sample);
+  const shoulderWidth = Math.max(shoulderDistance ?? 0, MIN_SHOULDER_WIDTH);
   const ankleRatio =
-    shoulderDistance && ankleDistance ? ankleDistance / shoulderDistance : 0;
+    shoulderDistance && ankleDistance ? ankleDistance / shoulderWidth : 0;
+  const kneeRatio =
+    shoulderDistance && kneeDistance ? kneeDistance / shoulderWidth : 0;
+  const previousShoulderWidth = previous
+    ? Math.max(
+        getTrackedDistance(previous, "leftShoulder", "rightShoulder") ?? 0,
+        MIN_SHOULDER_WIDTH,
+      )
+    : shoulderWidth;
+  const previousAnkleRatio = previous
+    ? getTrackedDistanceRatio(previous, "leftAnkle", "rightAnkle", previousShoulderWidth)
+    : null;
+  const ankleRatioDelta = previousAnkleRatio === null ? 0 : ankleRatio - previousAnkleRatio;
+  const lowerBodyMovementScore = getLowerBodyMovementScore(sample, previous);
+  const footClosingScore = scoreFromRange(-ankleRatioDelta, 0.04, 0.22);
+  const footClosedPostureScore = scoreFromInverseRange(ankleRatio, 0.6, 0.95);
+  const kneeClosedPostureScore = scoreFromInverseRange(kneeRatio, 0.75, 1.2);
+  const footClosedScore =
+    Math.min(footClosedPostureScore, kneeClosedPostureScore + 20) *
+    (Math.max(footClosingScore, lowerBodyMovementScore * 0.55) / 100);
   const wristRatio =
-    shoulderDistance && wristDistance ? wristDistance / shoulderDistance : 0;
+    shoulderDistance && wristDistance ? wristDistance / shoulderWidth : 0;
   const armLiftRatio =
     shoulderY !== null && wristY !== null && torsoHeight !== null
       ? (shoulderY - wristY) / torsoHeight
       : 0;
-  const hipToAnkleRatio =
-    hipY !== null && ankleY !== null && torsoHeight !== null
-      ? (ankleY - hipY) / torsoHeight
-      : 0;
+  const leftArmLiftScore = getArmLiftScore(sample, "left");
+  const rightArmLiftScore = getArmLiftScore(sample, "right");
+  const bothArmsLiftScore =
+    Math.min(leftArmLiftScore, rightArmLiftScore) * 0.75 +
+    Math.max(leftArmLiftScore, rightArmLiftScore) * 0.25;
+  const armDropScore = getArmDropScore(sample, previous);
+  const handForwardScore = getHandForwardScore();
+  const handBackwardScore = getHandBackwardScore();
+  const horizontalHandSwingScore = getHorizontalHandSwingScore(sample, previous, shoulderWidth);
+  const upperBodyContextScore = Math.max(
+    leftArmLiftScore,
+    rightArmLiftScore,
+    armDropScore,
+    handForwardScore,
+    handBackwardScore,
+    horizontalHandSwingScore,
+  );
+  const rawArmExtensionScore = Math.max(
+    getElbowAngleScore(sample, "left", "extend"),
+    getElbowAngleScore(sample, "right", "extend"),
+  );
+  const armExtensionScore =
+    rawArmExtensionScore * (Math.max(upperBodyContextScore, 20) / 100);
+  const armBendScore = Math.max(
+    getElbowAngleScore(sample, "left", "bend"),
+    getElbowAngleScore(sample, "right", "bend"),
+  );
+  const torsoScores = getTorsoLeanScores(sample, previous, shoulderWidth);
+  const headScores = getHeadMotionScores(sample, previous);
   const hipDelta = getHipVerticalDelta(previous, sample);
+  const squatPostureScore = getSquatPostureScore(sample);
+  const previousSquatPostureScore = previous ? getSquatPostureScore(previous) : 0;
+  const squatDescentScore =
+    scoreFromRange(hipDelta, 0.012, 0.055) * (squatPostureScore / 100);
+  const squatHoldScore = squatPostureScore >= 68 ? squatPostureScore * 0.75 : 0;
+  const standUpScore =
+    scoreFromRange(-hipDelta, 0.012, 0.055) *
+    (Math.max(previousSquatPostureScore, squatPostureScore) / 100);
+  const leftLegLiftScore = getLimbLiftScore(sample, "leftHip", "leftKnee");
+  const rightLegLiftScore = getLimbLiftScore(sample, "rightHip", "rightKnee");
   const candidates: BasicActionCandidate[] = [
     {
       label: "双脚打开",
-      score: scoreFromRange(ankleRatio, 0.85, 1.25),
+      score: scoreFromRange(ankleRatio, 1.05, 1.45),
       reason: "脚踝间距相对肩宽变大",
     },
     {
       label: "双脚合拢",
-      score: scoreFromInverseRange(ankleRatio, 0.75, 1.1),
-      reason: "脚踝间距相对肩宽较小",
+      score: footClosedScore,
+      reason: "脚踝和膝盖距离收窄，并出现合拢变化",
+    },
+    {
+      label: "左手上抬",
+      score: leftArmLiftScore,
+      reason: "左腕和左肘相对左肩上抬",
+    },
+    {
+      label: "右手上抬",
+      score: rightArmLiftScore,
+      reason: "右腕和右肘相对右肩上抬",
     },
     {
       label: "双臂上抬",
       score: Math.max(
-        scoreFromRange(armLiftRatio, -0.1, 0.35),
+        bothArmsLiftScore,
+        scoreFromRange(armLiftRatio, 0.05, 0.45),
         scoreFromRange(wristRatio, 0.9, 1.35) * 0.7,
       ),
       reason: "手腕高于肩部或双手横向打开",
     },
     {
+      label: "手臂回落",
+      score: armDropScore,
+      reason: "手腕相对上一帧向下移动",
+    },
+    {
+      label: "手向前移动",
+      score: handForwardScore,
+      reason: "RGB-D 显示手腕接近摄像头",
+    },
+    {
+      label: "手向后移动",
+      score: handBackwardScore,
+      reason: "RGB-D 显示手腕远离摄像头",
+    },
+    {
+      label: "手水平摆动",
+      score: horizontalHandSwingScore,
+      reason: "手腕横向位移明显",
+    },
+    {
+      label: "手臂伸展",
+      score: armExtensionScore,
+      reason: "肩肘腕夹角接近伸直，并伴随上肢活动证据",
+    },
+    {
+      label: "手臂弯曲",
+      score: armBendScore,
+      reason: "肩肘腕夹角变小",
+    },
+    {
       label: "左抬腿",
-      score: getLimbLiftScore(sample, "leftHip", "leftKnee"),
+      score: leftLegLiftScore,
       reason: "左膝相对左髋上抬",
     },
     {
       label: "右抬腿",
-      score: getLimbLiftScore(sample, "rightHip", "rightKnee"),
+      score: rightLegLiftScore,
       reason: "右膝相对右髋上抬",
     },
     {
+      label: "膝盖上抬",
+      score: Math.max(leftLegLiftScore, rightLegLiftScore),
+      reason: "任一膝盖相对髋部上抬",
+    },
+    {
       label: "下蹲",
-      score: Math.max(
-        scoreFromRange(hipDelta, 0.004, 0.035),
-        scoreFromInverseRange(hipToAnkleRatio, 1.25, 2.4) * 0.8,
-      ),
-      reason: "髋部下移或髋踝距离缩短",
+      score: Math.max(squatDescentScore, squatHoldScore),
+      reason: "髋部下移并伴随膝髋结构变化",
     },
     {
       label: "起身",
-      score: scoreFromRange(-hipDelta, 0.004, 0.035),
-      reason: "髋部上移",
+      score: standUpScore,
+      reason: "从下蹲结构中髋部上移",
+    },
+    {
+      label: "身体前倾",
+      score: torsoScores.forwardLean,
+      reason: "肩部相对髋部向下移动",
+    },
+    {
+      label: "身体后仰",
+      score: torsoScores.backwardLean,
+      reason: "肩部相对髋部向上移动",
+    },
+    {
+      label: "身体左倾",
+      score: torsoScores.leftLean,
+      reason: "肩部中心相对髋部中心左移",
+    },
+    {
+      label: "身体右倾",
+      score: torsoScores.rightLean,
+      reason: "肩部中心相对髋部中心右移",
+    },
+    {
+      label: "身体左转",
+      score: torsoScores.leftTurn,
+      reason: "左右肩 z 差显示身体旋转",
+    },
+    {
+      label: "身体右转",
+      score: torsoScores.rightTurn,
+      reason: "左右肩 z 差显示身体旋转",
+    },
+    {
+      label: "点头",
+      score: headScores.nod,
+      reason: "鼻尖纵向位移明显",
+    },
+    {
+      label: "摇头",
+      score: headScores.shake,
+      reason: "鼻尖横向位移明显",
+    },
+    {
+      label: "左转头",
+      score: headScores.leftTurn,
+      reason: "鼻尖相对双耳中心左移",
+    },
+    {
+      label: "右转头",
+      score: headScores.rightTurn,
+      reason: "鼻尖相对双耳中心右移",
     },
   ];
 
@@ -1354,7 +1787,7 @@ function getFullBodyBasicActionCandidates(
       ...candidate,
       score: clampScore(candidate.score),
     }))
-    .filter((candidate) => candidate.score >= 20)
+    .filter((candidate) => candidate.score >= 35)
     .sort((left, right) => right.score - left.score);
 }
 

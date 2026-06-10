@@ -1,0 +1,418 @@
+# Task10 后端算法层快速验证 — 实施清单
+
+> 状态：Phase 1 已完成；Phase 2 / Phase 3 / Phase 5 / Phase 6 / Phase 7 已启动，已形成第一版“视频 → 姿态 → 参数 → 离线状态机 → 可视化脚本”闭环。  
+> 目标：快速验证“如何更有效地利用前端识别到的点位”，形成轻量后端算法层，并用公开数据集 + 自录数据集沉淀可复用的动作参数资产。  
+> 原则：商业化前期优先显著成果和可视化效果；不做大模型研究，不继续堆识别点；每轮都量化响应速度、识别速度、识别准确度、误报和漏报。  
+
+---
+
+## Task10 主链路
+
+公开视频 / 图片数据集 / 自录视频  
+→ 统一提取人体姿态关键点  
+→ 清洗、归一化、标注动作阶段  
+→ 生成动作样本资产  
+→ 从样本资产生成动作参数  
+→ 接入轻量识别算法  
+→ 本地视频 / 摄像头实时验证  
+→ 输出量化指标  
+→ 决定是否接入 Vue 或后端 API
+
+---
+
+## Phase 1: 方向收敛和技术选型
+
+- [x] 1.1 确认 Task10 定位
+      → 后端包含算法层，不只是传统 API 服务
+      → 前端继续负责 MediaPipe Pose / Hand / segmentation / RGB-D 采样
+      → 后端算法层负责点位序列、depth 证据、动作特征、状态机、模板匹配和动作参数资产
+      → 不继续把核心识别复杂度堆到前端页面里
+      → Phase1 决策: Task10 的核心不是继续扩前端 UI，而是建立可独立验证的 Python 算法层；前端 / 摄像头 / 数据集都只作为输入来源
+
+- [x] 1.2 确认第一轮动作范围
+      → 静息、挥手、出拳、深蹲、高抬腿、开合跳
+      → 第一轮重点闭合：深蹲、开合跳
+      → 第二轮扩展：挥手、出拳
+      → 第三轮扩展：高抬腿
+      → Phase1 决策: 第一轮不平均铺开 6 个动作，先用深蹲和开合跳跑通“样本资产 → 参数 → 识别 → 可视化 → 指标”闭环
+
+- [x] 1.3 选定 P0 技术
+      → MediaPipe / ML Kit Pose Classification 思路: 归一化 + pose embedding + KNN / 模板相似度 + EMA / 滞回计数
+      → One Euro Filter / 自适应平滑: 降低静止抖动，减少快速动作延迟
+      → 规则状态机: 用于动作进入、阶段切换、计数、退出和冷却
+      → 每个动作必须有动作 spec，不能只说“使用某算法”
+      → Phase1 决策: P0 技术固定为 pose embedding + 规则状态机 + action spec；One Euro Filter 作为稳定性组件进入第一版
+
+- [x] 1.4 选定 P1 / P2 技术
+      → P1: DTW / 动作模板匹配，用于少样本周期动作和不同速度动作对齐
+      → P2: sklearn RandomForest / Logistic Regression / SVM，用于样本积累后的轻量分类验证
+      → 暂缓: ST-GCN / PoseC3D / PYSKL，只作为后续参考，不进入第一轮快速验证
+      → Phase1 决策: P1 只在 P0 效果不足时补 DTW；P2 等自录样本积累后再试；重模型不进入 Task10 第一轮
+
+- [x] 1.5 明确 Task10 的核心产物
+      → 不是只做一个识别脚本，而是沉淀“动作参数资产”
+      → 每个动作需要能回答：什么样的数据会被判断为这个动作
+      → 每个动作需要记录：正样本、负样本、混淆样本、阶段定义、特征、权重、阈值、模板、失败原因
+      → Phase1 决策: action spec 是核心资产；算法代码只读取 spec 和样本资产，不把动作参数硬编码在逻辑里
+
+### Phase 1 结论
+
+- [x] 技术主线已定：MediaPipe Pose 33 / 离线姿态样本 → 归一化 → pose embedding → action spec → 规则状态机 / 模板相似度 → 本地验证
+- [x] 第一轮闭环动作已定：深蹲、开合跳
+- [x] 后续扩展动作已定：挥手、出拳、高抬腿
+- [x] 第一轮暂不接 Vue，不先做 API；优先 Python 本地视频 / 摄像头验证
+- [x] 第一轮暂不引入 ST-GCN / PoseC3D / PYSKL 等重训练链路
+- [x] Phase2 需要继续确认：公开数据集的下载可行性、许可证风险、自录样本目录、第一批样本数量和标注方式
+
+---
+
+## Phase 2: 数据来源和采集规范
+
+- [ ] 2.1 确定公开数据集来源
+      → 深蹲 / 开合跳: 优先 PoseRAC / RepCount-pose、Penn Action
+      → 挥手 / 出拳: 优先 NTU RGB+D、UCF101
+      → 高抬腿: 公开数据不理想，优先自录样本 + 规则模板
+      → 注意记录数据集来源、动作类别、许可证、下载方式、是否已有关键点标注
+
+- [x] 2.2 增加自录数据集路线
+      → 用户可以自己录制 / 拍摄数据集
+      → 自录数据作为第一轮参数校准的核心数据，公开数据作为补充和参考
+      → 每个动作先录 10~30 条正样本
+      → 每个动作录 10~20 条负样本 / 混淆样本
+      → 每条样本建议 3~8 秒，包含动作开始、完整动作、动作结束
+      → 已确认: 用户已准备深蹲和开合跳视频，包括多角度正样本和负样本；第一轮可直接从视频生成姿态轨迹和抽帧图片
+
+- [ ] 2.3 自录视频采集要求
+      → 摄像头固定，不频繁移动
+      → 人体尽量完整入镜，头、手、脚不要出画面
+      → 先以正面视角为主，后续再增加侧面 / 斜侧面
+      → 光线稳定，背景尽量减少遮挡
+      → 每条视频文件名包含动作名、样本类型、编号、视角，例如 `jumping_jack_positive_front_001.mp4`
+
+- [ ] 2.4 自录图片采集要求
+      → 图片适合采集静态姿态阶段，不适合单独表达完整动作
+      → 每个动作阶段可拍 20~50 张图片
+      → 开合跳阶段: `closed`、`open`
+      → 深蹲阶段: `stand`、`down`
+      → 高抬腿阶段: `left_knee_up`、`right_knee_up`
+      → 挥手阶段: `hand_left`、`hand_right`、`hand_high`
+      → 出拳阶段: `guard`、`extend`、`retract`
+
+- [x] 2.5 建立原始数据目录
+      → 建议路径: `task10-后端算法层快速验证/datasets/raw/`
+      → `public/`: 公开数据集样本
+      → `self_recorded/videos/`: 自录视频
+      → `self_recorded/images/`: 自录图片
+      → `metadata/`: 样本来源、标签、备注、采集条件
+      → 已建立 raw / pose 目录结构，视频可先放入 `datasets/raw/self_recorded/videos/`
+
+- [x] 2.6 建立样本标注表
+      → 建议文件: `task10-后端算法层快速验证/datasets/metadata/samples.csv`
+      → 字段: sample_id、source、file_path、action、sample_type、view、stage_label、start_sec、end_sec、quality、note
+      → sample_type: positive / negative / confusion / calibration
+      → stage_label 可为空，视频样本后续再切阶段
+      → 已建立: `task10-后端算法层快速验证/datasets/raw/metadata/samples.csv`
+
+---
+
+## Phase 3: 图片 / 视频 → 姿态关键点
+
+- [ ] 3.1 统一姿态提取方案
+      → 第一版使用 MediaPipe Pose 33 或 MMPose COCO-17，优先选与当前前端一致的 MediaPipe Pose 33
+      → Whole-Body 133 点保留为可选输入，但第一轮动作识别只使用身体主骨架
+      → 核心点: 鼻子、肩、肘、腕、髋、膝、踝、脚跟、脚尖
+
+- [ ] 3.2 图片转姿态样本
+      → 输入: 单张图片
+      → 输出: 单帧 pose JSON
+      → 保存字段: image_path、action、stage_label、landmarks、visibility、image_width、image_height、extractor、created_at
+      → 用途: 生成静态阶段模板，例如深蹲最低点、开合跳打开态、出拳伸展态
+
+- [x] 3.3 视频转姿态序列
+      → 输入: mp4 / webcam record
+      → 输出: 多帧 pose sequence JSON / JSONL
+      → 每帧保存: timestamp、frame_index、landmarks、visibility、extractor_fps、pose_quality
+      → 用途: 生成动作时序模板，例如开合跳 closed→open→closed、深蹲 stand→down→stand
+      → 已新增脚本: `task10-后端算法层快速验证/video_pose_trajectory.py`
+      → 脚本输出: `pose_sequence.jsonl`、`features.csv`、`summary.json`、`snapshots/`、可选 `overlay.mp4`
+
+- [ ] 3.4 姿态质量检查
+      → 关键点可见率过低时标记低质量
+      → 手腕、髋、膝、踝缺失时，对上肢 / 下肢动作分别降权
+      → 人体框过小、身体出画面、多人入镜时标记异常
+      → 不合格样本不进入参数生成，只进入问题样本列表
+
+- [ ] 3.5 建立姿态输出目录
+      → 建议路径: `task10-后端算法层快速验证/datasets/pose/`
+      → `images/`: 图片提取的单帧姿态
+      → `videos/`: 视频提取的姿态序列
+      → `rejected/`: 低质量或提取失败样本
+
+---
+
+## Phase 4: 姿态关键点 → 动作样本资产
+
+- [ ] 4.1 统一坐标归一化
+      → 以髋中心作为人体中心
+      → 以肩宽、髋宽或躯干长度作为尺度
+      → 统一左右方向、相对高度、相对距离
+      → 尽量让不同身高、远近、画面尺寸下的样本可比较
+
+- [ ] 4.2 生成 pose embedding
+      → 静态特征: 关节角度、左右距离、手腕相对肩 / 髋位置、膝盖相对髋位置、脚距 / 肩宽
+      → 时序特征: 速度、加速度、方向变化、动作幅度、周期时长
+      → depth 特征: 手腕相对肩 / 髋的前后位移，主要用于出拳
+      → 质量特征: 关键点置信度、可见率、样本质量分
+
+- [ ] 4.3 标注动作阶段
+      → 开合跳: `closed`、`opening`、`open`、`closing`
+      → 深蹲: `stand`、`downing`、`down`、`rising`
+      → 挥手: `left_swing`、`right_swing`、`turning`
+      → 出拳: `guard`、`extending`、`extended`、`retracting`
+      → 高抬腿: `left_up`、`left_down`、`right_up`、`right_down`
+
+- [ ] 4.4 生成正样本资产
+      → 每个动作保存标准样本和可接受变体
+      → 每条样本保存 embedding 序列、阶段标签、关键曲线、质量分
+      → 关键曲线示例: 髋部高度、膝角度、脚距、腕部高度、腕部横向位移、手腕 depth
+      → 深蹲样本需覆盖多种手部姿态: 水平前伸、叉腰、双手背于臀部、按住膝盖内收
+      → 深蹲识别不应把手部姿态作为强条件；手部只能作为弱参考、备注特征或忽略特征
+
+- [ ] 4.5 生成负样本和混淆样本资产
+      → 静息作为所有动作的基础负样本
+      → 挥手 vs 出拳互为混淆样本
+      → 深蹲 vs 身体前倾互为混淆样本
+      → 开合跳 vs 普通跳跃 / 原地摆手互为混淆样本
+      → 高抬腿 vs 普通走动 / 踢腿互为混淆样本
+
+- [ ] 4.6 建立动作资产目录
+      → 建议路径: `backend/action_engine/assets/`
+      → `pose_samples/`: 归一化后的样本
+      → `templates/`: 每个动作的时序模板
+      → `curves/`: 每个动作的关键曲线
+      → `negative_samples/`: 反例和混淆样本
+      → `reports/`: 样本质量和参数生成报告
+      → 已新增批量审计脚本: `task10-后端算法层快速验证/batch_asset_audit.py`
+      → 审计脚本读取所有 `summary.json`，输出 `datasets/pose/reports/asset_audit.csv` 和 `asset_audit.md`
+      → 目的: 不逐个视频手工写注意点，而是批量归纳规律、异常样本和动作 spec 提示
+
+---
+
+## Phase 5: 动作样本资产 → 动作参数
+
+- [ ] 5.1 为每个动作建立 action spec
+      → 建议路径: `backend/action_engine/action_specs/`
+      → 第一批: `rest`、`wave`、`punch`、`squat`、`high_knee`、`jumping_jack`
+      → 第一版可使用 JSON / YAML / Python dict，优先保证可读、可调、可版本化
+      → 已建立 v0 草案: `backend/action_engine/action_specs/squat.json`
+      → 已建立 v0 草案: `backend/action_engine/action_specs/jumping_jack.json`
+      → 暂未建立: `rest`、`wave`、`punch`、`high_knee`
+
+- [ ] 5.2 action spec 必备字段
+      → action_name: 动作名
+      → action_type: static / transition / cyclic
+      → required_landmarks: 必须可见的关键点
+      → features: 使用哪些特征
+      → feature_weights: 特征权重
+      → enter_threshold: 进入阈值
+      → exit_threshold: 退出阈值
+      → min_hold_ms: 最小保持时间
+      → cooldown_ms: 冷却时间
+      → templates: 正样本模板
+      → negative_templates: 负样本模板
+      → confusion_templates: 混淆样本模板
+      → quality_gates: 质量门控
+      → explain_rules: 可解释原因
+      → v0 spec 已包含: action_name、action_type、supported_views、required_landmarks、strong_features、quality_gates、summary_rules、state_machine_hint、frame_state_machine、confusion_suppression
+      → v0 spec 暂缺: 正样本模板、负样本模板、DTW / KNN 模板参数、实时 rolling buffer 参数
+
+- [ ] 5.3 从样本统计静态参数
+      → 统计每个阶段的关节角度范围
+      → 统计每个阶段的相对高度范围
+      → 统计每个阶段的左右距离 / 脚距 / 手距范围
+      → 统计正样本和负样本的特征分布差异
+      → 用分位数生成初始阈值，而不是凭感觉手写死阈值
+      → 已从 24 条样本审计表生成 summary 级别 v0 阈值，用于验证方向；后续还需基于逐帧特征细化
+
+- [ ] 5.4 从样本统计时序参数
+      → 统计动作周期时长
+      → 统计动作幅度
+      → 统计速度峰值和方向变化次数
+      → 统计阶段切换顺序和平均持续时间
+      → 生成状态机的阶段进入 / 退出条件
+      → 已生成第一版逐帧阶段参数: 深蹲 `stand/downing/down/rising`；开合跳 `closed/opening/open/closing`
+      → 已验证第一版周期计数: 深蹲支持样本均识别 1 个周期；开合跳正面支持样本均识别 1 个周期
+      → 注意: 当前周期参数仍为 v0，后续应加入更多速度、持续时间、起止姿态约束
+
+- [ ] 5.5 生成模板匹配参数
+      → 为每个动作保存 5~20 条代表性模板
+      → 为每个动作保存关键曲线模板
+      → 计算正样本间距离分布
+      → 计算正样本 vs 负样本距离分布
+      → 生成 KNN / DTW / 模板相似度阈值
+
+- [ ] 5.6 第一轮动作参数重点
+      → 开合跳: 手腕高度、手距、脚距、脚距 / 肩宽、closed→open→closed 周期
+      → 深蹲: 髋部下降幅度、膝髋角度、躯干倾斜、stand→down→stand 周期；手部姿态多样，不作为必要条件
+      → 挥手: 手腕高度、横向摆动幅度、换向次数、身体整体运动量限制
+      → 出拳: 手臂伸展、手腕 depth 前移、回收、与挥手互斥
+      → 高抬腿: 膝盖相对髋部高度、左右交替、身体中心稳定性
+      → v0 决策: 深蹲正面/侧面均可先支持；开合跳先支持正面，侧面暂列 experimental
+      → v0 混淆抑制: 深蹲必须压制“弯腰但腿不弯”；开合跳必须压制“只抬一条胳膊”
+
+---
+
+## Phase 6: 动作参数 → 识别算法
+
+- [ ] 6.1 定义 compact frame JSON
+      → 输入字段: timestamp、pose33、handSummary、depthSamples、maskQuality、frontendFps
+      → 输出字段: basicActions、compositeAction、confidence、latencyMs、processingFps、evidence、debugReason
+
+- [ ] 6.2 搭建 Python 本地原型
+      → 可先做离线脚本，再升级为 HTTP / WebSocket 服务
+      → 维护 1 秒和 3 秒 rolling buffer
+      → 输出每帧动作结果 JSON
+      → 第一阶段优先本地视频 / 窗口验证，不急着接 Vue
+
+- [ ] 6.3 实现点位归一化和质量门控
+      → 使用肩宽、髋中心、躯干高度做归一化
+      → 检查关键点可见率、mask 命中率、depth 有效率
+      → 低质量时输出低置信度，不强行识别动作
+
+- [ ] 6.4 实现平滑和特征提取
+      → 对关键点和关键特征加入 One Euro Filter / 自适应平滑
+      → 提取距离、角度、速度、加速度、左右对称、depth 前后偏移、动作幅度
+      → 特征名称必须和 action spec 对齐
+
+- [x] 6.5 实现规则状态机 v0
+      → 从 action spec 读取阈值和阶段定义
+      → 每个动作包含 enter、hold、stage transition、exit、cooldown
+      → 避免把参数散落在代码里
+      → 输出当前动作阶段和失败原因
+      → 已新增脚本: `task10-后端算法层快速验证/offline_action_state_machine.py`
+      → 输入: 每个视频的 `features.csv` + `backend/action_engine/action_specs/*.json`
+      → 输出: 每个视频的 `state_sequence_<action>.jsonl`、`state_summary_<action>.json`
+      → 汇总输出: `datasets/pose/reports/state_machine_report.csv` 和 `state_machine_report.md`
+      → 当前结果: 48 次评估，44 pass，4 个开合跳侧面正样本因 unsupported view 被跳过；支持视角内 0 fail
+      → 当前限制: 仍是离线状态机；实时 rolling buffer、cooldown、动作冲突仲裁尚未进入
+
+- [ ] 6.6 实现 KNN / 模板相似度
+      → 使用 pose embedding 与正样本 / 负样本比较
+      → 输出动作相似度分数
+      → 记录最近邻样本 ID，方便追踪“为什么像这个动作”
+      → 与规则状态机分数融合
+
+- [ ] 6.7 实现 DTW / 时序模板匹配
+      → 使用 1~3 秒 rolling buffer
+      → 对关键曲线做时序对齐
+      → 用于深蹲、开合跳、高抬腿等周期动作
+      → 只保留能明显降低误报 / 漏报的模板逻辑
+
+- [ ] 6.8 实现分数融合
+      → final_score = 规则分数 + 模板分数 + 质量分 - 混淆惩罚
+      → 进入动作需要高阈值，退出动作使用低阈值，形成滞回
+      → 静息状态要有保护，避免轻微抖动频繁触发动作
+      → 同一时间多个动作冲突时，按 spec 中的互斥规则处理
+
+- [x] 6.9 实现 summary 级别 spec 粗评估
+      → 已新增脚本: `task10-后端算法层快速验证/evaluate_action_specs.py`
+      → 输入: `asset_audit.csv` + `backend/action_engine/action_specs/*.json`
+      → 输出: `datasets/pose/reports/spec_eval.csv` 和 `spec_eval.md`
+      → 当前结果: 48 次粗评估，44 pass，4 个开合跳侧面正样本因 unsupported view 被跳过；已计入跳过，不视为失败
+      → 注意: 这是 summary 级别验证，不等于最终实时逐帧识别算法
+
+---
+
+## Phase 7: 本地验证和可视化
+
+- [ ] 7.1 离线视频验证
+      → 输入公开视频 / 自录视频
+      → 输出带骨架、动作名、阶段、置信度、失败原因的可视化视频
+      → 输出每帧识别结果 JSONL
+      → 已新增可视化脚本: `task10-后端算法层快速验证/render_action_overlay.py`
+      → 输入: `summary.json`、`pose_sequence.jsonl`、`state_summary_<action>.json`、`state_sequence_<action>.jsonl`
+      → 输出: 每个样本目录下的 `action_overlay_<action>.mp4`
+      → 汇总输出: `datasets/pose/reports/action_overlay_report.csv` 和 `action_overlay_report.md`
+      → 防覆盖策略: 默认保留旧视频，重复渲染会生成带时间戳的新文件；只有显式使用 `--force-overwrite` 才覆盖
+      → 当前环境缺少 `cv2`，未在沙箱内实际渲染；需要用户在 `CalorieCalPose` conda 环境执行渲染命令确认视频效果
+
+- [ ] 7.2 图片阶段验证
+      → 输入自录图片或公开图片
+      → 输出姿态点、阶段分类结果、命中特征
+      → 用于检查静态阶段定义是否合理
+
+- [ ] 7.3 摄像头实时验证
+      → 本地窗口实时显示人体骨架、动作名、阶段、置信度
+      → 显示关键证据，例如“脚距达到 1.8x 肩宽”“髋部下降 0.32 torso”
+      → 显示失败原因，例如“脚踝不可见”“手臂幅度不足”“未完成 closed→open→closed”
+      → 已新增实时验证脚本: `task10-后端算法层快速验证/realtime_action_window.py`
+      → 输入: 摄像头画面 + MediaPipe Pose + `backend/action_engine/action_specs/*.json`
+      → 输出: 本地窗口叠加骨架、动作阶段、score、count、latency、gate reason
+      → 可选输出: `datasets/pose/realtime_logs/realtime_*.jsonl` 和 `realtime_overlay_*.mp4`
+      → 当前策略: 先实时验证，再根据实时反馈微调 deep squat / jumping jack 的阈值、窗口、门控和计数逻辑
+      → 注意: 开合跳侧面仍为 unsupported；实时验证优先使用正面视角
+      → 2026-06-10 实测记录: MediaPipe 实时启动成功，约 10 FPS，单帧延迟约 12~27ms；但下半身关键特征缺失，`mean_knee_angle`、`foot_spread_shoulder_ratio`、`hip_height_above_ankles_torso` 有效帧均为 0，说明当前摄像头构图/距离不足以验证深蹲和开合跳
+      → 已增强实时脚本诊断: 退出时输出 pose / knee_angle / foot_spread / hip_height 有效帧统计，窗口中显示 `missing lower-body evidence` 提示
+
+- [ ] 7.4 输出量化结果
+      → FPS
+      → 单帧处理耗时
+      → 动作响应延迟
+      → 正例识别率
+      → 漏检率
+      → 误判率
+      → 单次动作计数是否正确
+      → 标签稳定性
+      → 已新增样本级批量审计输出: `asset_audit.csv` / `asset_audit.md`
+      → 已新增 spec 粗评估输出: `spec_eval.csv` / `spec_eval.md`
+      → 已新增逐帧状态机评估输出: `state_machine_report.csv` / `state_machine_report.md`
+      → 当前离线状态机结果: 深蹲支持视角正样本 cycle count 全为 1；开合跳正面正样本 cycle count 全为 1
+      → 当前风险样本: 部分混淆样本会产生 raw cycle，但被 summary gate 拒绝；后续需要用更多负样本继续压低 raw cycle 风险
+
+- [ ] 7.5 对比当前前端规则
+      → 同样动作在当前 /#/demo 和后端算法层分别测试
+      → 记录哪些动作明显变好，哪些动作没有收益
+      → 若没有明显收益，不接入 demo，只保留算法记录
+
+---
+
+## Phase 8: 第一轮量化目标
+
+- [ ] 8.1 速度目标
+      → 后端算法处理耗时: 目标 < 10ms / 帧
+      → 端到端响应延迟: 目标 < 150ms，优秀 < 100ms
+      → 动作开始后 300~600ms 内给出可见反馈
+
+- [ ] 8.2 准确率目标
+      → 深蹲正例识别率: 第一轮 > 80%
+      → 开合跳正例识别率: 第一轮 > 80%
+      → 静息 / 混淆动作误报率: 第一轮 < 15%
+      → 单个动作持续 10 秒时异常跳变 < 2 次
+
+- [ ] 8.3 可解释目标
+      → 每个动作结果必须带 1~3 条证据
+      → 每个拒绝识别结果必须带失败原因
+      → 每轮调参必须能追溯是哪些样本、特征或阈值发生变化
+
+---
+
+## Phase 9: 接入决策
+
+- [ ] 9.1 决定是否接入 /#/demo
+      → 只有当响应速度、稳定性或准确率明显优于当前前端规则时才接入
+      → 接入也只接动作结果，不把调试细节展示给普通用户
+      → Vue 负责展示，算法层负责识别
+
+- [ ] 9.2 决定算法层形态
+      → 如果只是验证和演示，继续 Python 本地窗口最快
+      → 如果要产品化体验，封装成 Python API / WebSocket
+      → 如果后续需要部署，考虑把 action spec 和轻量模型独立版本化
+
+- [ ] 9.3 形成下一轮调优清单
+      → 根据用户实测反馈，记录每个动作的误报、漏报和混淆来源
+      → 决定继续调规则、加模板、加轻量模型，还是暂缓该动作
+
+- [ ] 9.4 Task10 收尾
+      → 输出可量化报告: 速度、准确率、误报率、稳定性、可视化效果
+      → 输出动作参数资产: action spec、模板、正负样本、混淆样本
+      → 明确后端算法层是否进入产品主链路

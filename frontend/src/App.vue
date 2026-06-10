@@ -2,9 +2,8 @@
 import { ref } from "vue";
 
 const navItems = [
-  { to: "/pose", label: "姿态检测", caption: "开合跳 MVP" },
-  { to: "/gesture", label: "手势识别", caption: "手部关键点" },
-  { to: "/face", label: "人脸检测", caption: "人脸框检测" },
+  { to: "/pose", label: "姿态检测", caption: "实时调试" },
+  { to: "/segmentation", label: "分割测试", caption: "Task8 实验" },
   { to: "/demo", label: "演示版", caption: "外场展示" },
 ];
 

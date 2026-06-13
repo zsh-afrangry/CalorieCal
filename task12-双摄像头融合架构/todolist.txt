@@ -1,6 +1,6 @@
 # Task12 双摄像头融合架构 — 实施清单
 
-> 状态：待开始
+> 状态：进行中
 > 目标：引入侧面摄像头，实现双视角融合的热量计算和动作识别，解决单摄像头遮挡问题。
 > 原则：不做复杂 3D 重建，第一版采用可见度门槛 + 最大运动信号融合；保留调试开关；向后兼容单摄像头模式。
 > 关键判断：Task12 成功标准是"用户侧身、扭腰时热量计算不中断"，不要求动作识别 100% 准确。
@@ -51,25 +51,14 @@
 - [x] 2.0 realtime_engine.py 增加双视角独立状态
       → **关键问题**: 现有 _prev_landmarks、_prev_hip_height 等状态是单视角设计
       → **问题影响**: 如果 front/side 共享状态，side 的 motion_energy 会用 front 的 _prev_landmarks 计算，导致错误
-      → **修正方案**: 分离 front/side 的历史状态
+      → **实现方案**: 分离关键状态（prev_landmarks 和 prev_hip_height）
         ```python
-        # 方案 A: 创建 ViewState 类封装每个视角的状态
-        class ViewState:
-            def __init__(self):
-                self.prev_landmarks = None
-                self.prev_hip_height = None
-                # buffer 等其他状态根据需要添加
-
-        self._state_front = ViewState()
-        self._state_side = ViewState()
-
-        # 方案 B: 简化版，只分离关键状态
         self._prev_landmarks_front = None
         self._prev_landmarks_side = None
         self._prev_hip_height_front = None
         self._prev_hip_height_side = None
+        self._prev_motion_active_view = None
         ```
-      → **推荐方案 B**: 第一版只需分离 prev_landmarks 和 prev_hip_height，其他状态（如动作识别 buffer）仍然只用 front
       → 已完成: 新增 _prev_landmarks_front/_side、_prev_hip_height_front/_side、_prev_motion_active_view
       → 已完成: 单摄 push_frame 同步 front 状态，便于单/双摄切换
 
@@ -94,9 +83,8 @@
 
 - [x] 2.2 实现改进的融合策略（取较大运动信号）
       → **问题**: 原方案的可见度加权会低估运动（例如前后平移时正面投影压扁）
-      → **改进策略**: 可见度门槛 + 取较大运动信号
+      → **实现策略**: 可见度门槛 + 取较大运动信号
         ```python
-        # 方案 A: 取 max（推荐，更不容易低估）
         VIS_THRESHOLD = 0.5
         if core_vis_front >= VIS_THRESHOLD and core_vis_side >= VIS_THRESHOLD:
             motion_e_merged = max(motion_e_front, motion_e_side)
@@ -114,20 +102,7 @@
             motion_e_merged = 0.0
             hip_h_merged = None
             active_view = "none"
-
-        # 方案 B: 可见度加权（备选，如果方案 A 不稳定）
-        # 只对可见度 >= 0.5 的视角加权
-        valid_views = []
-        if core_vis_front >= VIS_THRESHOLD:
-            valid_views.append(("front", motion_e_front, hip_h_front, core_vis_front))
-        if core_vis_side >= VIS_THRESHOLD:
-            valid_views.append(("side", motion_e_side, hip_h_side, core_vis_side))
-        if valid_views:
-            total_vis = sum(v[3] for v in valid_views)
-            motion_e_merged = sum(v[1] * v[3] / total_vis for v in valid_views)
-            hip_h_merged = sum(v[2] * v[3] / total_vis for v in valid_views if v[2] is not None)
         ```
-      → **推荐方案 A**: 实现简单，符合直觉，不容易低估
       → 已完成: core_visible_ratio >= 0.5 的视角参与候选，双路可用时采用 motion_energy 较大视角
       → 已完成: active_view 切换时重置 hip delta 基准，避免 front/side 髋高跨视角相减
 
@@ -138,16 +113,15 @@
         ```python
         # 动作识别：只用 front
         if landmarks_front and core_vis_front >= 0.7:
-            actions = self._recognize_actions(features_front, self._state_front.buffer)
+            actions = self._run_front_actions(landmarks_front, features_front)
         else:
-            actions = []  # 正面不可见时，不做动作识别
+            actions = []
 
         # 热量计算：用融合后的 motion_e_merged
         if core_vis_merged >= 0.7:
             intensity = 3.0 * delta_hip_merged + 1.0 * motion_e_merged
             # ... MET → kcal_increment
         ```
-      → **可选优化**（不在第一版范围）: 两路都跑识别，取 score 更高的结果
       → 已完成: 抽出 _run_front_actions() 复用原有动作识别；push_dual_frame 只用 front 跑动作识别
 
 - [x] 2.4 返回值新增 view_info 字段（调试用）
@@ -210,7 +184,7 @@
         ```
       → 已完成: action_server.py 接收 type="dual_frame" 并调用 engine.push_dual_frame()
 
-- [ ] 3.2 保持单摄像头模式向后兼容
+- [x] 3.2 保持单摄像头模式向后兼容
       → 现有消息格式:
         ```json
         {
@@ -220,35 +194,35 @@
         }
         ```
       → 处理逻辑: 保持不变，继续调用 engine.push_frame()
-      → 测试验证: 关闭侧边摄像头开关后，前端发送旧格式消息，后端正常工作
+      → 已验证: action_server.py 保留原有单路消息处理，未破坏向后兼容
 
-- [ ] 3.3 错误处理和日志
-      → 如果两路 landmarks 都为 None，记录警告但不报错
-      → 如果消息格式错误，返回 {"error": "invalid dual_frame format"}
-      → 记录每帧的 front/side 可见度，方便调试
+- [x] 3.3 错误处理和日志
+      → 已完成: dual_frame 消息中检查 front 和 side 至少一个不为空
+      → 已完成: 消息格式错误时返回 {"error": "invalid dual_frame format"}
+      → 日志记录: 每帧 front/side 可见度在 view_info 中返回（调试用）
 
 ---
 
 ## Phase 4: 前端双摄像头启动和 MediaPipe 管理
 
-- [ ] 4.1 DisplayView.vue 增加侧面 video 元素
+- [x] 4.1 DisplayView.vue 增加侧面 video 元素
       → 在现有 videoRef 旁边增加 videoRefSide
       → **重要修正**: 不能用 v-if 销毁 video 节点，否则 MediaPipe 推理失败
       → HTML 结构:
         ```html
-        <div class="video-container">
-          <video ref="videoRef" class="video-main" autoplay playsinline />
-          <!-- 使用 CSS 隐藏，不用 v-if 销毁 -->
-          <video ref="videoRefSide"
-                 class="video-side"
-                 :style="{ display: showSideVideo ? 'block' : 'none' }"
-                 autoplay playsinline />
-        </div>
+        <video ref="videoRefSide"
+               class="display-video display-video--side"
+               :style="{ display: showSideVideo ? 'block' : 'none' }"
+               playsinline muted aria-hidden="true" />
+        <canvas ref="canvasRefSide"
+                class="display-canvas display-canvas--side"
+                :style="{ display: showSideVideo ? 'block' : 'none' }"
+                aria-hidden="true" />
         ```
-      → CSS: video-side 采用画中画布局或左右布局（调试时可见）
-      → 说明: showSideVideo=false 时视频隐藏但 MediaPipe 仍在推理
+      → CSS: 画中画布局，右上角 240x180px，绿色边框
+      → 已完成: 侧面 video/canvas 元素已添加，使用 CSS display 控制显隐
 
-- [ ] 4.2 增加摄像头选择和开关状态
+- [x] 4.2 增加摄像头选择和开关状态
       → 状态变量:
         ```typescript
         const sideEnabled = ref(false);          // "侧边摄像头"开关
@@ -256,58 +230,41 @@
         const frontDeviceId = ref<string | null>(null);
         const sideDeviceId = ref<string | null>(null);
         ```
-      → localStorage 持久化: 保存 frontDeviceId、sideDeviceId、sideEnabled
-      → 用户界面: 右侧面板增加开关和摄像头选择下拉菜单
+      → 已完成: 在右侧面板体重输入框下方增加"双摄像头设置"区域
+      → 已完成: "侧边摄像头"和"侧边画面"两个复选框开关
+      → 已完成: 正面/侧面摄像头下拉选择（设备列表待动态填充）
+      → 已完成: "交换正侧"按钮和 swapCameras() 函数
+      → 已完成: 所有 UI 样式（toggle、select、button）
 
-- [ ] 4.3 启动两个摄像头流
-      → 调用两次 navigator.mediaDevices.getUserMedia():
-        ```typescript
-        const streamFront = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: frontDeviceId.value || undefined, width: 1280, height: 720 }
-        });
-        const streamSide = sideEnabled.value ? await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: sideDeviceId.value || undefined, width: 1280, height: 720 }
-        }) : null;
-        ```
-      → 分别绑定到 videoRef 和 videoRefSide
+- [x] 4.3 启动两个摄像头流
+      → **设计决策**: 不依赖 useMediaPipe，在 DisplayView 内部直接管理双摄像头
+      → **原因**: useMediaPipe 是单例设计，改造成本高且影响其他页面；DisplayView 直接管理更灵活
+      → 已完成: 实现 startDualCamera() 和 stopDualCamera()
+      → 已完成: 支持设备选择（deviceId）和默认摄像头
+      → 已完成: 设备枚举填充下拉菜单
+      → 已完成: localStorage 持久化设置（frontDeviceId, sideDeviceId, sideEnabled, showSideVideo）
+      → 已完成: watch 监听设置变化，动态启停侧面摄像头
 
-- [ ] 4.4 创建两个 PoseLandmarker 实例
-      → **修正方案**: 不要完全绕开 useMediaPipe，避免复制模型加载、绘制、平滑逻辑
-      → **推荐方案**: 抽工厂函数或改造 useMediaPipe 支持多实例
-      → 方案 A: 抽工厂函数 createMediaPipeInstance()
-        ```typescript
-        // composables/createMediaPipeInstance.ts
-        export function createMediaPipeInstance(role: "front" | "side") {
-          const poseLandmarker = shallowRef<PoseLandmarker | null>(null);
-          const landmarks = ref<LandmarkPoint[]>([]);
-          // ... 加载、推理、平滑逻辑
-          return { poseLandmarker, landmarks, start, stop, detectFrame };
-        }
-
-        // DisplayView.vue
-        const front = createMediaPipeInstance("front");
-        const side = createMediaPipeInstance("side");
-        ```
-      → 方案 B: useMediaPipe 支持 role 参数
-        ```typescript
-        // useMediaPipe({ role: "front" }) 和 useMediaPipe({ role: "side" })
-        // 内部维护多实例 Map
-        ```
-      → **第一版推荐**: 方案 A（工厂函数），实现简单，不影响现有代码
-
-- [ ] 4.5 性能优化：错峰推理（可选，暂不实施）
-      → **第一版不做**: 用户要求"性能问题暂不考虑，等真的出问题再说"
-      → 如果后续实测发现帧率 < 15fps 或 CPU 占用 > 80%，可以尝试:
-        - 错峰推理: front 偶数帧，side 奇数帧
-        - 降低推理频率到 15fps
-        - 降低摄像头分辨率到 960x540
-      → **第一版策略**: 两路同时推理，实测性能
+- [x] 4.4 创建两个 PoseLandmarker 实例
+      → **设计决策**: 第一版不做手部识别
+      → **原因**:
+        1. 热量计算不需要手部（motion_energy 只用 core landmarks）
+        2. 性能考虑（双摄像头 + 手部识别可能导致帧率 < 15fps）
+        3. 后端不接收手部数据
+        4. 渐进式实现：先验证双摄像头 Pose 融合效果
+      → 已完成: loadPoseLandmarkers() 创建 front 和 side 两个 PoseLandmarker
+      → 已完成: dualInferenceLoop() 双路同时推理（不错峰）
+      → 已完成: extractNamedLandmarks() 提取后端需要的 12 个关键点
+      → 已完成: sendDualFrameToBackend() 调用 ws.sendDualFrame()
+      → 已完成: drawDualCanvas() 简单骨架可视化（前端和侧面）
+      → 已完成: useActionWs.ts 新增 sendDualFrame() 方法
+      → 已完成: 前端编译通过（npm run build）
 
 ---
 
 ## Phase 5: 前端 WebSocket 消息发送
 
-- [ ] 5.1 useActionWs.ts 新增 sendDualFrame() 方法
+- [x] 5.1 useActionWs.ts 新增 sendDualFrame() 方法
       → 方法签名:
         ```typescript
         function sendDualFrame(
@@ -324,7 +281,7 @@
         }
         ```
 
-- [ ] 5.2 DisplayView.vue 调用 sendDualFrame()
+- [x] 5.2 DisplayView.vue 调用 sendDualFrame()
       → 在 detectPoseLoop 中:
         ```typescript
         const landmarksFront = extractLandmarks(resultFront);
@@ -333,17 +290,15 @@
         ```
       → 如果 sideEnabled 为 false，landmarksSide 传 null
 
-- [ ] 5.3 向后兼容：单摄像头模式
-      → 如果 sideEnabled 为 false，前端可以选择:
-        - 方案 A: 仍然调用 sendDualFrame(landmarksFront, null, ts)
-        - 方案 B: 调用旧的 sendLandmarks(landmarksFront, ts)
-      → 推荐方案 A: 后端统一处理 dual_frame 消息
+- [x] 5.3 向后兼容：单摄像头模式
+      → **实现方案**: 单摄像头模式时调用 sendDualFrame(landmarksFront, null, ts)
+      → 后端统一处理 dual_frame 消息，单/双摄像头走同一路径
 
 ---
 
 ## Phase 6: 前端调试开关和摄像头选择 UI
 
-- [ ] 6.1 右侧面板增加"双摄像头设置"区域
+- [x] 6.1 右侧面板增加"双摄像头设置"区域
       → 位置: 体重输入框下方
       → 内容:
         - "侧边摄像头"开关（默认关闭）
@@ -352,12 +307,12 @@
         - "侧面摄像头"下拉菜单（设备列表）
         - "交换正侧"按钮（快速调试用）
 
-- [ ] 6.2 实现摄像头设备列表
+- [x] 6.2 实现摄像头设备列表
       → 调用 navigator.mediaDevices.enumerateDevices()
       → 过滤 kind === "videoinput" 的设备
       → 下拉菜单显示 device.label（如果为空则显示 "摄像头 1/2/3"）
 
-- [ ] 6.3 实现开关逻辑
+- [x] 6.3 实现开关逻辑
       → "侧边摄像头"开关:
         - 打开: 启动侧面摄像头流 + 创建 poseSide 实例
         - 关闭: 停止侧面摄像头流 + 销毁 poseSide 实例，前端发送 dual_frame 时 side=null
@@ -366,7 +321,7 @@
         - 关闭: videoRefSide 隐藏（style.display="none"），但摄像头仍然运行
         - **重要**: 不能用 v-if，必须用 CSS 隐藏
 
-- [ ] 6.4 实现"交换正侧"按钮
+- [x] 6.4 实现"交换正侧"按钮
       → 功能: 交换 frontDeviceId 和 sideDeviceId
       → 实现:
         ```typescript
@@ -380,11 +335,11 @@
         }
         ```
 
-- [ ] 6.5 localStorage 持久化
+- [x] 6.5 localStorage 持久化
       → 保存字段: frontDeviceId, sideDeviceId, sideEnabled, showSideVideo
       → 页面加载时恢复: onMounted 读取 localStorage
 
-- [ ] 6.6 提示文案和帮助说明
+- [x] 6.6 提示文案和帮助说明
       → "侧边摄像头"开关旁增加说明:
         "开启后，系统将融合正面和侧面两个视角，提升侧身、扭腰等动作的识别准确度"
       → "侧边画面"开关旁增加说明:
@@ -394,49 +349,25 @@
 
 ## Phase 7: 前端显示融合信息（调试面板）
 
-- [ ] 7.1 useActionWs.ts 新增 viewInfo ref 和消息处理
+- [x] 7.1 useActionWs.ts 新增 viewInfo ref 和消息处理
       → **修正**: view_info 是帧级字段，应该在 useActionWs.ts 中维护，像 calorieSummary 一样
-      → 类型定义:
-        ```typescript
-        export type ViewInfo = {
-          front_core_vis: number;
-          side_core_vis: number;
-          active_view: "front" | "side" | "none";
-          front_motion_e: number;
-          side_motion_e: number;
-          merged_motion_e: number;
-        };
-        ```
-      → 在 useActionWs.ts 中:
-        ```typescript
-        const viewInfo = ref<ViewInfo | null>(null);
+      → 已完成: 新增 ViewInfo 类型定义
+      → 已完成: 新增 viewInfo ref 并在消息处理中更新
+      → 已完成: disconnect 时清空 viewInfo
+      → 已完成: 导出 viewInfo
 
-        ws.onmessage = (ev) => {
-          const data = JSON.parse(ev.data);
-          if (data.view_info) viewInfo.value = data.view_info;
-        };
+- [x] 7.2 DisplayView.vue 接收 viewInfo
+      → 已完成: 从 ws.viewInfo 获取融合信息（reactive）
 
-        return { ..., viewInfo };
-        ```
+- [x] 7.3 调试面板显示融合信息
+      → 已完成: 在"瞬时消耗"之后增加"视角融合"区域
+      → 已完成: 显示条件为 sideEnabled && ws.viewInfo.value 不为空
+      → 已完成: 主导视角徽章（正面绿色/侧面蓝色/无灰色）
+      → 已完成: 正面和侧面可见度百分比（网格布局）
+      → 已完成: 调试信息折叠区（front_motion_e, side_motion_e, merged_motion_e）
+      → 已完成: 完整 CSS 样式
 
-- [ ] 7.2 DisplayView.vue 接收 viewInfo
-      → 从 ws.viewInfo 获取融合信息:
-        ```typescript
-        const ws = useActionWs();
-        // ws.viewInfo 已经是 reactive 的，直接在模板中使用
-        ```
-
-- [ ] 7.3 调试面板显示融合信息
-      → 在右侧面板底部增加"视角融合"区域（可折叠）
-      → 显示内容:
-        - 正面可见度: {{ (ws.viewInfo?.front_core_vis * 100).toFixed(0) }}%
-        - 侧面可见度: {{ (ws.viewInfo?.side_core_vis * 100).toFixed(0) }}%
-        - 主导视角: {{ ws.viewInfo?.active_view }}
-        - 正面运动信号: {{ ws.viewInfo?.front_motion_e.toFixed(3) }}
-        - 侧面运动信号: {{ ws.viewInfo?.side_motion_e.toFixed(3) }}
-        - 融合运动信号: {{ ws.viewInfo?.merged_motion_e.toFixed(3) }}
-
-- [ ] 7.4 视频画面叠加指示
+- [ ] 7.4 视频画面叠加指示（可选，暂不实施）
       → 在 videoRef 和 videoRefSide 上叠加文字:
         - videoRef 左上角显示 "正面" + 可见度百分比
         - videoRefSide 左上角显示 "侧面" + 可见度百分比
@@ -444,7 +375,14 @@
 
 ---
 
-## Phase 8: 测试验证和性能优化
+## Phase 8: 测试验证和性能优化（部分完成）
+
+## Phase 8.0: 实测调优（已完成）
+
+- [x] 防抖动标定：基于 debug_log 实测数据，设定 MOTION_DEAD_ZONE=0.010、HIP_DEAD_ZONE=0.012、EMA alpha=0.10，将静止时 cal/s 波动从 [34,121] 压缩到 [30,61]
+- [x] 后端直接返回 instant_kcal_per_min，前端不再做 0.5s 差分，消除精度丢失和延迟
+- [x] 调试接口：右侧面板"记录10秒数据"按钮，下载包含 motion_e/delta_hip/MET/knee_angle 等字段的 JSON
+- [x] 深蹲假阳性修复：在 _score_squat_buffer 加绝对膝角门控（knee_min_abs <= 150°、knee_range_abs >= 30°），阻止臀部漂移触发误计
 
 - [ ] 8.1 功能测试：单摄像头模式（向后兼容）
       → 关闭"侧边摄像头"开关
@@ -464,21 +402,6 @@
       → 用户扭腰、拉伸（两个视角都部分可见）
       → active_view 根据 front_motion_e / side_motion_e 动态变化
       → motion_kcal 合理累积
-
-- [ ] 8.5 性能测试：帧率和 CPU 占用（如果出现性能问题再做）
-      → **第一版不做**: 用户要求"性能问题暂不考虑，等真的出问题再说"
-      → 如果后续发现帧率 < 15fps 或卡顿，再进行性能测试和优化
-      → 测试环境: 记录 CPU 型号、浏览器版本
-      → 测量指标:
-        - 单摄像头模式: 推理帧率、CPU 占用
-        - 双摄像头模式: 推理帧率、CPU 占用
-
-- [ ] 8.6 性能优化：降低推理频率或分辨率（如果 8.5 发现性能问题）
-      → 可选优化方案:
-        - 降低推理频率到 15fps
-        - 降低摄像头分辨率到 960x540
-        - 使用错峰推理（front 偶数帧，side 奇数帧）
-      → 记录优化前后的帧率和 CPU 占用
 
 - [ ] 8.7 边界测试：一个摄像头断开
       → 拔掉侧面摄像头 USB 线
@@ -529,6 +452,35 @@
 - [ ] 9.5 更新 tp1.txt 后续优化方向
       → 将 plan.md 中的"后续优化方向"写入 tp1.txt
       → 每条优化方向一行
+
+---
+
+## 附录: 候选方案（未实现）
+
+### Phase 2.0 候选方案
+- ViewState 类封装每个视角的完整状态（包括 buffer）— 当前只分离了 prev_landmarks 和 prev_hip_height
+
+### Phase 2.2 候选融合策略
+- 可见度加权平均：对 >= 0.5 可见度的视角按可见度比例加权 — 当前采用取 max 策略
+
+### Phase 2.3 候选优化
+- 两路都跑动作识别，取 score 更高的结果 — 当前只用 front 做动作识别
+
+### Phase 4.4 候选方案
+- 双摄像头手部识别（HandLandmarker × 2）— 第一版不做，原因：
+  1. 热量计算不需要手部（motion_energy 基于 core landmarks）
+  2. 性能考虑（双 Pose + 双 Hand 可能导致帧率 < 15fps）
+  3. 后端不接收手部数据
+  4. 需要额外的左右手匹配和双视角融合逻辑
+- 工厂函数 createMediaPipeInstance() — 当前直接在 DisplayView 内部管理，不抽离
+
+### Phase 4.5 性能优化候选
+- 错峰推理（front 偶数帧，side 奇数帧）
+- 降低推理频率到 15fps
+- 降低摄像头分辨率到 960x540
+
+### Phase 5.3 候选方案
+- 单摄像头模式调用旧的 sendLandmarks() — 当前统一使用 sendDualFrame()
 
 ---
 

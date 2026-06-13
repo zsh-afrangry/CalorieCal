@@ -120,6 +120,21 @@ async def action_ws(websocket: WebSocket) -> None:
                 }))
                 continue
 
+            # Debug recording control
+            if msg.get("type") == "debug_start":
+                engine.start_debug_recording()
+                await websocket.send_text(json.dumps({"type": "debug_started"}))
+                continue
+
+            if msg.get("type") == "debug_stop":
+                debug_data = engine.stop_debug_recording()
+                await websocket.send_text(json.dumps({
+                    "type": "debug_result",
+                    "data": debug_data,
+                    "count": len(debug_data),
+                }))
+                continue
+
             if msg.get("type") == "dual_frame":
                 front = msg.get("front")
                 side = msg.get("side")

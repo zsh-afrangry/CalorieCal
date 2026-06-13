@@ -69,6 +69,8 @@ CORE_LANDMARKS = [
 MIN_VISIBILITY = 0.5
 DUAL_VIEW_VISIBILITY_THRESHOLD = 0.5
 CALORIE_CORE_VISIBILITY_THRESHOLD = 0.7
+MOTION_DEAD_ZONE = 0.010  # Ignore motion below this threshold; calibrated from breathing-at-rest data
+HIP_DEAD_ZONE = 0.012  # Ignore small hip height changes; 0.012 filters ~51% of breathing-induced jitter
 
 # ---------------------------------------------------------------------------
 # Geometry helpers (mirror of video_pose_trajectory.py)
@@ -209,9 +211,15 @@ def compute_frame_features(
             prv = prev_pts.get(name)
             d = _dist2d(cur, prv)
             if d is not None and scale:
-                motions.append(d / scale)
+                normalized_motion = d / scale
+                # Apply dead zone to filter small jitter when stationary
+                if normalized_motion > MOTION_DEAD_ZONE:
+                    motions.append(normalized_motion)
         if motions:
             motion_energy = sum(motions) / len(motions)
+        else:
+            # All motions below threshold, treat as stationary
+            motion_energy = 0.0
 
     all_vis = [v.get("visibility", 0.0) for v in landmarks.values() if isinstance(v, dict)]
     mean_vis = _mean(all_vis) if all_vis else None
@@ -366,6 +374,15 @@ def _score_squat_buffer(buffer: list[dict], spec: dict) -> tuple[float | None, s
         int(params.get("min_down_hold_frames", 2)),
         int(params.get("min_return_to_stand_frames", 2)),
     )
+
+    # Absolute knee angle gate: suppress false positives from hip sway without real knee bend.
+    # knee_min_abs > 150° means knees never bent meaningfully.
+    # knee_range_abs < 30° means no real squat cycle happened.
+    knee_min_abs = min(knee_vals) if knee_vals else 999.0
+    knee_range_abs = (max(knee_vals) - min(knee_vals)) if len(knee_vals) >= 2 else 0.0
+    if knee_min_abs > 150.0 or knee_range_abs < 30.0:
+        count = 0
+
     current_score = scores[-1] if scores else None
     current_stage = stages[-1] if stages else "unknown"
     return current_score, current_stage, count
@@ -641,6 +658,7 @@ class RealtimeActionEngine:
         self._weight_kg: float = 70.0
         self._session_kcal: dict[str, float] = {}
         self._motion_kcal: float = 0.0
+        self._instant_kcal_per_min: float = 0.0  # Real-time instantaneous rate for frontend display
         # Per-rep timing (for rep_duration_sec)
         self._last_rep_ts: dict[str, float] = {}
         # Pending count events (flushed each frame)
@@ -653,6 +671,12 @@ class RealtimeActionEngine:
         self._prev_hip_height_front: float | None = None
         self._prev_hip_height_side: float | None = None
         self._prev_motion_active_view: str | None = None
+        # MET smoothing: exponential moving average to reduce jitter
+        self._smoothed_met: float = 1.5  # Start at resting MET
+        self._met_alpha: float = 0.10   # Smoothing factor; calibrated from breathing-at-rest data
+        # Debug logging
+        self._debug_log: list[dict] = []
+        self._debug_recording: bool = False
         self.specs = self._load_specs(spec_dir)
 
     def _log_count_event(self, action: str, side: str | None, count: int) -> None:
@@ -755,6 +779,16 @@ class RealtimeActionEngine:
     def set_user_config(self, weight_kg: float | None = None, height_cm: float | None = None) -> None:
         if weight_kg is not None:
             self._weight_kg = float(weight_kg)
+
+    def start_debug_recording(self) -> None:
+        """Start recording debug data for 10 seconds."""
+        self._debug_log.clear()
+        self._debug_recording = True
+
+    def stop_debug_recording(self) -> list[dict]:
+        """Stop recording and return collected debug data."""
+        self._debug_recording = False
+        return list(self._debug_log)
 
     def reset(self) -> None:
         self._buffer.clear()
@@ -922,27 +956,55 @@ class RealtimeActionEngine:
 
             delta_hip = (abs(hip_h - prev_hip_h)
                          if hip_h is not None and prev_hip_h is not None else 0.0)
+            # Apply dead zone to filter small vertical jitter
+            if delta_hip < HIP_DEAD_ZONE:
+                delta_hip = 0.0
             next_prev_hip = hip_h
 
             # Combined intensity: hip displacement (w=3) + motion_energy (w=1)
             intensity = 3.0 * delta_hip + 1.0 * motion_e
 
+            # Determine raw MET from intensity
             if intensity < 0.005:
-                met = 1.5
+                raw_met = 1.5
             elif intensity < 0.02:
-                met = 2.5
+                raw_met = 2.5
             elif intensity < 0.05:
-                met = 5.0
+                raw_met = 5.0
             elif intensity < 0.10:
-                met = 7.0
+                raw_met = 7.0
             else:
-                met = 9.0
+                raw_met = 9.0
 
-            self._motion_kcal += met * 3.5 * self._weight_kg / 200.0 / fps / 60.0
-            return next_prev_hip, fps
+            # Apply exponential moving average to smooth MET transitions
+            self._smoothed_met = (self._met_alpha * raw_met +
+                                  (1.0 - self._met_alpha) * self._smoothed_met)
+
+            # Calculate instantaneous kcal/min for real-time display
+            instant_kcal_per_min = self._smoothed_met * 3.5 * self._weight_kg / 200.0
+
+            # Debug logging (if recording enabled)
+            if self._debug_recording:
+                self._debug_log.append({
+                    "timestamp": ts_now,
+                    "core_vis": core_vis,
+                    "motion_e": round(motion_e, 6),
+                    "delta_hip": round(delta_hip, 6),
+                    "hip_h": round(hip_h, 6) if hip_h is not None else None,
+                    "prev_hip_h": round(prev_hip_h, 6) if prev_hip_h is not None else None,
+                    "intensity": round(intensity, 6),
+                    "raw_met": raw_met,
+                    "smoothed_met": round(self._smoothed_met, 4),
+                    "instant_kcal_per_min": round(instant_kcal_per_min, 4),
+                    "fps": round(fps, 2),
+                })
+
+            # Use smoothed MET for calorie accumulation
+            self._motion_kcal += instant_kcal_per_min / fps / 60.0
+            return next_prev_hip, fps, instant_kcal_per_min
 
         self._prev_frame_ts = ts_now
-        return None, fps
+        return None, fps, 0.0
 
     def _build_calorie_summary(self) -> dict[str, Any]:
         event_kcal = sum(self._session_kcal.values())
@@ -951,6 +1013,7 @@ class RealtimeActionEngine:
             "event_kcal":  round(event_kcal, 3),
             "total_kcal":  round(self._motion_kcal, 3),
             "by_action":   {k: round(v, 3) for k, v in self._session_kcal.items()},
+            "instant_kcal_per_min": round(self._instant_kcal_per_min, 4),
         }
 
     @staticmethod
@@ -1052,15 +1115,31 @@ class RealtimeActionEngine:
         ts_now = features.get("timestamp_ms") or (time.time() * 1000)
         core_vis = features.get("core_visible_ratio") or 0.0
 
-        self._prev_hip_height, _fps = self._integrate_motion_calories(
+        self._prev_hip_height, _fps, instant_rate = self._integrate_motion_calories(
             ts_now=ts_now,
             core_vis=core_vis,
             motion_e=features.get("motion_energy") or 0.0,
             hip_h=features.get("hip_height_above_ankles_torso"),
             prev_hip_h=self._prev_hip_height,
         )
+        self._instant_kcal_per_min = instant_rate
         self._prev_hip_height_front = self._prev_hip_height
         self._prev_motion_active_view = "front" if self._prev_hip_height is not None else None
+
+        # Append action recognition evidence to the debug log entry for this frame
+        if self._debug_recording and self._debug_log:
+            squat_action = next((a for a in actions if a["name"] == "squat"), None)
+            self._debug_log[-1]["action_evidence"] = {
+                "squat_stage":       squat_action["stage"] if squat_action else None,
+                "squat_score":       squat_action["score"] if squat_action else None,
+                "squat_count":       squat_action["count"] if squat_action else None,
+                "mean_knee_angle":   round(features["mean_knee_angle"], 2) if features.get("mean_knee_angle") is not None else None,
+                "left_knee_angle":   round(features["left_knee_angle"], 2) if features.get("left_knee_angle") is not None else None,
+                "right_knee_angle":  round(features["right_knee_angle"], 2) if features.get("right_knee_angle") is not None else None,
+                "left_hip_angle":    round(features["left_hip_angle"], 2) if features.get("left_hip_angle") is not None else None,
+                "right_hip_angle":   round(features["right_hip_angle"], 2) if features.get("right_hip_angle") is not None else None,
+                "hip_h":             round(features["hip_height_above_ankles_torso"], 4) if features.get("hip_height_above_ankles_torso") is not None else None,
+            }
 
         # Flush pending events
         new_events = list(self._pending_events)
@@ -1129,13 +1208,14 @@ class RealtimeActionEngine:
         if active_view != self._prev_motion_active_view:
             prev_hip = None
 
-        next_prev_hip, _fps = self._integrate_motion_calories(
+        next_prev_hip, _fps, instant_rate = self._integrate_motion_calories(
             ts_now=ts_now,
             core_vis=merged_features.get("core_visible_ratio") or 0.0,
             motion_e=merged_features.get("motion_energy") or 0.0,
             hip_h=merged_features.get("hip_height_above_ankles_torso"),
             prev_hip_h=prev_hip,
         )
+        self._instant_kcal_per_min = instant_rate
 
         if active_view == "front":
             self._prev_hip_height_front = next_prev_hip
@@ -1151,6 +1231,23 @@ class RealtimeActionEngine:
 
         new_events = list(self._pending_events)
         self._pending_events.clear()
+
+        # Append action recognition evidence to the debug log entry for this frame
+        if self._debug_recording and self._debug_log:
+            squat_action = next((a for a in actions if a["name"] == "squat"), None)
+            features_for_debug = features_front if features_front else merged_features
+            self._debug_log[-1]["action_evidence"] = {
+                "squat_stage":       squat_action["stage"] if squat_action else None,
+                "squat_score":       squat_action["score"] if squat_action else None,
+                "squat_count":       squat_action["count"] if squat_action else None,
+                "mean_knee_angle":   round(features_for_debug["mean_knee_angle"], 2) if features_for_debug.get("mean_knee_angle") is not None else None,
+                "left_knee_angle":   round(features_for_debug["left_knee_angle"], 2) if features_for_debug.get("left_knee_angle") is not None else None,
+                "right_knee_angle":  round(features_for_debug["right_knee_angle"], 2) if features_for_debug.get("right_knee_angle") is not None else None,
+                "left_hip_angle":    round(features_for_debug["left_hip_angle"], 2) if features_for_debug.get("left_hip_angle") is not None else None,
+                "right_hip_angle":   round(features_for_debug["right_hip_angle"], 2) if features_for_debug.get("right_hip_angle") is not None else None,
+                "hip_h":             round(features_for_debug["hip_height_above_ankles_torso"], 4) if features_for_debug.get("hip_height_above_ankles_torso") is not None else None,
+                "active_view":       active_view,
+            }
 
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
         return {

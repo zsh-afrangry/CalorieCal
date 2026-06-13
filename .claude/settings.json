@@ -12,7 +12,12 @@
       "WebFetch(domain:www.frontiersin.org)",
       "WebFetch(domain:ietresearch.onlinelibrary.wiley.com)",
       "WebFetch(domain:formative.jmir.org)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(npm run *)",
+      "Bash(python3 -m py_compile /home/afrangry/桌面/CalorieCal/backend/action_engine/realtime_engine.py)",
+      "Bash(python3 -m py_compile /home/afrangry/桌面/CalorieCal/backend/action_engine/realtime_engine.py /home/afrangry/桌面/CalorieCal/backend/action_server.py)",
+      "Bash(python3)",
+      "Bash(python3 -m py_compile backend/action_engine/realtime_engine.py)"
     ]
   }
 }

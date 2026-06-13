@@ -1,8 +1,23 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, shallowRef } from "vue";
 import "../session-ui.css";
 import { useMediaPipe } from "../composables/useMediaPipe";
 import { useActionWs }  from "../composables/useActionWs";
+import {
+  FilesetResolver,
+  PoseLandmarker,
+  type NormalizedLandmark,
+} from "@mediapipe/tasks-vision";
+
+// ---- MediaPipe constants ---------------------------------------------------
+
+const MEDIAPIPE_TASKS_VERSION = "0.10.22-rc.20250304";
+const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_TASKS_VERSION}/wasm`;
+const POSE_LANDMARKER_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+const TARGET_INFERENCE_FPS = 20;
+const MIN_INFERENCE_INTERVAL_MS = 1000 / TARGET_INFERENCE_FPS;
 
 // ---- Types -----------------------------------------------------------------
 
@@ -68,8 +83,26 @@ const BACKEND_KEY_MAP: Record<string, string> = {
 
 const activeTab    = ref<string>(TABS[0].key);
 const videoRef     = ref<HTMLVideoElement | null>(null);
+const videoRefSide = ref<HTMLVideoElement | null>(null);
 const canvasRef    = ref<HTMLCanvasElement | null>(null);
+const canvasRefSide = ref<HTMLCanvasElement | null>(null);
 const weightKg     = ref(70);
+
+// Dual camera state
+const sideEnabled = ref(false);          // "侧边摄像头"开关
+const showSideVideo = ref(false);        // "侧边画面"开关
+const frontDeviceId = ref<string | null>(null);
+const sideDeviceId = ref<string | null>(null);
+const availableDevices = ref<MediaDeviceInfo[]>([]);
+
+// Dual camera MediaPipe instances
+let streamFront: MediaStream | null = null;
+let streamSide: MediaStream | null = null;
+let poseFront = shallowRef<PoseLandmarker | null>(null);
+let poseSide = shallowRef<PoseLandmarker | null>(null);
+let animFrameId: number | null = null;
+let lastInferenceAt = 0;
+const dualCameraStatus = ref<"idle" | "loading" | "ready" | "error">("idle");
 
 // Per-action runtime state (reset on tab switch)
 const actionStates = ref<Record<string, ActionState>>({});
@@ -80,28 +113,38 @@ const elapsedMs    = ref(0);
 const backendMotionKcal = ref<number | null>(null);
 const backendEventKcal  = ref<number | null>(null);
 const backendByAction   = ref<Record<string, number>>({});
+const instantKcalPerMin = ref<number | null>(null); // Direct from backend, no windowing needed
 
-// Instant rate: sliding window over motion_kcal (0.5s)
-const INSTANT_WINDOW_MS = 500;
-type KcalSample = { ts: number; kcal: number };
-const kcalWindow: KcalSample[] = [];
-const instantKcalPerMin = ref<number | null>(null);
+// Debug recording
+const debugRecording = ref(false);
+const debugData = ref<any>(null);
 
-function pushKcalSample(motionKcal: number) {
-  const now = performance.now();
-  kcalWindow.push({ ts: now, kcal: motionKcal });
-  // trim entries older than window
-  const cutoff = now - INSTANT_WINDOW_MS;
-  while (kcalWindow.length > 0 && kcalWindow[0].ts < cutoff) kcalWindow.shift();
-}
+async function startDebugRecording() {
+  if (debugRecording.value) return;
+  debugRecording.value = true;
+  debugData.value = null;
 
-function computeInstantRate() {
-  if (kcalWindow.length < 2) { instantKcalPerMin.value = null; return; }
-  const oldest = kcalWindow[0];
-  const newest = kcalWindow[kcalWindow.length - 1];
-  const dtMin = (newest.ts - oldest.ts) / 60000;
-  if (dtMin < 0.0005) { instantKcalPerMin.value = null; return; }
-  instantKcalPerMin.value = Math.max(0, (newest.kcal - oldest.kcal) / dtMin);
+  try {
+    const result = await ws.startDebugRecording();
+    debugData.value = result;
+    console.log("Debug recording completed:", result);
+
+    // Download JSON file
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `debug_log_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    alert(`调试数据已记录，共 ${result.count} 帧数据已下载`);
+  } catch (err) {
+    console.error("Debug recording failed:", err);
+    alert("调试记录失败：" + err);
+  } finally {
+    debugRecording.value = false;
+  }
 }
 
 // ---- Composables -----------------------------------------------------------
@@ -140,17 +183,17 @@ const currentCalories = computed(() =>
 const activeElapsedSec = computed(() => elapsedMs.value / 1000);
 
 // ---- Backend result handling -----------------------------------------------
-
-mp.setOnInference((pose) => {
-  if (!pose) return;
-  const named: Record<string, { x: number; y: number; z: number; visibility: number }> = {};
-  const idx = mp.LANDMARK_INDEX;
-  for (const [camel, backendName] of Object.entries(BACKEND_KEY_MAP)) {
-    const lm = pose[idx[camel as keyof typeof idx]];
-    if (lm) named[backendName] = { x: lm.x, y: lm.y, z: lm.z ?? 0, visibility: lm.visibility ?? 0 };
-  }
-  ws.sendLandmarks(named, performance.now());
-});
+// NOTE: Old single-camera inference callback disabled, now using dual camera system
+// mp.setOnInference((pose) => {
+//   if (!pose) return;
+//   const named: Record<string, { x: number; y: number; z: number; visibility: number }> = {};
+//   const idx = mp.LANDMARK_INDEX;
+//   for (const [camel, backendName] of Object.entries(BACKEND_KEY_MAP)) {
+//     const lm = pose[idx[camel as keyof typeof idx]];
+//     if (lm) named[backendName] = { x: lm.x, y: lm.y, z: lm.z ?? 0, visibility: lm.visibility ?? 0 };
+//   }
+//   ws.sendLandmarks(named, performance.now());
+// });
 
 watch(ws.actions, (newActions) => {
   for (const a of newActions) {
@@ -194,7 +237,7 @@ watch(ws.calorieSummary, (summary) => {
   backendMotionKcal.value = motionKcal;
   backendEventKcal.value  = summary.event_kcal  ?? null;
   backendByAction.value   = summary.by_action   ?? {};
-  if (motionKcal !== null) pushKcalSample(motionKcal);
+  instantKcalPerMin.value = summary.instant_kcal_per_min ?? null;
 });
 
 // Send weight config whenever it changes (debounced via watch)
@@ -220,10 +263,281 @@ function switchTab(key: string) {
   setTimeout(() => ws.connect(), 200);
 }
 
+// ---- Dual camera controls --------------------------------------------------
+
+function swapCameras() {
+  const tmp = frontDeviceId.value;
+  frontDeviceId.value = sideDeviceId.value;
+  sideDeviceId.value = tmp;
+  // Restart cameras with swapped device IDs
+  stopDualCamera();
+  setTimeout(() => startDualCamera(), 100);
+}
+
+// Enumerate camera devices and populate dropdown
+async function enumerateDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    availableDevices.value = devices.filter(d => d.kind === "videoinput");
+  } catch (err) {
+    console.error("Failed to enumerate devices:", err);
+  }
+}
+
+// Load MediaPipe Pose models
+async function loadPoseLandmarkers() {
+  try {
+    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+
+    poseFront.value = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: POSE_LANDMARKER_MODEL_URL },
+      runningMode: "VIDEO",
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+
+    if (sideEnabled.value) {
+      poseSide.value = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: POSE_LANDMARKER_MODEL_URL },
+        runningMode: "VIDEO",
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+      });
+    }
+  } catch (err) {
+    console.error("Failed to load PoseLandmarker:", err);
+    dualCameraStatus.value = "error";
+  }
+}
+
+// Start dual camera streams
+async function startDualCamera() {
+  if (!videoRef.value) return;
+
+  dualCameraStatus.value = "loading";
+
+  try {
+    // Start front camera
+    streamFront = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: frontDeviceId.value ? { exact: frontDeviceId.value } : undefined,
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        facingMode: "user",
+      },
+      audio: false,
+    });
+    videoRef.value.srcObject = streamFront;
+    await videoRef.value.play();
+
+    // Start side camera (if enabled)
+    if (sideEnabled.value && videoRefSide.value && sideDeviceId.value) {
+      streamSide = await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: sideDeviceId.value },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+      videoRefSide.value.srcObject = streamSide;
+      await videoRefSide.value.play();
+    }
+
+    // Load Pose models
+    await loadPoseLandmarkers();
+
+    dualCameraStatus.value = "ready";
+
+    // Start inference loop
+    if (animFrameId !== null) cancelAnimationFrame(animFrameId);
+    animFrameId = requestAnimationFrame(dualInferenceLoop);
+
+  } catch (err) {
+    console.error("Failed to start dual camera:", err);
+    dualCameraStatus.value = "error";
+  }
+}
+
+// Stop dual camera streams
+function stopDualCamera() {
+  if (animFrameId !== null) {
+    cancelAnimationFrame(animFrameId);
+    animFrameId = null;
+  }
+
+  streamFront?.getTracks().forEach(t => t.stop());
+  streamFront = null;
+
+  streamSide?.getTracks().forEach(t => t.stop());
+  streamSide = null;
+
+  poseFront.value?.close();
+  poseFront.value = null;
+
+  poseSide.value?.close();
+  poseSide.value = null;
+
+  dualCameraStatus.value = "idle";
+}
+
+// Dual camera inference loop
+function dualInferenceLoop() {
+  const now = performance.now();
+
+  // Throttle inference to target FPS
+  if (now - lastInferenceAt < MIN_INFERENCE_INTERVAL_MS) {
+    animFrameId = requestAnimationFrame(dualInferenceLoop);
+    return;
+  }
+  lastInferenceAt = now;
+
+  // Run inference on both cameras
+  let resultFront: any = null;
+  let resultSide: any = null;
+
+  if (poseFront.value && videoRef.value && videoRef.value.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    try {
+      resultFront = poseFront.value.detectForVideo(videoRef.value, now);
+    } catch (err) {
+      console.error("Front pose inference error:", err);
+    }
+  }
+
+  if (sideEnabled.value && poseSide.value && videoRefSide.value && videoRefSide.value.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    try {
+      resultSide = poseSide.value.detectForVideo(videoRefSide.value, now);
+    } catch (err) {
+      console.error("Side pose inference error:", err);
+    }
+  }
+
+  // Extract landmarks
+  const landmarksFront = resultFront?.landmarks?.[0] || null;
+  const landmarksSide = resultSide?.landmarks?.[0] || null;
+
+  // Send to backend
+  sendDualFrameToBackend(landmarksFront, landmarksSide, now);
+
+  // Draw on canvas (optional, for visualization)
+  drawDualCanvas(landmarksFront, landmarksSide);
+
+  animFrameId = requestAnimationFrame(dualInferenceLoop);
+}
+
+// Send dual frame to backend
+function sendDualFrameToBackend(
+  landmarksFront: NormalizedLandmark[] | null,
+  landmarksSide: NormalizedLandmark[] | null,
+  timestamp: number
+) {
+  const namedFront = landmarksFront ? extractNamedLandmarks(landmarksFront) : null;
+  const namedSide = landmarksSide ? extractNamedLandmarks(landmarksSide) : null;
+
+  ws.sendDualFrame(namedFront, namedSide, timestamp);
+}
+
+// Extract named landmarks for backend
+function extractNamedLandmarks(landmarks: NormalizedLandmark[]) {
+  const LANDMARK_INDICES: Record<string, number> = {
+    LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
+    LEFT_ELBOW: 13,    RIGHT_ELBOW: 14,
+    LEFT_WRIST: 15,    RIGHT_WRIST: 16,
+    LEFT_HIP: 23,      RIGHT_HIP: 24,
+    LEFT_KNEE: 25,     RIGHT_KNEE: 26,
+    LEFT_ANKLE: 27,    RIGHT_ANKLE: 28,
+  };
+
+  const named: Record<string, { x: number; y: number; z: number; visibility: number }> = {};
+  for (const [name, idx] of Object.entries(LANDMARK_INDICES)) {
+    const lm = landmarks[idx];
+    if (lm) {
+      named[name] = {
+        x: lm.x,
+        y: lm.y,
+        z: lm.z ?? 0,
+        visibility: lm.visibility ?? 0,
+      };
+    }
+  }
+  return named;
+}
+
+// Draw landmarks on canvas (simple visualization)
+function drawDualCanvas(
+  landmarksFront: NormalizedLandmark[] | null,
+  landmarksSide: NormalizedLandmark[] | null
+) {
+  // Draw front camera
+  if (canvasRef.value && videoRef.value && landmarksFront) {
+    const ctx = canvasRef.value.getContext("2d");
+    if (ctx) {
+      const w = canvasRef.value.width = videoRef.value.videoWidth;
+      const h = canvasRef.value.height = videoRef.value.videoHeight;
+      ctx.clearRect(0, 0, w, h);
+      drawPoseLandmarks(ctx, landmarksFront, w, h, "#22c55e");
+    }
+  }
+
+  // Draw side camera
+  if (canvasRefSide.value && videoRefSide.value && landmarksSide && showSideVideo.value) {
+    const ctx = canvasRefSide.value.getContext("2d");
+    if (ctx) {
+      const w = canvasRefSide.value.width = videoRefSide.value.videoWidth;
+      const h = canvasRefSide.value.height = videoRefSide.value.videoHeight;
+      ctx.clearRect(0, 0, w, h);
+      drawPoseLandmarks(ctx, landmarksSide, w, h, "#22c55e");
+    }
+  }
+}
+
+// Simple pose landmark drawing
+function drawPoseLandmarks(
+  ctx: CanvasRenderingContext2D,
+  landmarks: NormalizedLandmark[],
+  w: number,
+  h: number,
+  color: string
+) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.fillStyle = color;
+
+  // Draw connections (simple skeleton)
+  const connections = [
+    [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], // arms
+    [11, 23], [12, 24], [23, 24], // torso
+    [23, 25], [25, 27], [24, 26], [26, 28], // legs
+  ];
+
+  for (const [a, b] of connections) {
+    const lmA = landmarks[a];
+    const lmB = landmarks[b];
+    if (lmA && lmB && (lmA.visibility ?? 0) > 0.5 && (lmB.visibility ?? 0) > 0.5) {
+      ctx.beginPath();
+      ctx.moveTo(lmA.x * w, lmA.y * h);
+      ctx.lineTo(lmB.x * w, lmB.y * h);
+      ctx.stroke();
+    }
+  }
+
+  // Draw joints
+  for (const lm of landmarks) {
+    if ((lm.visibility ?? 0) > 0.5) {
+      ctx.beginPath();
+      ctx.arc(lm.x * w, lm.y * h, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
 // ---- Elapsed timer (wall-clock, for display only) --------------------------
 
 let elapsedTimer: ReturnType<typeof setInterval> | null = null;
-let rateTimer:    ReturnType<typeof setInterval> | null = null;
 
 // ---- Lifecycle -------------------------------------------------------------
 
@@ -236,18 +550,66 @@ onMounted(async () => {
   elapsedTimer = setInterval(() => {
     elapsedMs.value = Date.now() - sessionStart.value;
   }, 500);
-  rateTimer = setInterval(computeInstantRate, 200);
-  await Promise.all([mp.loadPoseLandmarker(), mp.loadHandLandmarker()]);
+
+  // Enumerate camera devices for dual camera mode
+  await enumerateDevices();
+
+  // Load localStorage settings for dual camera
+  const savedSideEnabled = localStorage.getItem("sideEnabled");
+  const savedShowSideVideo = localStorage.getItem("showSideVideo");
+  const savedFrontDeviceId = localStorage.getItem("frontDeviceId");
+  const savedSideDeviceId = localStorage.getItem("sideDeviceId");
+
+  if (savedSideEnabled !== null) sideEnabled.value = savedSideEnabled === "true";
+  if (savedShowSideVideo !== null) showSideVideo.value = savedShowSideVideo === "true";
+  if (savedFrontDeviceId) frontDeviceId.value = savedFrontDeviceId;
+  if (savedSideDeviceId) sideDeviceId.value = savedSideDeviceId;
+
+  // Start dual camera mode (new system, parallel to useMediaPipe)
   if (videoRef.value && canvasRef.value) {
-    await mp.startCamera(videoRef.value, canvasRef.value);
+    await startDualCamera();
   }
+
+  // Keep old single camera system for backward compatibility (will be removed later)
+  // await Promise.all([mp.loadPoseLandmarker(), mp.loadHandLandmarker()]);
+  // if (videoRef.value && canvasRef.value) {
+  //   await mp.startCamera(videoRef.value, canvasRef.value);
+  // }
 });
 
 onUnmounted(() => {
+  stopDualCamera();
   mp.dispose();
   ws.disconnect();
   if (elapsedTimer) clearInterval(elapsedTimer);
-  if (rateTimer)    clearInterval(rateTimer);
+});
+
+// Watch dual camera settings and save to localStorage
+watch(sideEnabled, (val) => {
+  localStorage.setItem("sideEnabled", String(val));
+  if (val && !poseSide.value) {
+    // Restart to load side camera
+    stopDualCamera();
+    setTimeout(() => startDualCamera(), 100);
+  } else if (!val && poseSide.value) {
+    // Stop side camera only
+    streamSide?.getTracks().forEach(t => t.stop());
+    streamSide = null;
+    poseSide.value?.close();
+    poseSide.value = null;
+  }
+});
+
+watch(showSideVideo, (val) => {
+  localStorage.setItem("showSideVideo", String(val));
+});
+
+watch(frontDeviceId, (val) => {
+  if (val) localStorage.setItem("frontDeviceId", val);
+});
+
+watch(sideDeviceId, (val) => {
+  if (val) localStorage.setItem("sideDeviceId", val);
 });
 </script>
 
@@ -299,8 +661,25 @@ onUnmounted(() => {
     <!-- CENTER: camera -->
     <main class="display-center">
       <div class="display-camera-wrap">
+        <!-- Front camera video and canvas -->
         <video ref="videoRef" class="display-video" playsinline muted aria-hidden="true" />
         <canvas ref="canvasRef" class="display-canvas" aria-hidden="true" />
+
+        <!-- Side camera video and canvas (hidden by default) -->
+        <video
+          ref="videoRefSide"
+          class="display-video display-video--side"
+          :style="{ display: showSideVideo ? 'block' : 'none' }"
+          playsinline
+          muted
+          aria-hidden="true"
+        />
+        <canvas
+          ref="canvasRefSide"
+          class="display-canvas display-canvas--side"
+          :style="{ display: showSideVideo ? 'block' : 'none' }"
+          aria-hidden="true"
+        />
 
         <!-- Current action badge -->
         <div class="cam-overlay cam-overlay--tl">
@@ -349,6 +728,93 @@ onUnmounted(() => {
           />
           <span class="weight-unit cc-muted">kg</span>
         </div>
+      </div>
+
+      <div class="data-divider" />
+
+      <!-- Dual camera settings -->
+      <div class="data-section data-section--dual-camera">
+        <p class="data-section__label">双摄像头设置</p>
+
+        <!-- Side camera enabled toggle -->
+        <div class="camera-toggle-row">
+          <label class="camera-toggle-label">
+            <input
+              v-model="sideEnabled"
+              type="checkbox"
+              class="camera-toggle-input"
+            />
+            <span>侧边摄像头</span>
+          </label>
+          <span class="camera-toggle-hint cc-muted">开启后融合正面和侧面视角</span>
+        </div>
+
+        <!-- Show side video toggle (only when side enabled) -->
+        <div v-if="sideEnabled" class="camera-toggle-row">
+          <label class="camera-toggle-label">
+            <input
+              v-model="showSideVideo"
+              type="checkbox"
+              class="camera-toggle-input"
+            />
+            <span>侧边画面</span>
+          </label>
+          <span class="camera-toggle-hint cc-muted">显示侧面摄像头画面</span>
+        </div>
+
+        <!-- Camera device selectors (when side enabled) -->
+        <div v-if="sideEnabled" class="camera-selectors">
+          <div class="camera-select-row">
+            <label class="camera-select-label">正面</label>
+            <select v-model="frontDeviceId" class="cc-select">
+              <option :value="null">默认摄像头</option>
+              <option
+                v-for="device in availableDevices"
+                :key="device.deviceId"
+                :value="device.deviceId"
+              >
+                {{ device.label || `摄像头 ${device.deviceId.slice(0, 8)}` }}
+              </option>
+            </select>
+          </div>
+
+          <div class="camera-select-row">
+            <label class="camera-select-label">侧面</label>
+            <select v-model="sideDeviceId" class="cc-select">
+              <option :value="null">默认摄像头</option>
+              <option
+                v-for="device in availableDevices"
+                :key="device.deviceId"
+                :value="device.deviceId"
+              >
+                {{ device.label || `摄像头 ${device.deviceId.slice(0, 8)}` }}
+              </option>
+            </select>
+          </div>
+
+          <!-- Swap button -->
+          <button class="cc-btn cc-btn--secondary camera-swap-btn" @click="swapCameras">
+            交换正侧
+          </button>
+        </div>
+      </div>
+
+      <div class="data-divider" />
+
+      <!-- Debug recording button -->
+      <div class="data-section">
+        <p class="data-section__label">调试工具</p>
+        <button
+          class="cc-btn cc-btn--secondary"
+          :disabled="debugRecording"
+          @click="startDebugRecording"
+          style="width: 100%; margin-top: 8px;"
+        >
+          {{ debugRecording ? "记录中..." : "记录10秒数据" }}
+        </button>
+        <p class="data-section__sub cc-muted" style="margin-top: 8px;">
+          点击后记录10秒内的所有识别数据，自动下载为JSON文件
+        </p>
       </div>
 
       <div class="data-divider" />
@@ -446,6 +912,60 @@ onUnmounted(() => {
         </template>
         <p v-else class="data-section__sub cc-muted">等待运动数据…</p>
       </div>
+
+      <!-- View fusion info (dual camera mode) -->
+      <template v-if="sideEnabled && ws.viewInfo.value">
+        <div class="data-divider" />
+        <div class="data-section data-section--view-fusion">
+          <p class="data-section__label">视角融合</p>
+
+          <!-- Active view indicator -->
+          <div class="view-active-row">
+            <span class="view-active-label">主导视角</span>
+            <span
+              class="view-active-badge"
+              :class="{
+                'view-active-badge--front': ws.viewInfo.value.active_view === 'front',
+                'view-active-badge--side': ws.viewInfo.value.active_view === 'side',
+                'view-active-badge--none': ws.viewInfo.value.active_view === 'none',
+              }"
+            >
+              {{ ws.viewInfo.value.active_view === 'front' ? '正面' : ws.viewInfo.value.active_view === 'side' ? '侧面' : '无' }}
+            </span>
+          </div>
+
+          <!-- Visibility percentages -->
+          <div class="view-info-grid">
+            <div class="view-info-item">
+              <span class="view-info-label">正面可见度</span>
+              <span class="view-info-value">{{ (ws.viewInfo.value.front_core_vis * 100).toFixed(0) }}%</span>
+            </div>
+            <div class="view-info-item">
+              <span class="view-info-label">侧面可见度</span>
+              <span class="view-info-value">{{ (ws.viewInfo.value.side_core_vis * 100).toFixed(0) }}%</span>
+            </div>
+          </div>
+
+          <!-- Motion signals (debug info, collapsible) -->
+          <details class="view-debug-details">
+            <summary class="view-debug-summary">调试信息</summary>
+            <div class="view-debug-content">
+              <div class="view-debug-row">
+                <span class="view-debug-label">正面运动</span>
+                <span class="view-debug-value">{{ ws.viewInfo.value.front_motion_e.toFixed(4) }}</span>
+              </div>
+              <div class="view-debug-row">
+                <span class="view-debug-label">侧面运动</span>
+                <span class="view-debug-value">{{ ws.viewInfo.value.side_motion_e.toFixed(4) }}</span>
+              </div>
+              <div class="view-debug-row">
+                <span class="view-debug-label">融合运动</span>
+                <span class="view-debug-value">{{ ws.viewInfo.value.merged_motion_e.toFixed(4) }}</span>
+              </div>
+            </div>
+          </details>
+        </div>
+      </template>
 
       <div class="data-divider" />
 
@@ -607,6 +1127,20 @@ onUnmounted(() => {
   height: 100%;
   object-fit: cover;
   transform: scaleX(-1);
+}
+
+/* Side camera: picture-in-picture style */
+.display-video--side,
+.display-canvas--side {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 240px;
+  height: 180px;
+  inset: auto;
+  border: 2px solid #22c55e;
+  border-radius: 8px;
+  z-index: 10;
 }
 
 /* ---- Camera overlays ---- */
@@ -785,4 +1319,242 @@ onUnmounted(() => {
   font-weight: 600;
   color: #e5e7eb;
 }
+
+/* ---- Dual camera settings ---- */
+.data-section--dual-camera {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.camera-toggle-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.camera-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.camera-toggle-input {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.camera-toggle-hint {
+  font-size: 11px;
+  padding-left: 24px;
+}
+
+.camera-selectors {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.camera-select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.camera-select-label {
+  font-size: 12px;
+  font-weight: 500;
+  min-width: 40px;
+}
+
+.cc-select {
+  flex: 1;
+  background: #1a1d27;
+  border: 1px solid #2a2d3a;
+  border-radius: 6px;
+  color: #e5e7eb;
+  font-size: 12px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.cc-select:hover {
+  border-color: #22c55e;
+}
+
+.camera-swap-btn {
+  margin-top: 4px;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+.cc-btn {
+  background: #22c55e;
+  border: none;
+  border-radius: 6px;
+  color: #0f1117;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.cc-btn:hover {
+  opacity: 0.9;
+}
+
+.cc-btn--secondary {
+  background: #2a2d3a;
+  color: #e5e7eb;
+}
+
+.cc-btn--secondary:hover {
+  background: #353841;
+}
+
+.cc-input {
+  background: #1a1d27;
+  border: 1px solid #2a2d3a;
+  border-radius: 6px;
+  color: #e5e7eb;
+  font-size: 14px;
+  padding: 8px 10px;
+}
+
+.cc-input:focus {
+  outline: none;
+  border-color: #22c55e;
+}
+
+.weight-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.weight-input {
+  flex: 1;
+  text-align: center;
+}
+
+.weight-unit {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* ---- View fusion info ---- */
+.data-section--view-fusion {
+  font-size: 13px;
+}
+
+.view-active-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.view-active-label {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.view-active-badge {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.view-active-badge--front {
+  background: rgba(34, 197, 94, 0.2);
+  color: #22c55e;
+}
+
+.view-active-badge--side {
+  background: rgba(59, 130, 246, 0.2);
+  color: #3b82f6;
+}
+
+.view-active-badge--none {
+  background: rgba(156, 163, 175, 0.2);
+  color: #9ca3af;
+}
+
+.view-info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.view-info-item {
+  background: #1a1d27;
+  border: 1px solid #2a2d3a;
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.view-info-label {
+  font-size: 11px;
+  color: #9ca3af;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.view-info-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #e5e7eb;
+  font-family: 'Courier New', monospace;
+}
+
+.view-debug-details {
+  margin-top: 8px;
+}
+
+.view-debug-summary {
+  font-size: 11px;
+  color: #6b7280;
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 0;
+}
+
+.view-debug-summary:hover {
+  color: #9ca3af;
+}
+
+.view-debug-content {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #2a2d3a;
+}
+
+.view-debug-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  font-size: 11px;
+}
+
+.view-debug-label {
+  color: #9ca3af;
+}
+
+.view-debug-value {
+  font-family: 'Courier New', monospace;
+  color: #e5e7eb;
+}
+
+
 </style>

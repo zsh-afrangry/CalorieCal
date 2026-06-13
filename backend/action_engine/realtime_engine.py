@@ -337,6 +337,16 @@ def _count_cycles(
     return count
 
 
+def _is_squat_absolute_down(row: dict[str, Any]) -> bool:
+    knee = _safe_float(row.get("mean_knee_angle"))
+    core_vis = _safe_float(row.get("core_visible_ratio"))
+    if knee is None:
+        return False
+    if core_vis is not None and core_vis < CALORIE_CORE_VISIBILITY_THRESHOLD:
+        return False
+    return knee <= 120.0
+
+
 def _score_squat_buffer(buffer: list[dict], spec: dict) -> tuple[float | None, str, int]:
     """Returns (current_score, current_stage, cumulative_count_in_buffer)."""
     knee_vals = _buf_values(buffer, "mean_knee_angle")
@@ -385,6 +395,9 @@ def _score_squat_buffer(buffer: list[dict], spec: dict) -> tuple[float | None, s
 
     current_score = scores[-1] if scores else None
     current_stage = stages[-1] if stages else "unknown"
+    if buffer and _is_squat_absolute_down(buffer[-1]):
+        current_stage = "down"
+        current_score = max(current_score or 0.0, 0.75)
     return current_score, current_stage, count
 
 
@@ -638,7 +651,7 @@ class RealtimeActionEngine:
         self._prev_landmarks_front: dict[str, dict[str, float]] | None = None
         self._prev_landmarks_side: dict[str, dict[str, float]] | None = None
         self._cumulative_counts: dict[str, int] = {}
-        self._prev_buffer_counts: dict[str, int] = {}
+        self._online_count_state: dict[str, dict[str, Any]] = {}
         self._lunge_hold_sec: dict[str, float] = {"left": 0.0, "right": 0.0}
         self._lunge_state: str = "idle"
         self._lunge_state_frames: int = 0
@@ -666,6 +679,7 @@ class RealtimeActionEngine:
         # FPS estimation (sliding window over last 30 frame intervals)
         self._fps_ts_deque: deque[float] = deque(maxlen=30)
         self._prev_frame_ts: float | None = None
+        self._prev_server_receive_ts: float | None = None
         # Previous hip height for Δhip computation
         self._prev_hip_height: float | None = None
         self._prev_hip_height_front: float | None = None
@@ -811,7 +825,7 @@ class RealtimeActionEngine:
         self._prev_landmarks_front = None
         self._prev_landmarks_side = None
         self._cumulative_counts = {}
-        self._prev_buffer_counts = {}
+        self._online_count_state = {}
         self._lunge_hold_sec: dict[str, float] = {"left": 0.0, "right": 0.0}
         self._lunge_state: str = "idle"
         self._lunge_state_frames: int = 0
@@ -830,10 +844,113 @@ class RealtimeActionEngine:
         self._pending_events = []
         self._fps_ts_deque: deque[float] = deque(maxlen=30)
         self._prev_frame_ts = None
+        self._prev_server_receive_ts = None
         self._prev_hip_height = None
         self._prev_hip_height_front = None
         self._prev_hip_height_side = None
         self._prev_motion_active_view = None
+
+    def _update_online_count(
+        self,
+        action: str,
+        stage: str,
+        features: dict[str, Any],
+        timestamp_ms: float,
+    ) -> bool:
+        """Count one cyclic action event with online debouncing."""
+        state = self._online_count_state.setdefault(
+            action,
+            {
+                "armed": False,
+                "high_since": None,
+                "low_since": None,
+                "last_count_ts": None,
+                "last_count_reason": None,
+                "last_count_timestamp_ms": None,
+            },
+        )
+
+        if action == "squat":
+            knee = _safe_float(features.get("mean_knee_angle"))
+            is_high = stage == "down" or _is_squat_absolute_down(features)
+            is_low = (
+                (stage == "stand" and (knee is None or knee >= 155.0)) or
+                (knee is not None and knee >= 165.0)
+            )
+            min_high_ms = 100.0
+            min_low_ms = 120.0
+            cooldown_ms = 650.0
+        elif action == "jumping_jack":
+            is_high = stage == "open"
+            is_low = stage == "closed"
+            min_high_ms = 60.0
+            min_low_ms = 60.0
+            cooldown_ms = 300.0
+        else:
+            return False
+
+        last_count_ts = _safe_float(state.get("last_count_ts"))
+        in_cooldown = (
+            last_count_ts is not None and
+            timestamp_ms - last_count_ts < cooldown_ms
+        )
+        state["is_high"] = bool(is_high)
+        state["is_low"] = bool(is_low)
+        state["in_cooldown"] = bool(in_cooldown)
+        state["stage"] = stage
+        state["last_seen_timestamp_ms"] = round(timestamp_ms, 1)
+        state["min_high_ms"] = min_high_ms
+        state["min_low_ms"] = min_low_ms
+        state["cooldown_ms"] = cooldown_ms
+        state["last_decision"] = "wait"
+
+        if is_high:
+            if state.get("high_since") is None:
+                state["high_since"] = timestamp_ms
+            state["low_since"] = None
+            high_duration = timestamp_ms - float(state["high_since"])
+            state["high_duration_ms"] = round(high_duration, 1)
+            state["low_duration_ms"] = None
+            if high_duration >= min_high_ms and not in_cooldown:
+                state["armed"] = True
+                state["last_decision"] = "armed"
+            elif in_cooldown:
+                state["last_decision"] = "high_in_cooldown"
+            else:
+                state["last_decision"] = "high_too_short"
+            return False
+
+        state["high_since"] = None
+        state["high_duration_ms"] = None
+
+        if is_low:
+            if state.get("low_since") is None:
+                state["low_since"] = timestamp_ms
+            low_duration = timestamp_ms - float(state["low_since"])
+            state["low_duration_ms"] = round(low_duration, 1)
+            if state.get("armed") and low_duration >= min_low_ms and not in_cooldown:
+                state["armed"] = False
+                state["last_count_ts"] = timestamp_ms
+                state["last_count_timestamp_ms"] = round(timestamp_ms, 1)
+                state["last_count_reason"] = "armed_high_then_stable_low"
+                state["low_since"] = timestamp_ms
+                state["last_decision"] = "count"
+                return True
+            if not state.get("armed"):
+                state["last_decision"] = "low_not_armed"
+            elif in_cooldown:
+                state["last_decision"] = "low_in_cooldown"
+            else:
+                state["last_decision"] = "low_too_short"
+            return False
+
+        state["low_since"] = None
+        state["low_duration_ms"] = None
+        if state.get("armed"):
+            state["last_decision"] = "armed_waiting_for_low"
+        else:
+            state["last_decision"] = "neutral"
+        return False
 
     def _run_front_actions(
         self,
@@ -921,23 +1038,14 @@ class RealtimeActionEngine:
             # --- cyclic actions (squat, jumping_jack): count mode ---
             if action not in self._cumulative_counts:
                 self._cumulative_counts[action] = 0
-                self._prev_buffer_counts[action] = 0
 
-            score, stage, buf_count = self._run_on_buffer(buf, spec)
-
-            prev = self._prev_buffer_counts[action]
-            if buf_count > prev:
-                delta = buf_count - prev
-                self._cumulative_counts[action] += delta
-                ts = features.get("timestamp_ms") or time.time() * 1000
-                for _ in range(delta):
-                    ev = self._make_count_event(action, None, ts)
-                    self._pending_events.append(ev)
+            score, stage, _buf_count = self._run_on_buffer(buf, spec)
+            ts = features.get("timestamp_ms") or time.time() * 1000
+            if self._update_online_count(action, stage, features, ts):
+                self._cumulative_counts[action] += 1
+                ev = self._make_count_event(action, None, ts)
+                self._pending_events.append(ev)
                 self._log_count_event(action, None, self._cumulative_counts[action])
-            elif prev - buf_count > 2:
-                self._prev_buffer_counts[action] = buf_count
-                prev = buf_count
-            self._prev_buffer_counts[action] = buf_count
 
             actions.append({
                 "name": action,
@@ -956,15 +1064,30 @@ class RealtimeActionEngine:
         motion_e: float,
         hip_h: float | None,
         prev_hip_h: float | None,
-    ) -> tuple[float | None, float]:
-        """Accumulate continuous motion calories and return (next_prev_hip, fps)."""
+        server_receive_perf_ms: float | None = None,
+    ) -> tuple[float | None, float, float]:
+        """Accumulate continuous motion calories and return (next_prev_hip, fps, instant_rate)."""
         fps = 30.0
+        frame_dt_ms = (
+            ts_now - self._prev_frame_ts
+            if self._prev_frame_ts is not None
+            else None
+        )
+        if server_receive_perf_ms is None:
+            server_receive_perf_ms = time.perf_counter() * 1000.0
+        server_receive_dt_ms = (
+            server_receive_perf_ms - self._prev_server_receive_ts
+            if self._prev_server_receive_ts is not None
+            else None
+        )
+        self._prev_server_receive_ts = server_receive_perf_ms
+        fps_sample_accepted = False
 
         if core_vis >= CALORIE_CORE_VISIBILITY_THRESHOLD:
-            if self._prev_frame_ts is not None:
-                dt_ms = ts_now - self._prev_frame_ts
-                if 10.0 < dt_ms < 500.0:  # only sane intervals (2-100 fps)
-                    self._fps_ts_deque.append(dt_ms)
+            if frame_dt_ms is not None:
+                if 10.0 < frame_dt_ms < 500.0:  # only sane intervals (2-100 fps)
+                    self._fps_ts_deque.append(frame_dt_ms)
+                    fps_sample_accepted = True
             self._prev_frame_ts = ts_now
             fps = (1000.0 / (sum(self._fps_ts_deque) / len(self._fps_ts_deque))
                    if self._fps_ts_deque else 30.0)
@@ -1002,6 +1125,10 @@ class RealtimeActionEngine:
             if self._debug_recording:
                 self._debug_log.append({
                     "timestamp": ts_now,
+                    "frame_dt_ms": round(frame_dt_ms, 2) if frame_dt_ms is not None else None,
+                    "server_receive_dt_ms": round(server_receive_dt_ms, 2) if server_receive_dt_ms is not None else None,
+                    "fps_sample_accepted": fps_sample_accepted,
+                    "skipped_reason": None,
                     "core_vis": core_vis,
                     "motion_e": round(motion_e, 6),
                     "delta_hip": round(delta_hip, 6),
@@ -1019,6 +1146,26 @@ class RealtimeActionEngine:
             return next_prev_hip, fps, instant_kcal_per_min
 
         self._prev_frame_ts = ts_now
+        fps = (1000.0 / (sum(self._fps_ts_deque) / len(self._fps_ts_deque))
+               if self._fps_ts_deque else 30.0)
+        if self._debug_recording:
+            self._debug_log.append({
+                "timestamp": ts_now,
+                "frame_dt_ms": round(frame_dt_ms, 2) if frame_dt_ms is not None else None,
+                "server_receive_dt_ms": round(server_receive_dt_ms, 2) if server_receive_dt_ms is not None else None,
+                "fps_sample_accepted": False,
+                "skipped_reason": "low_core_visibility",
+                "core_vis": core_vis,
+                "motion_e": round(motion_e, 6),
+                "delta_hip": None,
+                "hip_h": round(hip_h, 6) if hip_h is not None else None,
+                "prev_hip_h": round(prev_hip_h, 6) if prev_hip_h is not None else None,
+                "intensity": None,
+                "raw_met": None,
+                "smoothed_met": round(self._smoothed_met, 4),
+                "instant_kcal_per_min": 0.0,
+                "fps": round(fps, 2),
+            })
         return None, fps, 0.0
 
     def _build_calorie_summary(self) -> dict[str, Any]:
@@ -1136,6 +1283,7 @@ class RealtimeActionEngine:
             motion_e=features.get("motion_energy") or 0.0,
             hip_h=features.get("hip_height_above_ankles_torso"),
             prev_hip_h=self._prev_hip_height,
+            server_receive_perf_ms=t0 * 1000.0,
         )
         self._instant_kcal_per_min = instant_rate
         self._prev_hip_height_front = self._prev_hip_height
@@ -1154,6 +1302,7 @@ class RealtimeActionEngine:
                 "left_hip_angle":    round(features["left_hip_angle"], 2) if features.get("left_hip_angle") is not None else None,
                 "right_hip_angle":   round(features["right_hip_angle"], 2) if features.get("right_hip_angle") is not None else None,
                 "hip_h":             round(features["hip_height_above_ankles_torso"], 4) if features.get("hip_height_above_ankles_torso") is not None else None,
+                "squat_online_state": dict(self._online_count_state.get("squat", {})),
             }
 
         # Flush pending events
@@ -1163,6 +1312,10 @@ class RealtimeActionEngine:
         calorie_summary = self._build_calorie_summary()
 
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        if self._debug_recording and self._debug_log:
+            self._debug_log[-1]["backend_process_ms"] = latency_ms
+            self._debug_log[-1]["message_type"] = "single_frame"
+            self._debug_log[-1]["count_events"] = new_events
         return {
             "actions": actions,
             "count_events": new_events,
@@ -1229,6 +1382,7 @@ class RealtimeActionEngine:
             motion_e=merged_features.get("motion_energy") or 0.0,
             hip_h=merged_features.get("hip_height_above_ankles_torso"),
             prev_hip_h=prev_hip,
+            server_receive_perf_ms=t0 * 1000.0,
         )
         self._instant_kcal_per_min = instant_rate
 
@@ -1262,9 +1416,17 @@ class RealtimeActionEngine:
                 "right_hip_angle":   round(features_for_debug["right_hip_angle"], 2) if features_for_debug.get("right_hip_angle") is not None else None,
                 "hip_h":             round(features_for_debug["hip_height_above_ankles_torso"], 4) if features_for_debug.get("hip_height_above_ankles_torso") is not None else None,
                 "active_view":       active_view,
+                "squat_online_state": dict(self._online_count_state.get("squat", {})),
             }
 
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        if self._debug_recording and self._debug_log:
+            self._debug_log[-1]["backend_process_ms"] = latency_ms
+            self._debug_log[-1]["message_type"] = "dual_frame"
+            self._debug_log[-1]["front_present"] = bool(front)
+            self._debug_log[-1]["side_present"] = bool(side)
+            self._debug_log[-1]["view_info"] = view_info
+            self._debug_log[-1]["count_events"] = new_events
         return {
             "actions": actions,
             "count_events": new_events,

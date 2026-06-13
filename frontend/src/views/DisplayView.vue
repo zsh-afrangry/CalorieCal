@@ -49,6 +49,46 @@ type DurationState = {
 
 type ActionState = CountState | DurationState;
 
+type DebugMessageType = "single_frame" | "dual_frame" | "none";
+
+type SentFrameInfo = {
+  messageType: DebugMessageType;
+  payloadEstimatedBytes: number | null;
+};
+
+type FrontendDebugFrame = {
+  sample_index: number;
+  timestamp_ms: number;
+  loop_dt_ms: number | null;
+  front_infer_ms: number | null;
+  side_infer_ms: number | null;
+  draw_ms: number;
+  send_ms: number;
+  total_loop_ms: number;
+  total_pose_infer_ms: number;
+  message_type: DebugMessageType;
+  side_enabled: boolean;
+  show_side_video: boolean;
+  front_ready: boolean;
+  side_ready: boolean;
+  front_has_pose: boolean;
+  side_has_pose: boolean;
+  target_interval_ms: number;
+  front_video_width: number | null;
+  front_video_height: number | null;
+  side_video_width: number | null;
+  side_video_height: number | null;
+  payload_estimated_bytes: number | null;
+};
+
+type NumberStats = {
+  avg: number | null;
+  p50: number | null;
+  p95: number | null;
+  min: number | null;
+  max: number | null;
+};
+
 // ---- Constants -------------------------------------------------------------
 
 const TABS: ActionTab[] = [
@@ -113,19 +153,36 @@ const instantKcalPerMin = ref<number | null>(null); // Direct from backend, no w
 // Debug recording
 const debugRecording = ref(false);
 const debugData = ref<any>(null);
+let frontendDebugFrames: FrontendDebugFrame[] = [];
+let frontendDebugStartedAt = 0;
+let frontendDebugLastLoopAt: number | null = null;
 
 async function startDebugRecording() {
   if (debugRecording.value) return;
   debugRecording.value = true;
   debugData.value = null;
+  beginFrontendDebugDiagnostics();
 
   try {
-    const result = await ws.startDebugRecording();
-    debugData.value = result;
-    console.log("Debug recording completed:", result);
+    const result = await ws.startDebugRecording(true);
+    const frontendDiagnostics = buildFrontendDebugDiagnostics(performance.now());
+    const backendDiagnostics = buildBackendDebugDiagnostics(result);
+    const combined = {
+      ...result,
+      diagnostics: {
+        frontend: frontendDiagnostics,
+        backend: backendDiagnostics,
+        bottleneck_hints: buildBottleneckHints(
+          frontendDiagnostics.summary,
+          backendDiagnostics.summary,
+        ),
+      },
+    };
+    debugData.value = combined;
+    console.log("Debug recording completed:", combined);
 
     // Download JSON file
-    const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(combined, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -133,7 +190,7 @@ async function startDebugRecording() {
     a.click();
     URL.revokeObjectURL(url);
 
-    alert(`调试数据已记录，共 ${result.count} 帧数据已下载`);
+    alert(`调试数据已记录，后端 ${result.count} 帧，前端 ${frontendDiagnostics.summary.sample_count} 帧数据已下载`);
   } catch (err) {
     console.error("Debug recording failed:", err);
     alert("调试记录失败：" + err);
@@ -159,6 +216,167 @@ function qualityLabel(score: number | null): string {
   if (score === null) return "--";
   const rounded = Math.round(score * 4) / 4;
   return QUALITY_ZH[rounded] ?? "--";
+}
+
+function roundMetric(value: number | null | undefined, digits = 2): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  const scale = 10 ** digits;
+  return Math.round(value * scale) / scale;
+}
+
+function numberStats(values: Array<number | null | undefined>, digits = 2): NumberStats {
+  const xs = values
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v))
+    .sort((a, b) => a - b);
+  if (!xs.length) {
+    return { avg: null, p50: null, p95: null, min: null, max: null };
+  }
+  const pick = (q: number) => xs[Math.min(xs.length - 1, Math.floor((xs.length - 1) * q))];
+  const avg = xs.reduce((sum, v) => sum + v, 0) / xs.length;
+  return {
+    avg: roundMetric(avg, digits),
+    p50: roundMetric(pick(0.50), digits),
+    p95: roundMetric(pick(0.95), digits),
+    min: roundMetric(xs[0], digits),
+    max: roundMetric(xs[xs.length - 1], digits),
+  };
+}
+
+function ratio(count: number, total: number): number {
+  return total > 0 ? roundMetric(count / total, 4)! : 0;
+}
+
+function beginFrontendDebugDiagnostics() {
+  frontendDebugFrames = [];
+  frontendDebugStartedAt = performance.now();
+  frontendDebugLastLoopAt = null;
+}
+
+function currentVideoSummary(video: HTMLVideoElement | null, stream: MediaStream | null) {
+  const settings = stream?.getVideoTracks()[0]?.getSettings();
+  return {
+    video_width: video?.videoWidth || null,
+    video_height: video?.videoHeight || null,
+    track_width: settings?.width ?? null,
+    track_height: settings?.height ?? null,
+    track_frame_rate: settings?.frameRate ?? null,
+    device_id: settings?.deviceId ?? null,
+  };
+}
+
+function estimateJsonBytes(payload: unknown): number | null {
+  try {
+    const text = JSON.stringify(payload);
+    if (typeof TextEncoder !== "undefined") {
+      return new TextEncoder().encode(text).length;
+    }
+    return text.length;
+  } catch {
+    return null;
+  }
+}
+
+function recordFrontendDebugFrame(frame: Omit<FrontendDebugFrame, "sample_index">) {
+  if (!debugRecording.value || frontendDebugStartedAt <= 0) return;
+  frontendDebugFrames.push({
+    sample_index: frontendDebugFrames.length,
+    ...frame,
+  });
+}
+
+function summarizeFrontendBottleneck(frames: FrontendDebugFrame[]): string {
+  if (!frames.length) return "no_frontend_samples";
+  const totalInferAvg = numberStats(frames.map(f => f.total_pose_infer_ms)).avg ?? 0;
+  const drawAvg = numberStats(frames.map(f => f.draw_ms)).avg ?? 0;
+  const sendAvg = numberStats(frames.map(f => f.send_ms)).avg ?? 0;
+  const noSendRatio = ratio(frames.filter(f => f.message_type === "none").length, frames.length);
+
+  if (totalInferAvg >= MIN_INFERENCE_INTERVAL_MS * 0.85) return "frontend_pose_inference_near_budget";
+  if (drawAvg >= 10) return "frontend_canvas_draw_cost_high";
+  if (sendAvg >= 8) return "frontend_websocket_send_cost_high";
+  if (noSendRatio >= 0.30) return "pose_missing_often";
+  return "frontend_within_budget";
+}
+
+function buildFrontendDebugDiagnostics(endAt: number) {
+  const frames = frontendDebugFrames.slice();
+  const durationMs = Math.max(0, endAt - frontendDebugStartedAt);
+  const sentSingle = frames.filter(f => f.message_type === "single_frame").length;
+  const sentDual = frames.filter(f => f.message_type === "dual_frame").length;
+  const sentNone = frames.filter(f => f.message_type === "none").length;
+
+  return {
+    summary: {
+      sample_count: frames.length,
+      duration_ms: roundMetric(durationMs),
+      loop_fps: durationMs > 0 ? roundMetric(frames.length * 1000 / durationMs) : null,
+      target_inference_fps: TARGET_INFERENCE_FPS,
+      target_interval_ms: roundMetric(MIN_INFERENCE_INTERVAL_MS),
+      loop_dt_ms: numberStats(frames.map(f => f.loop_dt_ms)),
+      front_infer_ms: numberStats(frames.map(f => f.front_infer_ms)),
+      side_infer_ms: numberStats(frames.map(f => f.side_infer_ms)),
+      total_pose_infer_ms: numberStats(frames.map(f => f.total_pose_infer_ms)),
+      draw_ms: numberStats(frames.map(f => f.draw_ms)),
+      send_ms: numberStats(frames.map(f => f.send_ms)),
+      total_loop_ms: numberStats(frames.map(f => f.total_loop_ms)),
+      payload_estimated_bytes: numberStats(frames.map(f => f.payload_estimated_bytes), 0),
+      front_pose_ratio: ratio(frames.filter(f => f.front_has_pose).length, frames.length),
+      side_pose_ratio: ratio(frames.filter(f => f.side_has_pose).length, frames.length),
+      side_enabled_ratio: ratio(frames.filter(f => f.side_enabled).length, frames.length),
+      sent_single_count: sentSingle,
+      sent_dual_count: sentDual,
+      sent_none_count: sentNone,
+      frontend_bottleneck_guess: summarizeFrontendBottleneck(frames),
+      front_camera: currentVideoSummary(videoRef.value, streamFront),
+      side_camera: currentVideoSummary(videoRefSide.value, streamSide),
+      user_agent: navigator.userAgent,
+    },
+    frames,
+  };
+}
+
+function buildBackendDebugDiagnostics(result: any) {
+  const rows = Array.isArray(result?.data) ? result.data : [];
+  return {
+    summary: {
+      sample_count: rows.length,
+      fps: numberStats(rows.map((r: any) => r.fps)),
+      frame_dt_ms: numberStats(rows.map((r: any) => r.frame_dt_ms)),
+      server_receive_dt_ms: numberStats(rows.map((r: any) => r.server_receive_dt_ms)),
+      backend_process_ms: numberStats(rows.map((r: any) => r.backend_process_ms)),
+      core_vis: numberStats(rows.map((r: any) => r.core_vis), 3),
+      low_visibility_count: rows.filter((r: any) => r.skipped_reason === "low_core_visibility").length,
+    },
+  };
+}
+
+function buildBottleneckHints(frontend: any, backend: any): string[] {
+  const hints: string[] = [];
+  const loopFps = frontend.loop_fps ?? 0;
+  const inferAvg = frontend.total_pose_infer_ms?.avg ?? 0;
+  const sideAvg = frontend.side_infer_ms?.avg ?? 0;
+  const backendAvg = backend.backend_process_ms?.avg ?? 0;
+  const receiveAvg = backend.server_receive_dt_ms?.avg ?? 0;
+
+  if (loopFps > 0 && loopFps < TARGET_INFERENCE_FPS * 0.75) {
+    hints.push("前端实际推理 FPS 明显低于目标值，优先看 frontend.total_pose_infer_ms。");
+  }
+  if (inferAvg >= MIN_INFERENCE_INTERVAL_MS * 0.85) {
+    hints.push("浏览器姿态推理耗时接近单帧预算，双摄顺序 detectForVideo 很可能是主要瓶颈。");
+  }
+  if (sideAvg >= 15) {
+    hints.push("侧摄推理耗时不低，可以考虑侧摄降频、错峰推理，或动作识别只用正面。");
+  }
+  if (backendAvg >= 15) {
+    hints.push("后端单帧处理耗时偏高，服务器 CPU 或 Python 处理链路需要进一步排查。");
+  }
+  if (receiveAvg >= 80 && inferAvg < MIN_INFERENCE_INTERVAL_MS * 0.5) {
+    hints.push("前端推理不慢但后端收到帧间隔大，需检查 WebSocket 发送、浏览器主线程或网络。");
+  }
+  if (!hints.length) {
+    hints.push("本次摘要未看到单个明显瓶颈，建议对比单摄/双摄两份日志的 frontend 与 backend 摘要。");
+  }
+  return hints;
 }
 
 // ---- Active tab data -------------------------------------------------------
@@ -398,31 +616,53 @@ function stopDualCamera() {
 // Dual camera inference loop
 function dualInferenceLoop() {
   const now = performance.now();
+  const loopStart = now;
 
   // Throttle inference to target FPS
   if (now - lastInferenceAt < MIN_INFERENCE_INTERVAL_MS) {
     animFrameId = requestAnimationFrame(dualInferenceLoop);
     return;
   }
+  const loopDtMs = frontendDebugLastLoopAt == null ? null : now - frontendDebugLastLoopAt;
+  frontendDebugLastLoopAt = now;
   lastInferenceAt = now;
 
   // Run inference on both cameras
   let resultFront: any = null;
   let resultSide: any = null;
+  let frontInferMs: number | null = null;
+  let sideInferMs: number | null = null;
+  const frontReady = !!(
+    poseFront.value &&
+    videoRef.value &&
+    videoRef.value.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+  );
+  const sideReady = !!(
+    sideEnabled.value &&
+    poseSide.value &&
+    videoRefSide.value &&
+    videoRefSide.value.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+  );
 
-  if (poseFront.value && videoRef.value && videoRef.value.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+  if (frontReady && poseFront.value && videoRef.value) {
+    const t = performance.now();
     try {
       resultFront = poseFront.value.detectForVideo(videoRef.value, now);
     } catch (err) {
       console.error("Front pose inference error:", err);
+    } finally {
+      frontInferMs = performance.now() - t;
     }
   }
 
-  if (sideEnabled.value && poseSide.value && videoRefSide.value && videoRefSide.value.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+  if (sideReady && poseSide.value && videoRefSide.value) {
+    const t = performance.now();
     try {
       resultSide = poseSide.value.detectForVideo(videoRefSide.value, now);
     } catch (err) {
       console.error("Side pose inference error:", err);
+    } finally {
+      sideInferMs = performance.now() - t;
     }
   }
 
@@ -431,10 +671,38 @@ function dualInferenceLoop() {
   const landmarksSide = resultSide?.landmarks?.[0] || null;
 
   // Send to backend
-  sendDualFrameToBackend(landmarksFront, landmarksSide, now);
+  const sendStart = performance.now();
+  const sentFrame = sendDualFrameToBackend(landmarksFront, landmarksSide, now);
+  const sendMs = performance.now() - sendStart;
 
   // Draw on canvas (optional, for visualization)
+  const drawStart = performance.now();
   drawDualCanvas(landmarksFront, landmarksSide);
+  const drawMs = performance.now() - drawStart;
+
+  recordFrontendDebugFrame({
+    timestamp_ms: roundMetric(now, 2)!,
+    loop_dt_ms: roundMetric(loopDtMs),
+    front_infer_ms: roundMetric(frontInferMs),
+    side_infer_ms: roundMetric(sideInferMs),
+    draw_ms: roundMetric(drawMs)!,
+    send_ms: roundMetric(sendMs)!,
+    total_loop_ms: roundMetric(performance.now() - loopStart)!,
+    total_pose_infer_ms: roundMetric((frontInferMs ?? 0) + (sideInferMs ?? 0))!,
+    message_type: sentFrame.messageType,
+    side_enabled: sideEnabled.value,
+    show_side_video: showSideVideo.value,
+    front_ready: frontReady,
+    side_ready: sideReady,
+    front_has_pose: !!landmarksFront,
+    side_has_pose: !!landmarksSide,
+    target_interval_ms: roundMetric(MIN_INFERENCE_INTERVAL_MS)!,
+    front_video_width: videoRef.value?.videoWidth || null,
+    front_video_height: videoRef.value?.videoHeight || null,
+    side_video_width: videoRefSide.value?.videoWidth || null,
+    side_video_height: videoRefSide.value?.videoHeight || null,
+    payload_estimated_bytes: sentFrame.payloadEstimatedBytes,
+  });
 
   animFrameId = requestAnimationFrame(dualInferenceLoop);
 }
@@ -444,11 +712,33 @@ function sendDualFrameToBackend(
   landmarksFront: NormalizedLandmark[] | null,
   landmarksSide: NormalizedLandmark[] | null,
   timestamp: number
-) {
+): SentFrameInfo {
   const namedFront = landmarksFront ? extractNamedLandmarks(landmarksFront) : null;
   const namedSide = landmarksSide ? extractNamedLandmarks(landmarksSide) : null;
 
-  ws.sendDualFrame(namedFront, namedSide, timestamp);
+  if (sideEnabled.value && (namedFront || namedSide)) {
+    ws.sendDualFrame(namedFront, namedSide, timestamp);
+    return {
+      messageType: "dual_frame",
+      payloadEstimatedBytes: debugRecording.value
+        ? estimateJsonBytes({
+            type: "dual_frame",
+            front: namedFront ? { timestamp_ms: timestamp, landmarks: namedFront } : null,
+            side: namedSide ? { timestamp_ms: timestamp, landmarks: namedSide } : null,
+          })
+        : null,
+    };
+  } else if (namedFront) {
+    ws.sendLandmarks(namedFront, timestamp);
+    return {
+      messageType: "single_frame",
+      payloadEstimatedBytes: debugRecording.value
+        ? estimateJsonBytes({ timestamp_ms: timestamp, landmarks: namedFront })
+        : null,
+    };
+  }
+
+  return { messageType: "none", payloadEstimatedBytes: null };
 }
 
 // Extract named landmarks for backend
@@ -1033,7 +1323,7 @@ watch(sideDeviceId, (val) => {
 /* ---- Shell: 3-column layout ---- */
 .display-shell {
   display: grid;
-  grid-template-columns: 180px minmax(0, 1fr) 260px;
+  grid-template-columns: 180px minmax(0, 1fr) 300px;
   grid-template-rows: 100vh;
   background: #0f1117;
   color: #e5e7eb;
@@ -1148,8 +1438,10 @@ watch(sideDeviceId, (val) => {
   position: absolute;
   top: 16px;
   right: 16px;
-  width: 240px;
-  height: 180px;
+  width: clamp(320px, 34vw, 460px);
+  height: clamp(240px, 25.5vw, 345px);
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 96px);
   inset: auto;
   border: 2px solid #22c55e;
   border-radius: 8px;
@@ -1335,8 +1627,7 @@ watch(sideDeviceId, (val) => {
 
 /* ---- Dual camera settings ---- */
 .data-section--dual-camera {
-  max-height: 300px;
-  overflow-y: auto;
+  overflow: visible;
 }
 
 .camera-toggle-row {
@@ -1375,18 +1666,20 @@ watch(sideDeviceId, (val) => {
 
 .camera-select-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
 }
 
 .camera-select-label {
   font-size: 12px;
   font-weight: 500;
-  min-width: 40px;
+  min-width: 0;
 }
 
 .cc-select {
-  flex: 1;
+  width: 100%;
+  min-width: 0;
   background: #1a1d27;
   border: 1px solid #2a2d3a;
   border-radius: 6px;
@@ -1451,6 +1744,7 @@ watch(sideDeviceId, (val) => {
 
 .weight-input {
   flex: 1;
+  min-width: 0;
   text-align: center;
 }
 
@@ -1569,5 +1863,14 @@ watch(sideDeviceId, (val) => {
   color: #e5e7eb;
 }
 
+@media (max-width: 900px) {
+  .display-video--side,
+  .display-canvas--side {
+    width: min(46vw, 360px);
+    height: min(34.5vw, 270px);
+    top: 12px;
+    right: 12px;
+  }
+}
 
 </style>

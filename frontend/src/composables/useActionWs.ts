@@ -159,7 +159,7 @@ export function useActionWs() {
     }));
   }
 
-  function startDebugRecording(): Promise<any> {
+  function startDebugRecording(reset = false): Promise<any> {
     return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         reject(new Error("WebSocket not connected"));
@@ -175,7 +175,7 @@ export function useActionWs() {
       };
 
       ws.addEventListener("message", handler);
-      ws.send(JSON.stringify({ type: "debug_start" }));
+      ws.send(JSON.stringify({ type: "debug_start", reset }));
 
       // Auto-stop after 10 seconds
       setTimeout(() => {

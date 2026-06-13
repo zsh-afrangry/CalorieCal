@@ -122,8 +122,13 @@ async def action_ws(websocket: WebSocket) -> None:
 
             # Debug recording control
             if msg.get("type") == "debug_start":
+                if msg.get("reset"):
+                    engine.reset()
                 engine.start_debug_recording()
-                await websocket.send_text(json.dumps({"type": "debug_started"}))
+                await websocket.send_text(json.dumps({
+                    "type": "debug_started",
+                    "reset": bool(msg.get("reset")),
+                }))
                 continue
 
             if msg.get("type") == "debug_stop":

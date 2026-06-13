@@ -1,43 +1,112 @@
-Task13 修改计划：单摄优先与实时计数稳定化
+Task13：单摄参数调整与双摄架构拆分
 
-一、改动工作量评估
+本文件用于记录 task13 下的多个连续任务。当前结论是：动作识别准确性不能只靠动作阈值补丁，采样 FPS 和双摄推理架构是后续必须解决的问题。
 
-整体工作量不大，主要集中在后端实时计数逻辑和前端单摄运行参数。预计属于中小改动：
-1. 后端：把 squat / jumping_jack 的累计计数从 rolling buffer 差分，改成在线事件状态机。
-2. 前端：让动作识别测试优先走单摄路径，减少双摄顺序推理带来的 fps 下降。
-3. 调试：debug_start 支持可选 reset，避免 10 秒日志继承旧 session 计数。
-4. 参数：根据单摄日志调整深蹲阶段响应，比如 smoothing 窗口和 down 兜底条件。
 
-二、原因
+任务一：单摄优先与实时计数稳定化
 
-当前深蹲识别有两个问题：
-1. 双摄时前端需要在同一个 loop 内顺序跑 front / side 两次 PoseLandmarker，实际送到后端的姿态帧率会下降。之前双摄日志约 8-9fps，单摄日志约 18fps，单摄识别明显更稳定。
-2. 后端 squat 计数当前依赖 rolling buffer 内重新统计出的 cycle 数量，再用 buf_count - prev_buf_count 推累计计数。这个方式适合离线分析，但实时场景里容易受窗口边界和平滑阶段抖动影响，出现漏计或同一次动作附近连续加计数。
+目标：
+1. 先让单摄动作识别稳定可测。
+2. 修复深蹲实时计数中 rolling buffer 差分导致的漏计、重复计数问题。
+3. 增强 10 秒 debug 日志，能快速判断问题来自阶段识别、计数状态机、前端推理 FPS 还是后端处理。
 
-三、解决逻辑
-
-1. 动作识别先回到单摄优先，侧摄暂时不参与动作识别，避免性能下降影响阶段判断。
-2. 深蹲阶段判断增加明显下蹲的绝对姿态兜底，例如膝角足够小且可见度达标时允许进入 down，减少低 fps 或平滑带来的阶段滞后。
-3. 计数改为在线状态机：看到 down 后进入 armed，随后稳定回到 stand 才 count + 1，并加入 cooldown 防止同一次动作重复计数。
-4. debug_start 增加 reset 选项。默认不重置训练 session；测试时可显式 reset，让日志里的 count 表示本次测试新增计数。
-
-四、代码方案
-
+已实施：
 1. backend/action_engine/realtime_engine.py
-   - 为 squat / jumping_jack 增加在线计数状态字段，例如 armed、last_count_ts、down_since、stand_since。
-   - 新增通用在线计数 helper，输入当前 stage、timestamp、动作阈值，输出是否新增一次计数。
-   - squat 的 stage 可保留现有 buffer score，但增加 knee angle / visibility 的 down 兜底。
-   - 保留 rolling buffer score 用于阶段和质量参考，但累计 count 不再直接依赖 buf_count 差分。
+   - squat / jumping_jack 累计计数从 rolling buffer 差分改为在线事件计数。
+   - squat 增加绝对 down 兜底：mean_knee_angle <= 120 且可见度达标时允许视为 down。
+   - squat 增加绝对 stand 兜底：mean_knee_angle >= 165 时允许视为回到站立。
+   - debug 日志增加 frame_dt_ms、server_receive_dt_ms、backend_process_ms、count_events。
+   - squat_online_state 增加 is_high、is_low、in_cooldown、high_duration_ms、low_duration_ms、last_decision、last_count_reason。
 
 2. backend/action_server.py
-   - debug_start 读取 reset 参数。
-   - 当 reset=true 时调用 engine.reset() 后再 start_debug_recording()。
+   - debug_start 支持 reset=true。
+   - 测试记录前可重置 engine，避免 10 秒日志继承旧 session 计数。
 
-3. frontend/src/views/DisplayView.vue
-   - Task13 阶段默认单摄测试动作识别。
-   - 侧摄功能保留，但不作为动作识别验收前提。
-   - 必要时降低或错峰侧摄推理，而不是让双摄同时影响正面动作识别。
+3. frontend/src/composables/useActionWs.ts
+   - startDebugRecording(reset = false) 支持向后端发送 reset 参数。
 
-4. 参数调整
-   - squat smoothing_window_frames 从 5 评估是否降到 3，或后续改为按实际 fps 自适应。
-   - squat down 兜底建议先保守：core_visible_ratio 达标、mean_knee_angle 明显小于阈值，并持续至少 1-2 帧。
+4. frontend/src/views/DisplayView.vue
+   - 调试按钮默认使用 reset=true。
+   - 侧摄未开启时发送单路 landmarks，后端走 push_frame。
+   - 侧摄开启时才发送 dual_frame，后端走 push_dual_frame。
+   - “记录10秒数据”下载 JSON 增加 diagnostics.frontend / diagnostics.backend / bottleneck_hints。
+   - 前端每帧记录 front_infer_ms、side_infer_ms、total_pose_infer_ms、draw_ms、send_ms、loop_dt_ms、message_type、摄像头分辨率和 track_frame_rate。
+   - 修复 /#/display 右侧“双摄像头设置”区域显示不全：右侧栏加宽，设置区域不再内部滚动，摄像头选择改成上下排列。
+
+验证：
+1. python3 -m py_compile backend/action_engine/realtime_engine.py backend/action_server.py 通过。
+2. git diff --check 通过。
+3. npm run build 通过。
+4. 深蹲单摄日志回放可稳定识别 3 次。
+
+保留结论：
+1. 单摄优先是当前动作识别验收的稳定路径。
+2. 对深蹲的 down / stand 兜底可以缓解低 FPS 下的阶段滞后，但不能根治双摄快动作漏采样。
+3. 后续不再把主要精力放在逐个动作补阈值上，尤其是高抬腿这类快动作。
+
+
+任务二：双摄独立采集与后端异步融合
+
+背景：
+1. 双摄日志 10秒测试集合/双设.json 显示，双摄模式下前端实际推理 FPS 约 14fps。
+2. 两个摄像头本身 track_frame_rate 都是 30fps，后端 backend_process_ms 平均约 1-2ms，后端不是瓶颈。
+3. 当前瓶颈来自同一个浏览器页面、同一个 loop 内顺序执行 front detectForVideo() 和 side detectForVideo()。
+4. 双摄总推理耗时经常超过 50ms 的 20fps 单帧预算，导致深蹲、高抬腿等快动作的关键姿态只留下 1-2 帧，甚至被漏采。
+
+方向：
+1. 不再继续围绕每个动作单独优化阈值。
+2. 将双摄从“一个页面串行推理”改为“两路独立采集 / 独立推理 / 独立发送”。
+3. 后端按 session_id 和 view 缓存两路最新姿态，再按 timestamp 做异步融合。
+
+建议页面结构：
+1. /#/camera?session=<id>&view=front
+   - 正面摄像头采集页。
+   - 只负责选择摄像头、运行单路 PoseLandmarker、发送 front landmarks。
+
+2. /#/camera?session=<id>&view=side
+   - 侧面摄像头采集页。
+   - 只负责选择摄像头、运行单路 PoseLandmarker、发送 side landmarks。
+
+3. /#/display?session=<id>
+   - 展示页。
+   - 不再承担双摄推理，只展示后端融合后的动作结果、热量和调试数据。
+
+后端协议建议：
+1. 新增 view_frame 消息：
+   {
+     "type": "view_frame",
+     "session_id": "test1",
+     "view": "front",
+     "timestamp_ms": 1781366339265,
+     "perf_timestamp_ms": 123456.7,
+     "landmarks": { ... }
+   }
+
+2. 后端按 session_id 维护：
+   - latest_front_frame
+   - latest_side_frame
+   - each_view_fps
+   - each_view_visibility
+   - latest_fused_result
+
+3. 融合策略：
+   - 任一路 view_frame 到达时立即更新该路缓存。
+   - 用当前帧 timestamp 附近 100-150ms 内的另一视角做融合。
+   - 如果另一视角过旧或不存在，则单路继续工作，不阻塞动作识别。
+
+时间同步注意：
+1. 两个独立页面的 performance.now() 不能直接跨页面比较。
+2. 跨页面 / 跨主机融合应优先使用 Date.now() 生成的 timestamp_ms。
+3. performance.now() 仅用于各自页面内部诊断推理耗时和 loop 间隔。
+
+预期效果：
+1. 两路摄像头不再互相等待，也不再被同一个主线程串行 detectForVideo 拖慢。
+2. 单路采样 FPS 应接近单摄水平。
+3. 快动作识别不再依赖逐个动作补策略，而是从采样链路上减少漏帧。
+4. 后续如果需要利用 3060 GPU，可再评估将姿态推理迁移到后端 ONNX / TensorRT；当前浏览器 MediaPipe 主要仍吃前端浏览器侧计算能力。
+
+后续实施建议：
+1. 先新增轻量 CameraCaptureView.vue，不改现有 DisplayView 的主体展示逻辑。
+2. 后端 action_server.py 新增 view_frame 协议和 session registry。
+3. RealtimeActionEngine 保留 push_frame / push_dual_frame，同时新增或包装异步双路输入入口。
+4. 用单摄页面分别打开 front / side，记录 10 秒 debug，确认两路 FPS 是否都回到单摄水平。

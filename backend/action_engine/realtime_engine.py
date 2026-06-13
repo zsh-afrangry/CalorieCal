@@ -67,6 +67,8 @@ CORE_LANDMARKS = [
 ]
 
 MIN_VISIBILITY = 0.5
+DUAL_VIEW_VISIBILITY_THRESHOLD = 0.5
+CALORIE_CORE_VISIBILITY_THRESHOLD = 0.7
 
 # ---------------------------------------------------------------------------
 # Geometry helpers (mirror of video_pose_trajectory.py)
@@ -616,6 +618,8 @@ class RealtimeActionEngine:
         self.buffer_max = max(10, int(buffer_sec * fps_estimate))
         self._buffer: deque[dict] = deque(maxlen=self.buffer_max)
         self._prev_landmarks: dict[str, dict[str, float]] | None = None
+        self._prev_landmarks_front: dict[str, dict[str, float]] | None = None
+        self._prev_landmarks_side: dict[str, dict[str, float]] | None = None
         self._cumulative_counts: dict[str, int] = {}
         self._prev_buffer_counts: dict[str, int] = {}
         self._lunge_hold_sec: dict[str, float] = {"left": 0.0, "right": 0.0}
@@ -646,6 +650,9 @@ class RealtimeActionEngine:
         self._prev_frame_ts: float | None = None
         # Previous hip height for Δhip computation
         self._prev_hip_height: float | None = None
+        self._prev_hip_height_front: float | None = None
+        self._prev_hip_height_side: float | None = None
+        self._prev_motion_active_view: str | None = None
         self.specs = self._load_specs(spec_dir)
 
     def _log_count_event(self, action: str, side: str | None, count: int) -> None:
@@ -752,6 +759,8 @@ class RealtimeActionEngine:
     def reset(self) -> None:
         self._buffer.clear()
         self._prev_landmarks = None
+        self._prev_landmarks_front = None
+        self._prev_landmarks_side = None
         self._cumulative_counts = {}
         self._prev_buffer_counts = {}
         self._lunge_hold_sec: dict[str, float] = {"left": 0.0, "right": 0.0}
@@ -773,22 +782,17 @@ class RealtimeActionEngine:
         self._fps_ts_deque: deque[float] = deque(maxlen=30)
         self._prev_frame_ts = None
         self._prev_hip_height = None
+        self._prev_hip_height_front = None
+        self._prev_hip_height_side = None
+        self._prev_motion_active_view = None
 
-    def push_frame(
+    def _run_front_actions(
         self,
-        raw_landmarks: dict[str, Any],
-        timestamp_ms: float | None = None,
-    ) -> dict[str, Any]:
-        t0 = time.perf_counter()
-
-        landmarks = normalise_landmarks(raw_landmarks)
-        features = compute_frame_features(landmarks, self._prev_landmarks)
-        self._prev_landmarks = landmarks
-
-        features["timestamp_ms"] = timestamp_ms or (time.time() * 1000)
-        self._buffer.append(features)
-
-        actions = []
+        landmarks: dict[str, dict[str, float]],
+        features: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Run the existing action state machines against the front-view buffer."""
+        actions: list[dict[str, Any]] = []
         buf = list(self._buffer)
 
         for spec in self.specs:
@@ -893,25 +897,32 @@ class RealtimeActionEngine:
                 "score": round(score, 3) if score is not None else None,
             })
 
-        # --- motion_energy continuous calorie integration ---
-        ts_now = features.get("timestamp_ms") or (time.time() * 1000)
-        core_vis = features.get("core_visible_ratio") or 0.0
+        return actions
 
-        if core_vis >= 0.7:
-            # FPS estimation from frame timestamps
+    def _integrate_motion_calories(
+        self,
+        *,
+        ts_now: float,
+        core_vis: float,
+        motion_e: float,
+        hip_h: float | None,
+        prev_hip_h: float | None,
+    ) -> tuple[float | None, float]:
+        """Accumulate continuous motion calories and return (next_prev_hip, fps)."""
+        fps = 30.0
+
+        if core_vis >= CALORIE_CORE_VISIBILITY_THRESHOLD:
             if self._prev_frame_ts is not None:
                 dt_ms = ts_now - self._prev_frame_ts
-                if 10.0 < dt_ms < 500.0:  # only sane intervals (2–100 fps)
+                if 10.0 < dt_ms < 500.0:  # only sane intervals (2-100 fps)
                     self._fps_ts_deque.append(dt_ms)
             self._prev_frame_ts = ts_now
             fps = (1000.0 / (sum(self._fps_ts_deque) / len(self._fps_ts_deque))
                    if self._fps_ts_deque else 30.0)
 
-            motion_e = features.get("motion_energy") or 0.0
-            hip_h = features.get("hip_height_above_ankles_torso")
-            delta_hip = (abs(hip_h - self._prev_hip_height)
-                         if hip_h is not None and self._prev_hip_height is not None else 0.0)
-            self._prev_hip_height = hip_h
+            delta_hip = (abs(hip_h - prev_hip_h)
+                         if hip_h is not None and prev_hip_h is not None else 0.0)
+            next_prev_hip = hip_h
 
             # Combined intensity: hip displacement (w=3) + motion_energy (w=1)
             intensity = 3.0 * delta_hip + 1.0 * motion_e
@@ -928,32 +939,226 @@ class RealtimeActionEngine:
                 met = 9.0
 
             self._motion_kcal += met * 3.5 * self._weight_kg / 200.0 / fps / 60.0
-        else:
-            self._prev_frame_ts = ts_now
-            self._prev_hip_height = None  # reset on pose loss
+            return next_prev_hip, fps
 
-        # Flush pending events
-        new_events = list(self._pending_events)
-        self._pending_events.clear()
+        self._prev_frame_ts = ts_now
+        return None, fps
 
+    def _build_calorie_summary(self) -> dict[str, Any]:
         event_kcal = sum(self._session_kcal.values())
-        calorie_summary = {
+        return {
             "motion_kcal": round(self._motion_kcal, 3),
             "event_kcal":  round(event_kcal, 3),
             "total_kcal":  round(self._motion_kcal, 3),
             "by_action":   {k: round(v, 3) for k, v in self._session_kcal.items()},
         }
 
+    @staticmethod
+    def _serialise_features(features: dict[str, Any]) -> dict[str, Any]:
+        return {
+            k: (round(v, 4) if isinstance(v, float) else v)
+            for k, v in features.items()
+            if k != "timestamp_ms"
+        }
+
+    @staticmethod
+    def _empty_view_features(timestamp_ms: float) -> dict[str, Any]:
+        return {
+            "timestamp_ms": timestamp_ms,
+            "mean_visibility": None,
+            "core_visible_ratio": 0.0,
+            "motion_energy": 0.0,
+            "hip_height_above_ankles_torso": None,
+        }
+
+    @staticmethod
+    def _select_dual_motion(
+        features_front: dict[str, Any],
+        features_side: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        front_vis = float(features_front.get("core_visible_ratio") or 0.0)
+        side_vis = float(features_side.get("core_visible_ratio") or 0.0)
+        front_motion = float(features_front.get("motion_energy") or 0.0)
+        side_motion = float(features_side.get("motion_energy") or 0.0)
+        front_hip = _safe_float(features_front.get("hip_height_above_ankles_torso"))
+        side_hip = _safe_float(features_side.get("hip_height_above_ankles_torso"))
+
+        if (
+            front_vis >= DUAL_VIEW_VISIBILITY_THRESHOLD and
+            side_vis >= DUAL_VIEW_VISIBILITY_THRESHOLD
+        ):
+            if front_motion >= side_motion:
+                active_view = "front"
+                merged_motion = front_motion
+                merged_hip = front_hip
+            else:
+                active_view = "side"
+                merged_motion = side_motion
+                merged_hip = side_hip
+        elif front_vis >= DUAL_VIEW_VISIBILITY_THRESHOLD:
+            active_view = "front"
+            merged_motion = front_motion
+            merged_hip = front_hip
+        elif side_vis >= DUAL_VIEW_VISIBILITY_THRESHOLD:
+            active_view = "side"
+            merged_motion = side_motion
+            merged_hip = side_hip
+        else:
+            active_view = "none"
+            merged_motion = 0.0
+            merged_hip = None
+
+        merged_core_vis = max(front_vis, side_vis)
+        view_info = {
+            "front_core_vis": round(front_vis, 3),
+            "side_core_vis": round(side_vis, 3),
+            "active_view": active_view,
+            "front_motion_e": round(front_motion, 4),
+            "side_motion_e": round(side_motion, 4),
+            "merged_motion_e": round(merged_motion, 4),
+        }
+        merged_features = {
+            "mean_visibility": _mean([
+                _safe_float(features_front.get("mean_visibility")),
+                _safe_float(features_side.get("mean_visibility")),
+            ]),
+            "core_visible_ratio": merged_core_vis,
+            "motion_energy": merged_motion,
+            "hip_height_above_ankles_torso": merged_hip,
+            "active_view": active_view,
+            "front_core_visible_ratio": front_vis,
+            "side_core_visible_ratio": side_vis,
+        }
+        return merged_features, view_info
+
+    def push_frame(
+        self,
+        raw_landmarks: dict[str, Any],
+        timestamp_ms: float | None = None,
+    ) -> dict[str, Any]:
+        t0 = time.perf_counter()
+
+        landmarks = normalise_landmarks(raw_landmarks)
+        features = compute_frame_features(landmarks, self._prev_landmarks)
+        self._prev_landmarks = landmarks
+        self._prev_landmarks_front = landmarks
+
+        features["timestamp_ms"] = timestamp_ms or (time.time() * 1000)
+        self._buffer.append(features)
+
+        actions = self._run_front_actions(landmarks, features)
+
+        # --- motion_energy continuous calorie integration ---
+        ts_now = features.get("timestamp_ms") or (time.time() * 1000)
+        core_vis = features.get("core_visible_ratio") or 0.0
+
+        self._prev_hip_height, _fps = self._integrate_motion_calories(
+            ts_now=ts_now,
+            core_vis=core_vis,
+            motion_e=features.get("motion_energy") or 0.0,
+            hip_h=features.get("hip_height_above_ankles_torso"),
+            prev_hip_h=self._prev_hip_height,
+        )
+        self._prev_hip_height_front = self._prev_hip_height
+        self._prev_motion_active_view = "front" if self._prev_hip_height is not None else None
+
+        # Flush pending events
+        new_events = list(self._pending_events)
+        self._pending_events.clear()
+
+        calorie_summary = self._build_calorie_summary()
+
         latency_ms = round((time.perf_counter() - t0) * 1000, 2)
         return {
             "actions": actions,
             "count_events": new_events,
             "calorie_summary": calorie_summary,
-            "features": {
-                k: (round(v, 4) if isinstance(v, float) else v)
-                for k, v in features.items()
-                if k != "timestamp_ms"
-            },
+            "features": self._serialise_features(features),
+            "latency_ms": latency_ms,
+            "buffer_size": len(self._buffer),
+        }
+
+    def push_dual_frame(
+        self,
+        landmarks_front: dict[str, Any] | None,
+        landmarks_side: dict[str, Any] | None,
+        timestamp_ms: float | None = None,
+    ) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        ts_now = timestamp_ms or (time.time() * 1000)
+
+        front = normalise_landmarks(landmarks_front) if landmarks_front else None
+        side = normalise_landmarks(landmarks_side) if landmarks_side else None
+
+        if front:
+            features_front = compute_frame_features(front, self._prev_landmarks_front)
+            self._prev_landmarks_front = front
+        else:
+            features_front = self._empty_view_features(ts_now)
+            self._prev_landmarks_front = None
+
+        if side:
+            features_side = compute_frame_features(side, self._prev_landmarks_side)
+            self._prev_landmarks_side = side
+        else:
+            features_side = self._empty_view_features(ts_now)
+            self._prev_landmarks_side = None
+
+        features_front["timestamp_ms"] = ts_now
+        features_side["timestamp_ms"] = ts_now
+
+        # Keep the legacy front-view state in sync for compatibility with helpers
+        # that still use self._prev_landmarks indirectly.
+        self._prev_landmarks = front
+
+        actions: list[dict[str, Any]] = []
+        if front:
+            self._buffer.append(features_front)
+            actions = self._run_front_actions(front, features_front)
+
+        merged_features, view_info = self._select_dual_motion(features_front, features_side)
+        merged_features["timestamp_ms"] = ts_now
+
+        active_view = view_info["active_view"]
+        if active_view == "front":
+            prev_hip = self._prev_hip_height_front
+        elif active_view == "side":
+            prev_hip = self._prev_hip_height_side
+        else:
+            prev_hip = None
+        if active_view != self._prev_motion_active_view:
+            prev_hip = None
+
+        next_prev_hip, _fps = self._integrate_motion_calories(
+            ts_now=ts_now,
+            core_vis=merged_features.get("core_visible_ratio") or 0.0,
+            motion_e=merged_features.get("motion_energy") or 0.0,
+            hip_h=merged_features.get("hip_height_above_ankles_torso"),
+            prev_hip_h=prev_hip,
+        )
+
+        if active_view == "front":
+            self._prev_hip_height_front = next_prev_hip
+            self._prev_hip_height = next_prev_hip
+        elif active_view == "side":
+            self._prev_hip_height_side = next_prev_hip
+            self._prev_hip_height = next_prev_hip
+        else:
+            self._prev_hip_height_front = None
+            self._prev_hip_height_side = None
+            self._prev_hip_height = None
+        self._prev_motion_active_view = active_view if active_view != "none" else None
+
+        new_events = list(self._pending_events)
+        self._pending_events.clear()
+
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return {
+            "actions": actions,
+            "count_events": new_events,
+            "calorie_summary": self._build_calorie_summary(),
+            "features": self._serialise_features(merged_features),
+            "view_info": view_info,
             "latency_ms": latency_ms,
             "buffer_size": len(self._buffer),
         }

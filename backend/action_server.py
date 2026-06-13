@@ -120,6 +120,29 @@ async def action_ws(websocket: WebSocket) -> None:
                 }))
                 continue
 
+            if msg.get("type") == "dual_frame":
+                front = msg.get("front")
+                side = msg.get("side")
+                if not front and not side:
+                    await websocket.send_text(
+                        json.dumps({"error": "invalid dual_frame format"})
+                    )
+                    continue
+                timestamp_ms = (
+                    (front or {}).get("timestamp_ms")
+                    or (side or {}).get("timestamp_ms")
+                )
+                result = engine.push_dual_frame(
+                    landmarks_front=(front or {}).get("landmarks"),
+                    landmarks_side=(side or {}).get("landmarks"),
+                    timestamp_ms=timestamp_ms,
+                )
+                frame_index = msg.get("frame_index")
+                if frame_index is not None:
+                    result["frame_index"] = frame_index
+                await websocket.send_text(json.dumps(result, ensure_ascii=False))
+                continue
+
             landmarks = msg.get("landmarks")
             if not landmarks:
                 await websocket.send_text(

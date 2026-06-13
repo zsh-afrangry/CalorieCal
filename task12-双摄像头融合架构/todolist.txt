@@ -2,7 +2,7 @@
 
 > 状态：待开始
 > 目标：引入侧面摄像头，实现双视角融合的热量计算和动作识别，解决单摄像头遮挡问题。
-> 原则：不做复杂 3D 重建，只做可见度加权融合；保留调试开关；向后兼容单摄像头模式。
+> 原则：不做复杂 3D 重建，第一版采用可见度门槛 + 最大运动信号融合；保留调试开关；向后兼容单摄像头模式。
 > 关键判断：Task12 成功标准是"用户侧身、扭腰时热量计算不中断"，不要求动作识别 100% 准确。
 
 ---
@@ -25,13 +25,13 @@
       → 文件: backend/action_server.py, backend/action_engine/realtime_engine.py
       → 现状: action_server 接收单路 landmarks，调用 engine.push_frame()
       → 评估: 需要新增 dual_frame 消息处理 + engine.push_dual_frame() 方法
-      → 复杂度: 中等（需要双路特征提取 + 可见度加权融合）
+      → 复杂度: 中等（需要双路特征提取 + 可见度门槛 / 最大运动信号融合）
 
 - [x] 1.4 分析热量计算逻辑
       → 文件: backend/action_engine/realtime_engine.py (push_frame 中的 motion_kcal 积分)
       → 现状: 基于单路 motion_energy 和 hip_height 计算 intensity → MET → kcal_increment
       → 评估: 需要融合两路的 motion_energy 和 hip_height
-      → 复杂度: 低（可见度加权平均即可）
+      → 复杂度: 低（可见度门槛 + 取较大运动信号即可）
 
 - [x] 1.5 评估前端性能影响
       → 关键指标: 两个 PoseLandmarker 同时运行的 CPU/GPU 占用、帧率
@@ -40,15 +40,15 @@
 
 - [x] 1.6 总结复杂度评估
       → 前端改造: 中等（需要管理两个 MediaPipe 实例 + 两个 video 元素）
-      → 后端改造: 中等（新增 push_dual_frame + 可见度加权融合）
+      → 后端改造: 中等（新增 push_dual_frame + 视角级 motion 融合）
       → 性能风险: 中等（需要实测，可能需要降低帧率或错峰推理）
       → 总体工作量: 2-3 天（前端 1 天，后端 0.5 天，调试 1 天，文档 0.5 天）
 
 ---
 
-## Phase 2: 后端双视角融合引擎
+## Phase 2: 后端双视角融合引擎 ✅ 已完成（2026-06-13）
 
-- [ ] 2.0 realtime_engine.py 增加双视角独立状态
+- [x] 2.0 realtime_engine.py 增加双视角独立状态
       → **关键问题**: 现有 _prev_landmarks、_prev_hip_height 等状态是单视角设计
       → **问题影响**: 如果 front/side 共享状态，side 的 motion_energy 会用 front 的 _prev_landmarks 计算，导致错误
       → **修正方案**: 分离 front/side 的历史状态
@@ -70,8 +70,10 @@
         self._prev_hip_height_side = None
         ```
       → **推荐方案 B**: 第一版只需分离 prev_landmarks 和 prev_hip_height，其他状态（如动作识别 buffer）仍然只用 front
+      → 已完成: 新增 _prev_landmarks_front/_side、_prev_hip_height_front/_side、_prev_motion_active_view
+      → 已完成: 单摄 push_frame 同步 front 状态，便于单/双摄切换
 
-- [ ] 2.1 realtime_engine.py 新增 push_dual_frame() 方法
+- [x] 2.1 realtime_engine.py 新增 push_dual_frame() 方法
       → 方法签名:
         ```python
         def push_dual_frame(
@@ -88,8 +90,9 @@
         - 用融合后的值计算 intensity → MET → kcal_increment
         - **动作识别只用 front**（见 2.3）
         - 返回 actions (front only)、features (merged)、calorie_summary、view_info
+      → 已完成: 新增 push_dual_frame()，front 进入原有动作 buffer，side 只参与 motion_kcal 融合
 
-- [ ] 2.2 实现改进的融合策略（取较大运动信号）
+- [x] 2.2 实现改进的融合策略（取较大运动信号）
       → **问题**: 原方案的可见度加权会低估运动（例如前后平移时正面投影压扁）
       → **改进策略**: 可见度门槛 + 取较大运动信号
         ```python
@@ -125,8 +128,10 @@
             hip_h_merged = sum(v[2] * v[3] / total_vis for v in valid_views if v[2] is not None)
         ```
       → **推荐方案 A**: 实现简单，符合直觉，不容易低估
+      → 已完成: core_visible_ratio >= 0.5 的视角参与候选，双路可用时采用 motion_energy 较大视角
+      → 已完成: active_view 切换时重置 hip delta 基准，避免 front/side 髋高跨视角相减
 
-- [ ] 2.3 动作识别和热量融合明确分离
+- [x] 2.3 动作识别和热量融合明确分离
       → **第一版明确边界**: 动作识别只用 front，side 只参与 motion_kcal
       → **原因**: 降低风险，热量计算立即受益，动作识别保持稳定
       → **实现**:
@@ -143,8 +148,9 @@
             # ... MET → kcal_increment
         ```
       → **可选优化**（不在第一版范围）: 两路都跑识别，取 score 更高的结果
+      → 已完成: 抽出 _run_front_actions() 复用原有动作识别；push_dual_frame 只用 front 跑动作识别
 
-- [ ] 2.4 返回值新增 view_info 字段（调试用）
+- [x] 2.4 返回值新增 view_info 字段（调试用）
       → **重要**: view_info 是帧级字段，与 actions、calorie_summary 平级，不属于 actions 内部
       → 返回结构:
         ```json
@@ -166,12 +172,15 @@
         - active_view: "front" / "side" / "none"（哪个视角的运动信号被采用）
         - front_motion_e / side_motion_e: 原始运动信号（调试用）
         - merged_motion_e: 融合后的运动信号（实际用于热量计算）
+      → 已完成: push_dual_frame 返回 view_info，与 actions、calorie_summary 平级
+      → 已验证: python3 -m py_compile backend/action_engine/realtime_engine.py backend/action_server.py 通过
+      → 已验证: 引擎级 smoke test 中 side_motion_e 较大时 active_view=side
 
 ---
 
 ## Phase 3: 后端消息处理和向后兼容
 
-- [ ] 3.1 action_server.py 新增 dual_frame 消息处理
+- [x] 3.1 action_server.py 新增 dual_frame 消息处理
       → 消息格式:
         ```json
         {
@@ -199,6 +208,7 @@
             await websocket.send_text(json.dumps(result))
             continue
         ```
+      → 已完成: action_server.py 接收 type="dual_frame" 并调用 engine.push_dual_frame()
 
 - [ ] 3.2 保持单摄像头模式向后兼容
       → 现有消息格式:
@@ -443,16 +453,16 @@
 
 - [ ] 8.2 功能测试：双摄像头正面动作
       → 打开"侧边摄像头"开关
-      → 用户正面深蹲 5 次 → front 主导（权重 > 70%），结果与单摄像头一致
+      → 用户正面深蹲 5 次 → active_view 主要为 front，结果与单摄像头一致
 
 - [ ] 8.3 功能测试：双摄像头侧身场景
       → 用户侧身 90 度（背对正面摄像头）
-      → side 主导（权重 > 70%）
+      → active_view 主要为 side
       → motion_kcal 持续累积，不为 0
 
 - [ ] 8.4 功能测试：双摄像头扭腰场景
       → 用户扭腰、拉伸（两个视角都部分可见）
-      → 权重动态变化（如 60% front + 40% side）
+      → active_view 根据 front_motion_e / side_motion_e 动态变化
       → motion_kcal 合理累积
 
 - [ ] 8.5 性能测试：帧率和 CPU 占用（如果出现性能问题再做）

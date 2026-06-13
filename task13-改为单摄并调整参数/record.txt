@@ -1,0 +1,43 @@
+Task13 修改计划：单摄优先与实时计数稳定化
+
+一、改动工作量评估
+
+整体工作量不大，主要集中在后端实时计数逻辑和前端单摄运行参数。预计属于中小改动：
+1. 后端：把 squat / jumping_jack 的累计计数从 rolling buffer 差分，改成在线事件状态机。
+2. 前端：让动作识别测试优先走单摄路径，减少双摄顺序推理带来的 fps 下降。
+3. 调试：debug_start 支持可选 reset，避免 10 秒日志继承旧 session 计数。
+4. 参数：根据单摄日志调整深蹲阶段响应，比如 smoothing 窗口和 down 兜底条件。
+
+二、原因
+
+当前深蹲识别有两个问题：
+1. 双摄时前端需要在同一个 loop 内顺序跑 front / side 两次 PoseLandmarker，实际送到后端的姿态帧率会下降。之前双摄日志约 8-9fps，单摄日志约 18fps，单摄识别明显更稳定。
+2. 后端 squat 计数当前依赖 rolling buffer 内重新统计出的 cycle 数量，再用 buf_count - prev_buf_count 推累计计数。这个方式适合离线分析，但实时场景里容易受窗口边界和平滑阶段抖动影响，出现漏计或同一次动作附近连续加计数。
+
+三、解决逻辑
+
+1. 动作识别先回到单摄优先，侧摄暂时不参与动作识别，避免性能下降影响阶段判断。
+2. 深蹲阶段判断增加明显下蹲的绝对姿态兜底，例如膝角足够小且可见度达标时允许进入 down，减少低 fps 或平滑带来的阶段滞后。
+3. 计数改为在线状态机：看到 down 后进入 armed，随后稳定回到 stand 才 count + 1，并加入 cooldown 防止同一次动作重复计数。
+4. debug_start 增加 reset 选项。默认不重置训练 session；测试时可显式 reset，让日志里的 count 表示本次测试新增计数。
+
+四、代码方案
+
+1. backend/action_engine/realtime_engine.py
+   - 为 squat / jumping_jack 增加在线计数状态字段，例如 armed、last_count_ts、down_since、stand_since。
+   - 新增通用在线计数 helper，输入当前 stage、timestamp、动作阈值，输出是否新增一次计数。
+   - squat 的 stage 可保留现有 buffer score，但增加 knee angle / visibility 的 down 兜底。
+   - 保留 rolling buffer score 用于阶段和质量参考，但累计 count 不再直接依赖 buf_count 差分。
+
+2. backend/action_server.py
+   - debug_start 读取 reset 参数。
+   - 当 reset=true 时调用 engine.reset() 后再 start_debug_recording()。
+
+3. frontend/src/views/DisplayView.vue
+   - Task13 阶段默认单摄测试动作识别。
+   - 侧摄功能保留，但不作为动作识别验收前提。
+   - 必要时降低或错峰侧摄推理，而不是让双摄同时影响正面动作识别。
+
+4. 参数调整
+   - squat smoothing_window_frames 从 5 评估是否降到 3，或后续改为按实际 fps 自适应。
+   - squat down 兜底建议先保守：core_visible_ratio 达标、mean_knee_angle 明显小于阈值，并持续至少 1-2 帧。

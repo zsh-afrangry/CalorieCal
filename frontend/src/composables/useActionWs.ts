@@ -42,6 +42,7 @@ export type CountEvent = {
   rep_duration_sec: number;
   amplitude: number | null;
   quality: string;
+  advice: string;
   timestamp_ms: number;
   kcal: number;
 };

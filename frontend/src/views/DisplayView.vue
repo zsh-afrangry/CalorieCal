@@ -29,12 +29,15 @@ type ActionTab = {
 };
 
 type CountState = {
-  count:         number;
-  countLeft?:    number;
-  countRight?:   number;
-  stage:         string;
-  score:         number | null;
-  qualityLabel?: string;
+  count:          number;
+  countLeft?:     number;
+  countRight?:    number;
+  stage:          string;
+  score:          number | null;
+  qualityLabel?:  string;
+  standardCount:  number;
+  shallowCount:   number;
+  lastAdvice:     string;
 };
 
 type DurationState = {
@@ -70,14 +73,6 @@ const QUALITY_ZH: Record<number, string> = {
   0.0:  "未达标",
 };
 
-const BACKEND_KEY_MAP: Record<string, string> = {
-  leftShoulder: "LEFT_SHOULDER", rightShoulder: "RIGHT_SHOULDER",
-  leftElbow:    "LEFT_ELBOW",    rightElbow:    "RIGHT_ELBOW",
-  leftWrist:    "LEFT_WRIST",    rightWrist:    "RIGHT_WRIST",
-  leftHip:      "LEFT_HIP",      rightHip:      "RIGHT_HIP",
-  leftKnee:     "LEFT_KNEE",     rightKnee:     "RIGHT_KNEE",
-  leftAnkle:    "LEFT_ANKLE",    rightAnkle:    "RIGHT_ANKLE",
-};
 
 // ---- State -----------------------------------------------------------------
 
@@ -183,17 +178,6 @@ const currentCalories = computed(() =>
 const activeElapsedSec = computed(() => elapsedMs.value / 1000);
 
 // ---- Backend result handling -----------------------------------------------
-// NOTE: Old single-camera inference callback disabled, now using dual camera system
-// mp.setOnInference((pose) => {
-//   if (!pose) return;
-//   const named: Record<string, { x: number; y: number; z: number; visibility: number }> = {};
-//   const idx = mp.LANDMARK_INDEX;
-//   for (const [camel, backendName] of Object.entries(BACKEND_KEY_MAP)) {
-//     const lm = pose[idx[camel as keyof typeof idx]];
-//     if (lm) named[backendName] = { x: lm.x, y: lm.y, z: lm.z ?? 0, visibility: lm.visibility ?? 0 };
-//   }
-//   ws.sendLandmarks(named, performance.now());
-// });
 
 watch(ws.actions, (newActions) => {
   for (const a of newActions) {
@@ -205,27 +189,53 @@ watch(ws.actions, (newActions) => {
         holdSecRight: (a as any).hold_sec_right ?? 0,
       };
     } else if (a.name === "clap_under_knee") {
+      const prev = actionStates.value["clap_under_knee"] as CountState | undefined;
       actionStates.value["clap_under_knee"] = {
-        count:      a.count,
-        countLeft:  (a as any).count_left  ?? 0,
-        countRight: (a as any).count_right ?? 0,
-        stage:      a.stage,
-        score:      a.score,
+        count:         a.count,
+        countLeft:     (a as any).count_left  ?? 0,
+        countRight:    (a as any).count_right ?? 0,
+        stage:         a.stage,
+        score:         a.score,
+        standardCount: prev?.standardCount ?? 0,
+        shallowCount:  prev?.shallowCount  ?? 0,
+        lastAdvice:    prev?.lastAdvice    ?? "",
       };
     } else if (a.name === "high_knee") {
+      const prev = actionStates.value["high_knee"] as CountState | undefined;
       actionStates.value["high_knee"] = {
-        count:      a.count,
-        countLeft:  (a as any).count_left  ?? 0,
-        countRight: (a as any).count_right ?? 0,
-        stage:      a.stage,
-        score:      a.score,
+        count:         a.count,
+        countLeft:     (a as any).count_left  ?? 0,
+        countRight:    (a as any).count_right ?? 0,
+        stage:         a.stage,
+        score:         a.score,
+        standardCount: prev?.standardCount ?? 0,
+        shallowCount:  prev?.shallowCount  ?? 0,
+        lastAdvice:    prev?.lastAdvice    ?? "",
       };
     } else {
+      const prev = actionStates.value[a.name] as CountState | undefined;
       actionStates.value[a.name] = {
-        count: a.count,
-        stage: a.stage,
-        score: a.score,
+        count:         a.count,
+        stage:         a.stage,
+        score:         a.score,
+        standardCount: prev?.standardCount ?? 0,
+        shallowCount:  prev?.shallowCount  ?? 0,
+        lastAdvice:    prev?.lastAdvice    ?? "",
       };
+    }
+  }
+});
+
+// Watch count events — update quality counts and advice per action
+watch(ws.countEvents, (events) => {
+  for (const ev of events) {
+    const state = actionStates.value[ev.action] as CountState | undefined;
+    if (!state) continue;
+    if (ev.quality === "standard") {
+      state.standardCount = (state.standardCount ?? 0) + 1;
+    } else if (ev.quality === "shallow") {
+      state.shallowCount = (state.shallowCount ?? 0) + 1;
+      if (ev.advice) state.lastAdvice = ev.advice;
     }
   }
 });
@@ -258,7 +268,7 @@ function switchTab(key: string) {
   elapsedMs.value      = 0;
   actionStates.value[key] = key === "lunge"
     ? { stage: "idle", score: null, holdSecLeft: 0, holdSecRight: 0 }
-    : { count: 0, stage: "unknown", score: null };
+    : { count: 0, stage: "unknown", score: null, standardCount: 0, shallowCount: 0, lastAdvice: "" };
   ws.disconnect();
   setTimeout(() => ws.connect(), 200);
 }
@@ -570,11 +580,8 @@ onMounted(async () => {
     await startDualCamera();
   }
 
-  // Keep old single camera system for backward compatibility (will be removed later)
-  // await Promise.all([mp.loadPoseLandmarker(), mp.loadHandLandmarker()]);
-  // if (videoRef.value && canvasRef.value) {
-  //   await mp.startCamera(videoRef.value, canvasRef.value);
-  // }
+  // Load MediaPipe models for status display only (no camera inference)
+  await mp.loadPoseLandmarker();
 });
 
 onUnmounted(() => {
@@ -999,16 +1006,22 @@ watch(sideDeviceId, (val) => {
         </p>
       </div>
 
-      <!-- Stage detail (for squat: quality breakdown placeholder) -->
-      <template v-if="activeTabDef.key === 'squat'">
+      <!-- Quality breakdown + advice (count-mode actions) -->
+      <template v-if="activeTabDef.mode === 'count' && activeState && 'standardCount' in activeState">
         <div class="data-divider" />
         <div class="data-section">
           <p class="data-section__label">质量分布</p>
           <div class="quality-pills">
-            <span class="cc-pill">标准 -- 次</span>
-            <span class="cc-pill cc-pill--neutral">浅蹲 -- 次</span>
+            <span class="cc-pill cc-pill--good">标准 {{ activeState.standardCount }} 次</span>
+            <span class="cc-pill cc-pill--neutral">较浅 {{ activeState.shallowCount }} 次</span>
           </div>
-          <p class="data-section__sub cc-muted">计算逻辑待定</p>
+          <p
+            v-if="activeState.lastAdvice"
+            class="advice-text"
+            aria-live="polite"
+          >
+            {{ activeState.lastAdvice }}
+          </p>
         </div>
       </template>
 

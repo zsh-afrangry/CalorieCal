@@ -60,6 +60,18 @@
   border-color: rgba(107, 114, 128, 0.3);
 }
 
+.advice-text {
+  font-size: 12px;
+  color: #fbbf24;
+  line-height: 1.4;
+  padding: 6px 8px;
+  background: rgba(251, 191, 36, 0.08);
+  border-left: 2px solid #fbbf24;
+  border-radius: 0 4px 4px 0;
+  margin-top: 6px;
+  display: block;
+}
+
 /* ---- Buttons ---- */
 .cc-btn-primary {
   background: #22c55e;

@@ -739,8 +739,22 @@ class RealtimeActionEngine:
 
         # quality (squat uses amplitude gate; others default to standard)
         quality = "standard"
-        if action == "squat" and amplitude is not None:
-            quality = "standard" if amplitude >= 0.30 else "shallow"
+        advice = ""
+        if action == "squat":
+            knee_vals = _buf_values(buf, "mean_knee_angle")
+            knee_min = min(knee_vals) if knee_vals else None
+            knee_range = (max(knee_vals) - min(knee_vals)) if len(knee_vals) >= 2 else None
+            hip_range = amplitude  # already computed above
+
+            if knee_min is not None and knee_min > 140.0:
+                quality = "shallow"
+                advice = "下蹲更深一点，保持膝盖明显弯曲"
+            elif knee_range is not None and knee_range < 45.0:
+                quality = "shallow"
+                advice = "下蹲和起身幅度再明显一点"
+            elif hip_range is not None and hip_range < 0.30:
+                quality = "shallow"
+                advice = "髋部下降幅度再明显一点"
 
         # calorie
         kcal = 0.0
@@ -760,6 +774,7 @@ class RealtimeActionEngine:
             "rep_duration_sec": rep_duration_sec,
             "amplitude":        amplitude,
             "quality":          quality,
+            "advice":           advice,
             "kcal":             round(kcal, 4),
             "timestamp_ms":     round(timestamp_ms, 1),
         }

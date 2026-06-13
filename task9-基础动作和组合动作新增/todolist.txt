@@ -175,3 +175,82 @@
 
 - [ ] 5.3 构建验证
       → npm.cmd --prefix frontend run build
+
+## Phase 6: 动作标准度评分和建议反馈
+
+> 目标：当用户动作不标准时，实时给出具体建议（"蹲得更低"而非只计一下"浅蹲"）。
+> 原则：不新建模块，复用已有的 count_event 通路；先做深蹲，再逐动作推广。
+
+### 代码现状分析（2026-06-13）
+
+**已有的质量评估基础：**
+- `realtime_engine.py:_make_count_event` (L710-765)
+  - 深蹲：每次计数时已判断 `standard` vs `shallow`，依据是 buffer 里 `hip_height_range >= 0.30`
+  - `count_event` 已包含 `quality` 字段，WebSocket 已将 `count_events` 返回给前端
+  - 问题：**advice 文本缺失**，只有 `quality:"shallow"` 但没有告诉用户为什么 / 怎么改
+- `offline_action_state_machine.py:squat_quality_from_summary` (L321-371)
+  - 离线分析已有完整的三级判断和 advice 文本：
+    - `knee_angle > 140°` → "下蹲更深一点，保持膝盖明显弯曲"
+    - `knee_range < 45°` → "下蹲和起身幅度再明显一点"
+    - `hip_range < 0.30` → "髋部下降幅度再明显一点"
+  - 问题：此逻辑**未被实时引擎复用**
+- `high_knee` / `clap_under_knee`：`_score_high_knee_buffer` 已读取 spec 里的 `quality_scoring.levels`，count_event 也已有 quality 分数（0-1），但也没有 advice
+
+**前端现状：**
+- `DisplayView.vue` 的 `TABS` 和右侧面板已支持 count/duration 两种模式
+- WebSocket 返回的 `count_events` 数组已被 `useActionWs.ts` 透传，但 **DisplayView 没有解析 quality 和 advice 字段并展示**
+- 目前计数只显示一个数字，没有质量标签和建议文本
+
+**数据集验证（深蹲正面）：**
+- 正样本1（标准）：knee_min=75°, hip_range=0.688 → 应判 standard
+- 正样本2（较浅）：knee_min=116°, hip_range=0.554 → 应判 shallow + "蹲得更低"
+- 正样本3（最浅）：knee_min=117°, hip_range=0.397 → 应判 shallow + "蹲得更低"
+- 混淆（弯腰不弯腿）：knee_min=125°, hip_range异常 → 应判 shallow + "膝盖需要弯曲"
+
+---
+
+### 6.1 深蹲：后端补充 advice 文本
+
+- [ ] 在 `realtime_engine.py:_make_count_event` 的深蹲 quality 判断后，从 buffer 中取 `mean_knee_angle`（min/range）和 `hip_height_above_ankles_torso`（range）
+- [ ] 加入三级 advice 判断逻辑，复用离线 `squat_quality_from_summary` 的阈值：
+  - `knee_min > 140°` → advice = "下蹲更深一点，保持膝盖明显弯曲"
+  - `knee_range < 45°` → advice = "下蹲和起身幅度再明显一点"
+  - `hip_range < 0.30` → advice = "髋部下降幅度再明显一点"
+  - 其他情况 → advice = "动作幅度再完整一点"
+- [ ] `count_event` 的 `advice` 字段补上（standard 时为空字符串）
+- [ ] 注意：实时 buffer 取的是最近 3 秒，不是整个视频；knee_min 取 buffer 里的最小值，knee_range 取 max-min，hip_range 同理
+
+### 6.2 深蹲：前端展示 quality 和 advice
+
+- [ ] `DisplayView.vue`：监听 WebSocket 的 `count_events`（已有），解析最新的 squat count_event
+- [ ] 在深蹲计数旁边显示质量标签：standard → 绿色"标准"，shallow → 橙色"加深"
+- [ ] advice 文本在计数更新后展示 3-4 秒后淡出（不用持续显示，否则干扰）
+- [ ] 样式要求：简洁、不抢主界面，建议放在计数数字下方一行
+
+### 6.3 深蹲：离线验证
+
+- [ ] 用 `recognize_recorded_actions.py` 跑深蹲正面样本，确认 count_event 里 advice 文本正确
+  - 正样本1 → advice = ""（标准）
+  - 正样本2/3 → advice = "下蹲更深一点，保持膝盖明显弯曲"（knee_min ≈ 116°）
+  - 混淆 → 不计数（状态机不触发），无 advice
+- [ ] 构建验证：`npm run build` / `python -m py_compile backend/action_engine/realtime_engine.py`
+
+### 6.4 开合跳：后端补充 advice（后续动作，暂不实施）
+
+- [ ] 依据：`wrist_spread_range < 1.5` → "手臂打开幅度不够"；`foot_spread_range < 0.5` → "双脚打开幅度不够"
+- [ ] 来源：jumping_jack.json 的 `front_view_gates` 已有这两个阈值，直接读 spec
+
+### 6.5 高抬腿：后端补充 advice（后续动作，暂不实施）
+
+- [ ] 依据：`hip_angle_at_peak > 120°` → "抬腿高度不够，尝试大腿高于水平"；`opposite_knee_angle < 145°` → "支撑腿膝盖保持伸直"
+- [ ] 来源：high_knee.json 的 `quality_scoring.levels` 已有完整分级
+
+### 6.6 弓步压腿：后端补充 advice（后续动作，暂不实施）
+
+- [ ] 依据：`front_knee_angle > 135°` → "前腿压得更低，膝盖弯曲到90°"；`z_diff` 不满足 → "脚步前后分开幅度不够"
+- [ ] 来源：lunge.json 的 `quality_scoring.levels` 和 `hold_state_machine` 已有阈值
+
+### 6.7 胯下击掌：后端补充 advice（后续动作，暂不实施）
+
+- [ ] 依据：`knee_height_vs_hip < 0.1` → "抬腿幅度不够，膝盖需过髋"；`wrist_spread > 1.0` → "双手在膝盖下方合拢"
+- [ ] 来源：clap_under_knee.json 的 `quality_scoring` 已有分级阈值

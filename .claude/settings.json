@@ -17,7 +17,12 @@
       "Bash(python3 -m py_compile /home/afrangry/桌面/CalorieCal/backend/action_engine/realtime_engine.py)",
       "Bash(python3 -m py_compile /home/afrangry/桌面/CalorieCal/backend/action_engine/realtime_engine.py /home/afrangry/桌面/CalorieCal/backend/action_server.py)",
       "Bash(python3)",
-      "Bash(python3 -m py_compile backend/action_engine/realtime_engine.py)"
+      "Bash(python3 -m py_compile backend/action_engine/realtime_engine.py)",
+      "Bash(python3 -c \"import sys,json; [print\\(json.dumps\\(json.loads\\(l\\), ensure_ascii=False, indent=2\\)\\) for l in sys.stdin]\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({'feature_stats': {k: {'min': v['min'], 'max': v['max'], 'range': v['range'], 'mean': v['mean']} for k,v in d['feature_stats'].items\\(\\) if k in ['mean_knee_angle','left_knee_angle','right_knee_angle','left_hip_angle','right_hip_angle','hip_height_above_ankles_torso','motion_energy']}}, indent=2\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 recognize_recorded_actions.py datasets/pose/videos/人物1_深蹲_正面_正样本)",
+      "Bash(npm --prefix frontend run build)"
     ]
   }
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { useRoute } from "vue-router";
 
 const navItems = [
   { to: "/pose", label: "姿态检测", caption: "实时调试" },
@@ -8,10 +9,16 @@ const navItems = [
 ];
 
 const isSidebarCollapsed = ref(false);
+const route = useRoute();
 </script>
 
 <template>
+  <!-- Fullscreen layout for fitness UI routes (no sidebar) -->
+  <RouterView v-if="route.meta.fullscreen" />
+
+  <!-- Sidebar layout for debug/dev routes -->
   <div
+    v-else
     class="root-layout"
     :class="{ 'sidebar-collapsed': isSidebarCollapsed }"
   >

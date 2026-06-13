@@ -228,6 +228,149 @@ def summary_rules_pass(row: dict[str, Any], spec: dict[str, Any], view: str) -> 
     return True, True, "; ".join(reasons)
 
 
+def squat_total_rules_pass(row: dict[str, Any], spec: dict[str, Any], view: str) -> tuple[bool, bool, str]:
+    """Looser squat gate for counting all squat-like reps before quality grading."""
+    if spec.get("action_name") != "squat":
+        return summary_rules_pass(row, spec, view)
+
+    view_rule = spec.get("summary_rules", {}).get(view)
+    if not view_rule:
+        return False, False, f"unsupported view {view}"
+    if not view_rule.get("enabled", False):
+        return False, False, f"disabled view {view}: {view_rule.get('reason', 'no reason')}"
+
+    quality = view_rule.get("quality_gates", {})
+    for feature, threshold in [
+        ("detected_ratio", quality.get("detected_ratio_min")),
+        ("mean_visibility", quality.get("mean_visibility_min")),
+        ("mean_core_visible_ratio", quality.get("mean_core_visible_ratio_min")),
+    ]:
+        if threshold is None:
+            continue
+        ok, reason = check_rule(row, {"feature": feature, "op": ">=", "value": threshold})
+        if not ok:
+            return True, False, f"quality gate failed: {reason}"
+
+    relaxed_rules_by_view: dict[str, list[dict[str, Any]]] = {
+        "front": [
+            {
+                "feature": "mean_knee_angle_min",
+                "op": "<=",
+                "value": 150.0,
+                "reason": "Count shallow squat-like reps, but reject near-straight-leg bending.",
+            },
+            {
+                "feature": "mean_knee_angle_range",
+                "op": ">=",
+                "value": 35.0,
+                "reason": "Require a visible knee-flexion cycle for total squat count.",
+            },
+            {
+                "feature": "hip_height_range",
+                "op": ">=",
+                "value": 0.22,
+                "reason": "Require visible hip drop for total squat count.",
+            },
+        ],
+        "side": [
+            {
+                "feature": "mean_knee_angle_min",
+                "op": "<=",
+                "value": 80.0,
+                "reason": "Count side-view shallow squat-like reps, but reject bend-over-only motion.",
+            },
+            {
+                "feature": "mean_knee_angle_range",
+                "op": ">=",
+                "value": 60.0,
+                "reason": "Require a visible side-view knee-flexion cycle.",
+            },
+            {
+                "feature": "motion_energy_mean",
+                "op": ">=",
+                "value": 0.008,
+                "reason": "Reject near-static side samples.",
+            },
+        ],
+    }
+    relaxed_rules = relaxed_rules_by_view.get(view)
+    if not relaxed_rules:
+        return True, False, f"unsupported relaxed squat total gate for view {view}"
+
+    # Keep hard rejects that protect against obvious tracking instability.
+    for rule in view_rule.get("reject_any", []):
+        feature = str(rule.get("feature"))
+        if view == "front" and feature == "mean_knee_angle_min":
+            continue
+        if view == "side" and feature == "mean_knee_angle_min":
+            continue
+        ok, reason = check_rule(row, rule)
+        if ok:
+            return True, False, f"reject rule hit: {reason}"
+
+    reasons = []
+    for rule in relaxed_rules:
+        ok, reason = check_rule(row, rule)
+        if not ok:
+            return True, False, f"total-count rule failed: {reason}"
+        reasons.append(reason)
+
+    return True, True, "; ".join(reasons)
+
+
+def squat_quality_from_summary(
+    row: dict[str, Any],
+    view: str,
+    standard_passed: bool,
+    standard_reason: str,
+) -> dict[str, Any]:
+    """Classify a counted squat-like rep into standard or shallow/insufficient depth."""
+    if standard_passed:
+        return {
+            "quality": "standard",
+            "quality_reason": "standard_rules_passed",
+            "advice": "",
+        }
+
+    knee_min = safe_float(row.get("mean_knee_angle_min"))
+    knee_range = safe_float(row.get("mean_knee_angle_range"))
+    hip_range = safe_float(row.get("hip_height_range"))
+
+    if view == "front":
+        if knee_min is not None and knee_min > 140.0:
+            reason = "knee_angle_not_low_enough"
+            advice = "下蹲更深一点，保持膝盖明显弯曲"
+        elif knee_range is not None and knee_range < 45.0:
+            reason = "knee_flexion_range_not_enough"
+            advice = "下蹲和起身幅度再明显一点"
+        elif hip_range is not None and hip_range < 0.30:
+            reason = "hip_drop_not_enough"
+            advice = "髋部下降幅度再明显一点"
+        else:
+            reason = "standard_gate_failed"
+            advice = "动作幅度再完整一点"
+    elif view == "side":
+        if knee_min is not None and knee_min > 65.0:
+            reason = "knee_angle_not_low_enough"
+            advice = "下蹲更深一点，保持膝盖明显弯曲"
+        elif knee_range is not None and knee_range < 85.0:
+            reason = "knee_flexion_range_not_enough"
+            advice = "下蹲和起身幅度再明显一点"
+        else:
+            reason = "standard_gate_failed"
+            advice = "动作幅度再完整一点"
+    else:
+        reason = "standard_gate_failed"
+        advice = "动作幅度再完整一点"
+
+    return {
+        "quality": "shallow",
+        "quality_reason": reason,
+        "advice": advice,
+        "standard_gate_reason": standard_reason,
+    }
+
+
 def normalize(value: float | None, min_value: float | None, max_value: float | None, inverse: bool = False) -> float | None:
     if value is None or min_value is None or max_value is None:
         return None
@@ -300,7 +443,11 @@ def count_cycles(stages: list[str], low_stage: str, high_stage: str, min_high_ho
     return count
 
 
-def score_squat(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[float | None], list[str], int]:
+def score_squat_with_thresholds(
+    rows: list[dict[str, str]],
+    spec: dict[str, Any],
+    stage_thresholds: dict[str, Any] | None = None,
+) -> tuple[list[float | None], list[str], int]:
     knee_values = values(rows, "mean_knee_angle")
     hip_values = values(rows, "hip_height_above_ankles_torso")
     knee_min = min(knee_values) if knee_values else None
@@ -328,7 +475,7 @@ def score_squat(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[
     params = spec.get("frame_state_machine", {})
     window = int(params.get("smoothing_window_frames", 5))
     scores = smooth(scores, window)
-    thresholds = params.get("stage_thresholds", {})
+    thresholds = stage_thresholds or params.get("stage_thresholds", {})
     stages = stage_from_scores(
         scores,
         float(thresholds.get("stand_max", 0.20)),
@@ -346,6 +493,20 @@ def score_squat(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[
         int(params.get("min_return_to_stand_frames", 2)),
     )
     return scores, stages, count
+
+
+def score_squat(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[float | None], list[str], int]:
+    return score_squat_with_thresholds(rows, spec)
+
+
+def score_squat_total(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[float | None], list[str], int]:
+    params = spec.get("frame_state_machine", {})
+    thresholds = dict(params.get("stage_thresholds", {}))
+    total_thresholds = dict(params.get("total_count_stage_thresholds", {}))
+    thresholds.update(total_thresholds)
+    thresholds.setdefault("stand_max", 0.20)
+    thresholds.setdefault("down_min", 0.58)
+    return score_squat_with_thresholds(rows, spec, thresholds)
 
 
 def score_jumping_jack(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[float | None], list[str], int]:
@@ -404,6 +565,13 @@ def run_state_machine(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple
     if action == "jumping_jack":
         return score_jumping_jack(rows, spec)
     return [None] * len(rows), ["unsupported"] * len(rows), 0
+
+
+def run_total_count_state_machine(rows: list[dict[str, str]], spec: dict[str, Any]) -> tuple[list[float | None], list[str], int]:
+    action = spec.get("action_name")
+    if action == "squat":
+        return score_squat_total(rows, spec)
+    return run_state_machine(rows, spec)
 
 
 def expected_positive(meta: dict[str, str], spec: dict[str, Any]) -> bool:

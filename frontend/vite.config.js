@@ -1,7 +1,11 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import basicSsl from '@vitejs/plugin-basic-ssl';
 export default defineConfig({
-    plugins: [vue()],
+    plugins: [
+        vue(),
+        basicSsl() // 启用基础 SSL
+    ],
     server: {
         host: '0.0.0.0', // 允许局域网访问
         cors: true, // 允许跨域

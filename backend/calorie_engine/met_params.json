@@ -1,0 +1,97 @@
+{
+  "_comment": "MET values from Compendium of Physical Activities 2011 (Ainsworth et al.) where available; estimated otherwise.",
+  "_formula": "kcal_per_rep = MET_eff * 3.5 * weight_kg * rep_duration_sec / (200 * 60)",
+  "_formula_lunge": "kcal_lunge = MET_eff * 3.5 * weight_kg * hold_sec / (200 * 60)",
+  "global_calibration_factor": 1.0,
+
+  "squat": {
+    "met_base": 5.0,
+    "source": "Compendium 2011 code 02054 (resistance training, weight lifting)",
+    "speed_factor": {
+      "fast_threshold_sec": 2.0,
+      "fast_bonus": 1.3,
+      "slow_threshold_sec": 4.0,
+      "slow_penalty": 0.8,
+      "default": 1.0
+    },
+    "depth_factor": {
+      "standard": 1.0,
+      "shallow": 0.7,
+      "unknown": 0.85
+    },
+    "rep_duration_default_sec": 3.0,
+    "rep_duration_min_sec": 0.8,
+    "rep_duration_max_sec": 8.0
+  },
+
+  "jumping_jack": {
+    "met_base": 8.0,
+    "source": "Compendium 2011 code 02046 (calisthenics, vigorous)",
+    "speed_factor": {
+      "fast_threshold_sec": 1.0,
+      "fast_bonus": 1.2,
+      "slow_threshold_sec": 2.0,
+      "slow_penalty": 0.9,
+      "default": 1.0
+    },
+    "depth_factor": {
+      "standard": 1.0,
+      "unknown": 1.0
+    },
+    "rep_duration_default_sec": 1.2,
+    "rep_duration_min_sec": 0.4,
+    "rep_duration_max_sec": 4.0
+  },
+
+  "lunge": {
+    "met_base": 4.0,
+    "source": "Estimated, similar to walking lunges Compendium code 02049",
+    "hold_depth_factor": {
+      "excellent": 1.2,
+      "good": 1.0,
+      "fair": 0.8,
+      "invalid": 0.0,
+      "unknown": 0.9
+    }
+  },
+
+  "high_knee": {
+    "met_base": 7.0,
+    "source": "Estimated, similar to running in place Compendium code 02048",
+    "speed_factor": {
+      "fast_threshold_sec": 0.5,
+      "fast_bonus": 1.2,
+      "slow_threshold_sec": 1.2,
+      "slow_penalty": 0.85,
+      "default": 1.0
+    },
+    "depth_factor": {
+      "excellent": 1.2,
+      "good": 1.0,
+      "fair": 0.7,
+      "unknown": 0.9
+    },
+    "rep_duration_default_sec": 0.7,
+    "rep_duration_min_sec": 0.2,
+    "rep_duration_max_sec": 3.0
+  },
+
+  "clap_under_knee": {
+    "met_base": 7.5,
+    "source": "Estimated, similar to jumping drills",
+    "speed_factor": {
+      "fast_threshold_sec": 0.8,
+      "fast_bonus": 1.1,
+      "slow_threshold_sec": 1.8,
+      "slow_penalty": 0.9,
+      "default": 1.0
+    },
+    "depth_factor": {
+      "standard": 1.0,
+      "unknown": 1.0
+    },
+    "rep_duration_default_sec": 1.0,
+    "rep_duration_min_sec": 0.3,
+    "rep_duration_max_sec": 3.0
+  }
+}

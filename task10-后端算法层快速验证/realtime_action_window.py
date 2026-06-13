@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,8 @@ DEFAULT_LOG_DIR = SCRIPT_DIR / "datasets" / "pose" / "realtime_logs"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run realtime Task10 action validation from a webcam.")
-    parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument("--camera", default="auto", help="OpenCV camera index, device path, or auto.")
+    parser.add_argument("--list-cameras", action="store_true", help="Probe /dev/video* and camera indexes, then exit.")
     parser.add_argument("--view", choices=["front", "side", "diagonal"], default="front")
     parser.add_argument(
         "--backend",
@@ -72,6 +74,99 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Failed to create unique path for {path}")
+
+
+def import_cv2_only() -> Any:
+    try:
+        import cv2  # type: ignore
+    except ImportError as exc:
+        print(
+            "Missing dependency: opencv-python\n\n"
+            "Install it in your conda environment:\n"
+            "  pip install opencv-python\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+    return cv2
+
+
+def camera_source(value: str) -> int | str:
+    value = str(value).strip()
+    if value.isdigit():
+        return int(value)
+    return value
+
+
+def apply_camera_settings(cv2: Any, cap: Any, args: argparse.Namespace) -> None:
+    if args.camera_fourcc:
+        fourcc_text = args.camera_fourcc[:4].ljust(4)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_text))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
+    cap.set(cv2.CAP_PROP_FPS, args.camera_fps)
+
+
+def open_camera(cv2: Any, args: argparse.Namespace) -> tuple[Any, int | str]:
+    if str(args.camera).strip().lower() != "auto":
+        source = camera_source(args.camera)
+        cap = cv2.VideoCapture(source)
+        apply_camera_settings(cv2, cap, args)
+        return cap, source
+
+    candidates: list[int | str] = []
+    candidates.extend(str(path) for path in sorted(Path("/dev").glob("video*"), key=lambda p: p.name))
+    candidates.extend(range(0, 10))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        cap = cv2.VideoCapture(candidate)
+        apply_camera_settings(cv2, cap, args)
+        if cap.isOpened():
+            ok, _frame = cap.read()
+            if ok:
+                print(f"Auto camera selected: {candidate}")
+                return cap, candidate
+        cap.release()
+
+    cap = cv2.VideoCapture(0)
+    return cap, 0
+
+
+def list_camera_candidates(cv2: Any, max_index: int = 10) -> None:
+    print("Device paths:")
+    paths = sorted(Path("/dev").glob("video*"), key=lambda p: p.name)
+    if not paths:
+        print("  none found under /dev/video*")
+    for path in paths:
+        cap = cv2.VideoCapture(str(path))
+        opened = cap.isOpened()
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) if opened else 0
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0) if opened else 0
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if opened else 0.0
+        cap.release()
+        status = "ok" if opened else "closed"
+        print(f"  {path}: {status} {width}x{height} fps={fps:.1f}")
+
+    print("")
+    print("OpenCV index probe:")
+    found = False
+    for index in range(max_index + 1):
+        cap = cv2.VideoCapture(index)
+        opened = cap.isOpened()
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) if opened else 0
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0) if opened else 0
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if opened else 0.0
+        cap.release()
+        status = "ok" if opened else "closed"
+        print(f"  index {index}: {status} {width}x{height} fps={fps:.1f}")
+        found = found or opened
+    if not found:
+        print("")
+        print("No OpenCV camera index opened. Try a /dev/videoX path or check USB/privacy permissions.")
 
 
 def safe_float(value: Any) -> float | None:
@@ -165,8 +260,17 @@ class OnlineCounter:
         self.high_run = 0
         self.low_run = 0
         self.last_count_timestamp = None
+        self.count_events: list[dict[str, Any]] = []
+        self.quality_counts: defaultdict[str, int] = defaultdict(int)
 
-    def update(self, stage: str, can_count: bool, timestamp_sec: float) -> bool:
+    def update(
+        self,
+        stage: str,
+        can_count: bool,
+        timestamp_sec: float,
+        frame_index: int,
+        event_data: dict[str, Any] | None = None,
+    ) -> bool:
         counted = False
         if stage == self.high_stage:
             self.high_run += 1
@@ -181,6 +285,16 @@ class OnlineCounter:
                     self.count += 1
                     self.last_count_timestamp = timestamp_sec
                     counted = True
+                    event = {
+                        "count": self.count,
+                        "timestamp_sec": timestamp_sec,
+                        "frame_index": frame_index,
+                    }
+                    if event_data:
+                        event.update(event_data)
+                    quality = str(event.get("quality") or "counted")
+                    self.quality_counts[quality] += 1
+                    self.count_events.append(event)
                 self.seen_high = False
         else:
             self.high_run = 0
@@ -279,7 +393,8 @@ def draw_panel(
         score_text = "n/a" if score is None else f"{score:.2f}"
         count = result["count"]
         supported = result["supported"]
-        gate_ok = result["summary_rules_passed"]
+        gate_ok = result.get("count_rules_passed", result["summary_rules_passed"])
+        quality = result.get("quality")
         color = score_color(score, gate_ok, supported)
         if not supported:
             status = "unsupported"
@@ -287,10 +402,11 @@ def draw_panel(
             status = "gate-ok"
         else:
             status = "gated"
+        quality_text = f" {quality}" if action == "squat" and quality else ""
         put_text(
             cv2,
             frame,
-            f"{action}: {status} stage={stage} score={score_text} count={count}",
+            f"{action}: {status} stage={stage} score={score_text} count={count}{quality_text}",
             14,
             y,
             color,
@@ -322,17 +438,35 @@ def evaluate_actions(
     for spec in specs:
         action = str(spec.get("action_name"))
         supported, summary_passed, reason = action_sm.summary_rules_pass(summary_row, spec, view)
-        scores, stages, rolling_cycles = action_sm.run_state_machine(rows, spec)
+        count_supported = supported
+        count_passed = summary_passed
+        count_reason = reason
+        event_data = None
+        if action == "squat":
+            count_supported, count_passed, count_reason = action_sm.squat_total_rules_pass(summary_row, spec, view)
+            event_data = action_sm.squat_quality_from_summary(summary_row, view, summary_passed, reason)
+        scores, stages, rolling_cycles = action_sm.run_total_count_state_machine(rows, spec)
         score = next((x for x in reversed(scores) if x is not None), None)
         stage = next((x for x in reversed(stages) if x != "unknown"), stages[-1] if stages else "unknown")
         counter = counters[action]
-        counted = counter.update(stage, bool(supported and summary_passed), timestamp_sec)
+        frame_index = int(rows[-1].get("frame_index") or 0)
+        counted = counter.update(
+            stage,
+            bool(count_supported and count_passed),
+            timestamp_sec,
+            frame_index,
+            event_data,
+        )
         results.append(
             {
                 "action": action,
                 "supported": supported,
                 "summary_rules_passed": summary_passed,
                 "reason": reason,
+                "count_rules_passed": count_passed,
+                "count_reason": count_reason,
+                "quality": event_data.get("quality") if event_data else None,
+                "quality_reason": event_data.get("quality_reason") if event_data else None,
                 "stage": stage,
                 "score": score,
                 "rolling_cycles": rolling_cycles,
@@ -352,19 +486,21 @@ def write_log_line(log_file: Any, item: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.list_cameras:
+        cv2 = import_cv2_only()
+        list_camera_candidates(cv2)
+        return 0
+
     cv2, mp, _np = pose_tools.import_runtime_deps()
     specs = action_sm.load_specs(args.spec_dir)
     counters = {str(spec.get("action_name")): OnlineCounter(str(spec.get("action_name")), spec) for spec in specs}
 
-    cap = cv2.VideoCapture(args.camera)
-    if args.camera_fourcc:
-        fourcc_text = args.camera_fourcc[:4].ljust(4)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_text))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
-    cap.set(cv2.CAP_PROP_FPS, args.camera_fps)
+    cap, selected_camera = open_camera(cv2, args)
     if not cap.isOpened():
-        raise SystemExit(f"Failed to open camera index {args.camera}")
+        print(f"Failed to open camera: {args.camera}", file=sys.stderr)
+        print("Run this to inspect available camera indexes and device paths:", file=sys.stderr)
+        print(f"  python {Path(__file__).as_posix()} --list-cameras", file=sys.stderr)
+        raise SystemExit(2)
 
     estimator, backend_name = pose_tools.create_pose_estimator(mp, args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -387,6 +523,7 @@ def main() -> int:
     hip_height_valid_frames = 0
 
     print("Realtime window started.")
+    print(f"Camera: {selected_camera}")
     print("Press q or ESC to quit. Press r to reset counts.")
     if args.record_log:
         print(f"Log: {log_path}")
@@ -473,6 +610,14 @@ def main() -> int:
                     },
                 )
 
+                for result in results:
+                    if result.get("counted"):
+                        quality_text = f" quality={result['quality']}" if result.get("quality") else ""
+                        print(
+                            f"[COUNT] {result['action']} #{result['count']} "
+                            f"at {timestamp_sec:.2f}s frame={frame_index}{quality_text}"
+                        )
+
                 cv2.imshow("Task10 Realtime Action Validation", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in {27, ord("q")}:
@@ -506,6 +651,19 @@ def main() -> int:
             print("Lower-body evidence was missing. Move the camera back/lower until the full body and feet are visible.")
     for action, counter in counters.items():
         print(f"{action}: count={counter.count}")
+        if action == "squat":
+            print(
+                "squat quality: "
+                f"standard={counter.quality_counts.get('standard', 0)}, "
+                f"shallow={counter.quality_counts.get('shallow', 0)}"
+            )
+        if counter.count_events:
+            events = ", ".join(
+                f"#{event['count']}@{event['timestamp_sec']:.2f}s"
+                + (f"[{event.get('quality')}]" if event.get("quality") else "")
+                for event in counter.count_events
+            )
+            print(f"{action} events: {events}")
     return 0
 
 

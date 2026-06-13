@@ -6,6 +6,21 @@ import {
 } from "@mediapipe/tasks-vision";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
+// ---------------------------------------------------------------------------
+// Backend action server types
+// ---------------------------------------------------------------------------
+
+type BackendActionResult = {
+  name: string;
+  count: number;
+  stage: string;
+  score: number | null;
+};
+
+type BackendWsStatus = "disconnected" | "connecting" | "connected" | "error";
+
+// ---------------------------------------------------------------------------
+
 type CameraStatus = "idle" | "loading" | "ready" | "error";
 type ModelStatus = "idle" | "loading" | "ready" | "error";
 type PoseStatus = "idle" | "detecting" | "detected" | "missing";
@@ -113,7 +128,24 @@ const SMOOTHING_WINDOW_SIZE = 5;
 const FULL_BODY_HISTORY_MS = 1200;
 const FULL_BODY_ACTIVE_DISTANCE_THRESHOLD = 0.04;
 const DEPTH_SERVER_URL = "http://127.0.0.1:8765/depth";
+const ACTION_SERVER_WS_URL = `ws://${window.location.hostname}:8766/ws`;
 const DEPTH_REQUEST_INTERVAL_MS = 250;
+
+// Camel-case key → uppercase landmark name sent to backend
+const BACKEND_LANDMARK_KEY_MAP: Record<string, string> = {
+  leftShoulder:  "LEFT_SHOULDER",
+  rightShoulder: "RIGHT_SHOULDER",
+  leftElbow:     "LEFT_ELBOW",
+  rightElbow:    "RIGHT_ELBOW",
+  leftWrist:     "LEFT_WRIST",
+  rightWrist:    "RIGHT_WRIST",
+  leftHip:       "LEFT_HIP",
+  rightHip:      "RIGHT_HIP",
+  leftKnee:      "LEFT_KNEE",
+  rightKnee:     "RIGHT_KNEE",
+  leftAnkle:     "LEFT_ANKLE",
+  rightAnkle:    "RIGHT_ANKLE",
+};
 const DEPTH_FRONT_BACK_THRESHOLD_MM = 150;
 const DEPTH_ACTION_MAX_SCORE_OFFSET_MM = 800;
 const DEPTH_MAX_REASONABLE_OFFSET_MM = 2000;
@@ -280,6 +312,11 @@ const rightWristDepthRelation = ref("无");
 const leftWristDepthSource = ref("无");
 const rightWristDepthSource = ref("无");
 
+// Backend action server state
+const backendWsStatus = ref<BackendWsStatus>("disconnected");
+const backendActions = ref<BackendActionResult[]>([]);
+const backendLatencyMs = ref<number | null>(null);
+
 let stream: MediaStream | null = null;
 let animationFrameId: number | null = null;
 let poseLandmarker: PoseLandmarker | null = null;
@@ -295,6 +332,9 @@ let pendingJumpingJackFrames = 0;
 let lastJumpingJackRuntimeAt = 0;
 let lastDepthRequestAt = 0;
 let isDepthRequesting = false;
+let backendWs: WebSocket | null = null;
+let backendWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let backendFrameIndex = 0;
 const landmarkHistory: LandmarkPoint[][] = [];
 const fullBodyMotionHistory: FullBodyMotionSample[] = [];
 
@@ -328,7 +368,7 @@ const currentFullBodyMet = computed(() => {
 const fullBodyCalories = computed(() => {
   const activeMinutes = fullBodyMotionFeatures.value.activeFullBodyMs / 60_000;
 
-  return ((currentFullBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200) * 1000;
+  return (currentFullBodyMet.value * 3.5 * weightKg.value * activeMinutes) / 200;
 });
 
 const jumpingJackFrequencyPerMin = computed(() => {
@@ -358,7 +398,7 @@ const currentJumpingJackMet = computed(() => {
 const jumpingJackCalories = computed(() => {
   const elapsedMinutes = jumpingJackElapsedMs.value / 60_000;
 
-  return ((currentJumpingJackMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200) * 1000;
+  return (currentJumpingJackMet.value * 3.5 * weightKg.value * elapsedMinutes) / 200;
 });
 
 const fullBodyTrackedCompleteness = computed(() => {
@@ -730,6 +770,93 @@ function stopRenderLoop() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Backend WebSocket
+// ---------------------------------------------------------------------------
+
+function connectBackendWs() {
+  if (backendWs && backendWs.readyState <= WebSocket.OPEN) {
+    return;
+  }
+  backendWsStatus.value = "connecting";
+  const ws = new WebSocket(ACTION_SERVER_WS_URL);
+
+  ws.onopen = () => {
+    backendWsStatus.value = "connected";
+    backendFrameIndex = 0;
+  };
+
+  ws.onmessage = (ev: MessageEvent) => {
+    try {
+      const data = JSON.parse(ev.data as string) as {
+        actions?: BackendActionResult[];
+        latency_ms?: number;
+        error?: string;
+      };
+      if (data.error) return;
+      if (data.actions) backendActions.value = data.actions;
+      if (data.latency_ms != null) backendLatencyMs.value = data.latency_ms;
+    } catch {
+      // ignore malformed frames
+    }
+  };
+
+  ws.onerror = () => {
+    backendWsStatus.value = "error";
+  };
+
+  ws.onclose = () => {
+    backendWs = null;
+    if (backendWsStatus.value !== "disconnected") {
+      // Auto-reconnect after 2 s
+      backendWsStatus.value = "disconnected";
+      backendWsReconnectTimer = setTimeout(connectBackendWs, 2000);
+    }
+  };
+
+  backendWs = ws;
+}
+
+function disconnectBackendWs() {
+  if (backendWsReconnectTimer !== null) {
+    clearTimeout(backendWsReconnectTimer);
+    backendWsReconnectTimer = null;
+  }
+  backendWsStatus.value = "disconnected";
+  backendWs?.close();
+  backendWs = null;
+  backendActions.value = [];
+  backendLatencyMs.value = null;
+}
+
+function sendLandmarksToBackend(landmarks: LandmarkPoint[], timestampMs: number) {
+  if (!backendWs || backendWs.readyState !== WebSocket.OPEN) return;
+
+  // Build named-key landmark dict for the backend
+  const named: Record<string, { x: number; y: number; z?: number; visibility?: number }> = {};
+  for (const [camel, backendName] of Object.entries(BACKEND_LANDMARK_KEY_MAP)) {
+    const idx = LANDMARK_INDEX[camel as keyof typeof LANDMARK_INDEX];
+    const lm = landmarks[idx];
+    if (lm) {
+      named[backendName] = {
+        x: lm.x,
+        y: lm.y,
+        z: lm.z ?? 0,
+        visibility: lm.visibility ?? 0,
+      };
+    }
+  }
+
+  const msg = JSON.stringify({
+    frame_index: backendFrameIndex++,
+    timestamp_ms: timestampMs,
+    landmarks: named,
+  });
+  backendWs.send(msg);
+}
+
+// ---------------------------------------------------------------------------
+
 function stopCamera() {
   stopRenderLoop();
 
@@ -754,6 +881,7 @@ function stopCamera() {
   resetJumpingJackAnalysis("等待完整关键点");
   resetJumpingJackCounter();
   resetFullBodyMotionFeatures();
+  disconnectBackendWs();
 }
 
 function disposePoseLandmarker() {
@@ -2424,6 +2552,7 @@ async function runPoseInference(now: number) {
     updateJumpingJackAnalysis(smoothedLandmarks);
     updateFullBodyMotionFeatures(smoothedLandmarks, now);
     void updateDepthDebug(smoothedLandmarks, now);
+    if (smoothedLandmarks) sendLandmarksToBackend(smoothedLandmarks, now);
   } catch (error) {
     poseStatus.value = "missing";
     rawLandmarkState.value =
@@ -2498,6 +2627,7 @@ onMounted(() => {
   void startCamera();
   void loadPoseLandmarker();
   void loadHandLandmarker();
+  connectBackendWs();
 });
 
 onBeforeUnmount(() => {
@@ -2556,6 +2686,38 @@ onBeforeUnmount(() => {
     </section>
 
     <aside class="side-panel" aria-label="实时指标">
+      <!-- Backend action recognition panel -->
+      <section class="backend-action-panel" aria-label="后端动作识别">
+        <div class="backend-action-header">
+          <div>
+            <p class="eyebrow">后端算法层</p>
+            <h2>动作识别</h2>
+          </div>
+          <span class="status-pill" :class="`status-${backendWsStatus === 'connected' ? 'ready' : backendWsStatus === 'connecting' ? 'loading' : 'error'}`">
+            {{ backendWsStatus }}
+          </span>
+        </div>
+
+        <div v-if="backendActions.length" class="backend-action-grid">
+          <section
+            v-for="action in backendActions"
+            :key="action.name"
+            class="backend-action-card"
+          >
+            <span>{{ action.name }}</span>
+            <strong class="backend-count">{{ action.count }}</strong>
+            <small>{{ action.stage }} · {{ action.score != null ? action.score.toFixed(2) : '--' }}</small>
+          </section>
+        </div>
+        <p v-else class="backend-action-empty">
+          {{ backendWsStatus === 'connected' ? '等待第一帧…' : '后端未连接' }}
+        </p>
+
+        <p v-if="backendLatencyMs != null" class="backend-latency">
+          后端延迟 {{ backendLatencyMs.toFixed(1) }} ms
+        </p>
+      </section>
+
       <section class="depth-focus-panel" aria-label="Depth 测试参数">
         <div class="depth-focus-header">
           <div>

@@ -351,8 +351,14 @@
       → 可选输出: `datasets/pose/realtime_logs/realtime_*.jsonl` 和 `realtime_overlay_*.mp4`
       → 当前策略: 先实时验证，再根据实时反馈微调 deep squat / jumping jack 的阈值、窗口、门控和计数逻辑
       → 注意: 开合跳侧面仍为 unsupported；实时验证优先使用正面视角
+      → 摄像头排查: `realtime_action_window.py --list-cameras` 可列出 `/dev/video*` 和可打开的 OpenCV index；`--camera` 支持 index 或 `/dev/videoX` 路径
+      → 摄像头兼容: `--camera` 默认改为 `auto`，自动从 `/dev/video*` 和 index 0~9 中选择可读摄像头；仍支持显式传入 `--camera 1` 或 `--camera /dev/video2`
+      → 识别事件: 实时窗口每次计数会在终端打印 `[COUNT] action #n at xx.xxs frame=...`，退出时汇总每个动作的事件时间点
       → 2026-06-10 实测记录: MediaPipe 实时启动成功，约 10 FPS，单帧延迟约 12~27ms；但下半身关键特征缺失，`mean_knee_angle`、`foot_spread_shoulder_ratio`、`hip_height_above_ankles_torso` 有效帧均为 0，说明当前摄像头构图/距离不足以验证深蹲和开合跳
       → 已增强实时脚本诊断: 退出时输出 pose / knee_angle / foot_spread / hip_height 有效帧统计，窗口中显示 `missing lower-body evidence` 提示
+      → 2026-06-10 后续实测记录: 更换新 camera 后 `--camera 0` 不可用；`--list-cameras` 显示 index 1 / index 2 可打开，设备路径包含 `/dev/video2`、`/dev/video3`
+      → 2026-06-10 正面实时验证 v0 已通过: 使用可用 camera 后，下半身证据恢复；最新有效日志中 `mean_knee_angle`、`foot_spread_shoulder_ratio`、`hip_height_above_ankles_torso` 均有大量有效帧；最长一次实时测试已有开合跳和深蹲计数输出
+      → 下一步: 不新增动作，先围绕深蹲和开合跳做实时日志量化汇总、误报/漏报复盘、实时阈值微调
 
 - [ ] 7.4 输出量化结果
       → FPS
@@ -368,11 +374,80 @@
       → 已新增逐帧状态机评估输出: `state_machine_report.csv` / `state_machine_report.md`
       → 当前离线状态机结果: 深蹲支持视角正样本 cycle count 全为 1；开合跳正面正样本 cycle count 全为 1
       → 当前风险样本: 部分混淆样本会产生 raw cycle，但被 summary gate 拒绝；后续需要用更多负样本继续压低 raw cycle 风险
+      → 已新增 realtime log 汇总脚本: `task10-后端算法层快速验证/summarize_realtime_logs.py`
+      → 汇总输出: `datasets/pose/reports/realtime_summary.csv` 和 `realtime_summary.md`
+      → 汇总指标: FPS、latency、pose 可见率、下半身特征有效率、各动作计数、gate 通过率和主要失败原因
+      → 已新增录制视频混合动作识别脚本: `task10-后端算法层快速验证/recognize_recorded_actions.py`
+      → 用途: 读取一段包含多个动作的视频，例如 10 个深蹲 + 10 个开合跳，输出两个动作的识别计数、逐帧序列和可选 overlay
+      → 识别事件: 录制视频识别会在终端、`mixed_action_summary.json`、`mixed_action_summary.md` 中输出每次识别事件时间点，例如 `#1@3.53s`
+      → 干跑验证: 已在已有单动作 pose 输出上验证，深蹲样本得到 `squat=1/jumping_jack=0`，开合跳样本得到 `jumping_jack=1/squat=0`
+      → 下一步测试: 用户录制一段正面完整入镜视频，包含 10 个深蹲、短暂停顿、10 个开合跳；用该脚本识别并比较实际次数 vs 识别次数
+      → 2026-06-10 混合视频实测: 输出目录 `datasets/pose/recorded_actions/人物1_混合_正面_10深蹲10开合跳/`
+      → 实测结果: 开合跳实际 11 次，识别 10 次，漏掉第 8 和第 9 次之间的一次；深蹲实际 10 次，识别 3 次
+      → 已新增诊断脚本: `task10-后端算法层快速验证/diagnose_recorded_actions.py`
+      → 诊断输出: `mixed_action_diagnostics.md`，列出候选深蹲最低点、stage、score、gate reason，以及开合跳/深蹲阶段区间
+      → 初步分析: 开合跳漏检主要是状态机 `open_min` 过高，模拟将 `jumping_jack.frame_state_machine.stage_thresholds.open_min` 从 0.70 降到 0.65 可得到 11/11；深蹲漏检主要是 front squat 的膝角阈值过严，且部分浅深蹲/回到 stand 的状态机计数不稳，单纯放宽阈值最多约 6~7/10，需要继续调 action spec 和计数逻辑
+      → 已落地开合跳修正: `jumping_jack.frame_state_machine.stage_thresholds.open_min = 0.65`，混合视频开合跳从 10/11 修正为 11/11，离线状态机回归仍为 44 pass / 4 skipped
+      → 已新增深蹲参数候选评估脚本: `task10-后端算法层快速验证/tune_squat_params.py`
+      → 已落地深蹲中等放宽参数: front `mean_knee_angle_min <= 140`，reject `> 150`，`down_min = 0.70`
+      → 当前回归结果: 混合视频深蹲从 3/10 提升到 7/10；开合跳 11/11；已有离线资产评估 44 pass / 4 skipped，未新增失败
+      → 深蹲后续方向: 不继续粗暴放宽阈值；需要补充浅深蹲/半蹲/弯腰负样本，或加入更细的周期模板 / DTW / 相对髋高与膝角组合逻辑
+      → 2026-06-11 深蹲计数策略调整: 将“深蹲总次数”和“标准/浅蹲质量分类”拆开；总次数用于统计完整 squat-like attempt，标准次数继续优先沿用严格状态机事件
+      → 已新增录制视频后处理: `recognize_recorded_actions.py` 对录制视频使用局部膝角最低点 + 膝角变化 + 髋部变化做全局周期补齐；实时窗口暂不做全局后处理，仍保持在线状态机
+      → 当前录制视频实测 1: `人物1_混合_正面_10深蹲10开合跳`，开合跳 11/11；深蹲总数 10/10，质量分类 `standard=7, shallow=3`
+      → 当前录制视频实测 2: `人物2_深蹲_正面10个_正样本1`，深蹲总数 10/10，质量分类 `standard=10, shallow=0`
+      → 弯腰混淆样本误报复盘: `人物1_深蹲_正面_混淆样本_弯腰但腿不弯` 曾被误识别为 `squat=1 shallow=1`；overlay 中黄色关键点存在明显偏移，局部特征出现异常 `hip_height_range≈10.78`
+      → 已新增异常点位拒绝门控: 录制视频后处理遇到局部 `hip_height_range > 2.0` 时拒绝补计数，避免将弯腰导致的关键点漂移误判为浅蹲
+      → 当前混淆样本回归: `人物1_深蹲_正面_混淆样本_弯腰但腿不弯` 修正为 `squat=0/jumping_jack=0`；两个正样本结果保持不变
+      → 当前结论: 录制视频 deep squat / jumping jack v0.1 链路基本成立；风险点从“动作阈值”转为“上游姿态关键点漂移时的质量门控”
+      → 下一步验证批次: 批量跑已有正样本、浅蹲/半蹲、弯腰但腿不弯、静息/轻微晃动、开合跳混淆样本，输出每个样本的 count、standard/shallow、误报/漏报状态
+      → 下一步实现方向: 新增 recorded action 批量评估脚本或扩展现有评估，形成 `recorded_action_eval.csv/md`，用于量化深蹲总数准确率、标准分类准确率、混淆样本误报率
+      → 已新增录制动作批量评估脚本: `task10-后端算法层快速验证/batch_recorded_action_eval.py`
+      → 批量评估输出: `datasets/pose/reports/recorded_action_eval.csv` 和 `recorded_action_eval.md`
+      → 2026-06-11 批量评估结果: 31 个已有 pose 样本中 25 pass、5 review、1 fail
+      → 当前 review: 4 个侧面开合跳正样本未识别，符合当前 `jumping_jack` 侧面 unsupported/未优化状态；1 个侧面深蹲正样本漏检
+      → 当前 fail: `人物1_深蹲_侧面_混淆样本1_腿弯曲程度不够且上肢弯曲幅度过大` 被识别为 `squat=1 shallow=1`，下一步优先复盘侧面浅蹲/弯腰混淆门控
+      → 下一步优先级: 先处理侧面深蹲混淆误报，再决定是否继续支持侧面开合跳；短期产品验证仍优先正面视角
 
 - [ ] 7.5 对比当前前端规则
       → 同样动作在当前 /#/demo 和后端算法层分别测试
       → 记录哪些动作明显变好，哪些动作没有收益
       → 若没有明显收益，不接入 demo，只保留算法记录
+
+- [ ] 7.6 双摄像头验证: front + side
+      → 下一步方向已确定: 引入双摄像头，一个正面 front，一个侧面 side
+      → 目标: 不再强迫单视角承担所有动作证据，而是按动作选择主视角，提高深蹲深度判断、弯腰混淆抑制和开合跳计数稳定性
+      → 视角分工:
+        - 深蹲: side 为主，front 为辅；side 看膝角、髋部下降、躯干前倾和弯腰代偿，front 看左右对称和站位稳定
+        - 开合跳: front 为主，side 为辅；front 看脚距打开、手臂打开和闭合周期，side 只辅助判断跳跃节奏/身体周期，不作为主计数来源
+      → 短期策略: 继续保持正面单摄像头作为 baseline；新增双摄像头只是验证增强链路，不立刻替换现有正面流程
+      → 输入形态:
+        - front camera: 例如 `--front-camera 0` 或 `/dev/videoX`
+        - side camera: 例如 `--side-camera 2` 或 `/dev/videoY`
+        - 允许先用两段录制视频模拟双摄像头，再进入实时双摄像头
+      → 第一阶段实现: 新增双视频离线验证脚本，读取 front/side 两个视频或两个 pose 输出目录，分别提取姿态和动作结果，再做融合汇总
+      → 第二阶段实现: 新增双摄像头实时窗口，左右并排显示 front/side 画面、骨架、各自动作证据和融合后的最终动作计数
+      → 融合规则 v0:
+        - 深蹲 total: side 检测到 squat-like cycle 为主；front 若同时检测到明显下蹲，则提高置信度
+        - 深蹲 standard: side 膝角/髋部下降达标 + front 未发现明显站位/左右异常
+        - 深蹲 shallow: side 检测到 cycle，但深度不足或躯干前倾过大
+        - 弯腰误报抑制: side 检测到 torso/hip 异常但膝角不足时，拒绝 squat total
+        - 开合跳 total: front closed-open-closed 为主；side 不主导开合跳计数
+      → 必须记录的量化指标:
+        - front 单独结果
+        - side 单独结果
+        - fusion 结果
+        - 每个动作事件时间点
+        - 每个视角的 pose / lower-body feature 有效率
+        - 双摄像头帧率、单帧延迟、两个摄像头时间差
+      → 主要风险:
+        - 两个摄像头帧率不同，事件时间不完全同步
+        - USB 摄像头 index 不稳定，需要支持 `/dev/videoX` 路径和 `--list-cameras`
+        - ToC 产品安装成本上升，因此双摄像头短期作为高级/实验模式，不作为默认体验
+      → 下一步具体任务:
+        - 先实现 `dual_recorded_action_eval.py` 或等价脚本，支持两个已有视频/pose 目录的离线融合
+        - 再实现 `dual_realtime_action_window.py`，支持 `--front-camera` 和 `--side-camera`
+        - 用户录制/采集同一组动作的正面和侧面素材，先验证深蹲，再决定是否做侧面开合跳辅助
 
 ---
 
@@ -407,6 +482,15 @@
       → 如果只是验证和演示，继续 Python 本地窗口最快
       → 如果要产品化体验，封装成 Python API / WebSocket
       → 如果后续需要部署，考虑把 action spec 和轻量模型独立版本化
+      → 当前新增方向: 支持双摄像头 front + side 作为算法层高级模式
+      → 产品策略: 默认仍保留单正面摄像头；双摄像头用于高质量演示、健身评估增强或高级设置
+      → 后端形态要求: 算法层需要能同时管理两个视频源、两个 pose stream、两个 action stream，以及一个 fusion stream
+      → 未来 API 输出建议:
+        - `frontResult`
+        - `sideResult`
+        - `fusionResult`
+        - `cameraHealth`
+        - `syncStatus`
 
 - [ ] 9.3 形成下一轮调优清单
       → 根据用户实测反馈，记录每个动作的误报、漏报和混淆来源
@@ -416,3 +500,199 @@
       → 输出可量化报告: 速度、准确率、误报率、稳定性、可视化效果
       → 输出动作参数资产: action spec、模板、正负样本、混淆样本
       → 明确后端算法层是否进入产品主链路
+
+---
+
+## Phase 10: 热量计算
+
+> 背景：项目本质是热量计算，不要求精确但需要准确。后续 ToC 场景可能扩展至健身房 / 瑜伽馆。
+> 关键结论：姿势识别与热量计算在公式层面独立，但在数据层面高度相关；两个模块应共享同一批关键点数据，而非割裂设计。
+> 2026-06-11 实测确认：后端接入前端后，开合跳和深蹲计数准确。
+
+- [ ] 10.1 梳理现有热量公式
+      → 当前公式（前端 PoseView.vue）: `kcal = MET × 3.5 × 体重kg × 分钟数 / 200 × 1000`
+      → 基础公式（Ainsworth MET 公式）正确，但接入方式有两个根本问题:
+        1. MET 值硬编码（低/中/高强度 → 2.2/4.0/6.0），与姿态数据无关，不随个人差异变化
+        2. 全身热量用"活跃时长"，开合跳热量用"挂钟时长"，两个口径不一致
+      → 单位换算存疑：最后 ×1000 导致输出为 cal 而非 kcal，需确认并修正
+
+- [ ] 10.2 建立动态 MET 计算方案
+      → 目标：同样是"深蹲"，胖瘦不同、速度不同、幅度不同，输出热量不同
+      → 推荐方案：MET 基础值（查 Compendium of Physical Activities）× 速度修正 × 幅度修正
+        - 深蹲 MET 基础值 = 5.0；开合跳 MET 基础值 = 8.0
+        - 速度修正：周期 < 2s → ×1.3；周期 > 4s → ×0.8
+        - 幅度修正（深蹲）：shallow → ×0.7；standard → ×1.0
+      → 公式: `kcal_per_rep = MET × speed_factor × depth_factor × 3.5 × weight_kg / (200 × 60) × rep_duration_sec`
+      → 总热量 = Σ 各次动作事件的热量
+      → 备选方案（更直接）：用 `hip_height_range × torso_length × 体重 × 重力系数` 估算单次做功，再乘效率系数；需标定
+
+- [ ] 10.3 后端输出补充动作事件元数据
+      → 当前 realtime_engine.py 计数时只输出 count；需补充每次计数事件:
+        - rep_duration_sec（本次周期时长）
+        - amplitude（幅度，深蹲用 hip_height_range，开合跳用 foot_spread_range）
+        - quality（standard / shallow，深蹲专用）
+      → 这些数据状态机已有，只差在计数事件时输出
+      → action_server.py 的 WebSocket 响应新增 `count_events` 字段
+
+- [ ] 10.4 建立 calorie_estimator.py
+      → 位置: `backend/calorie_engine/calorie_estimator.py`
+      → 输入: 动作名称、动作事件列表（含幅度/速度/质量）、体重 kg、身高 cm（可选）
+      → 输出: 本次会话总热量（kcal）、各动作分项热量、累计活跃时长
+      → 按动作类型维护 MET 参数表（JSON），方便后续扩展新动作
+      → 单位统一为 kcal，不再混用 cal
+
+- [ ] 10.5 前端热量展示统一
+      → 删除现有两套割裂的热量计算（fullBodyCalories / jumpingJackCalories）
+      → 改为从后端 WebSocket 接收 `calorie_summary` 字段，前端只做展示
+      → 保留体重输入（已有），新增可选身高输入（影响质心位移估算精度）
+      → 展示: 总消耗 kcal、各动作分项、当前 MET 实时值、活跃时长
+
+- [ ] 10.6 健身房 / 瑜伽馆场景扩展准备
+      → 新动作接入时（挥手、出拳、高抬腿、瑜伽体式等）需同步建立 MET 参数
+      → 瑜伽体式以静态保持为主，热量计算改用"保持时长 × MET × 体重"而非计次
+      → 多人场景：每个用户独立维护体重和热量累计（需 session 隔离，WebSocket 已天然支持）
+      → 长期训练数据：考虑输出 session JSON（时间戳、动作序列、每次事件、总热量），供后续分析
+
+---
+
+## Phase 11: 前端界面重构
+
+> 背景：当前前端（PoseView.vue 2800+ 行）界面以调试为主，不适合 ToC 使用。
+> 实测确认：后端动作识别准确，可以开始以产品视角重新设计前端。
+> 原则：后端负责识别和计算，前端只负责展示和交互；不在前端保留业务逻辑。
+
+- [ ] 11.1 梳理可扩展业务逻辑
+      → 核心用户流程（不变）: 开摄像头 → 选择动作 / 训练模式 → 实时计数 + 热量 → 结束查看报告
+      → 可扩展维度:
+        - 动作种类（已有深蹲/开合跳，后续扩展）
+        - 训练模式（自由模式 / 目标次数模式 / 计时模式）
+        - 用户信息（体重、身高，影响热量精度）
+        - 历史记录（每次 session 的动作和热量）
+        - 双摄像头模式（正面 + 侧面，高级模式）
+      → 不扩展: 社交、排行榜、课程内容（不是当前阶段）
+
+- [ ] 11.2 页面结构设计
+      → 当前单页结构不适合多动作 / 多模式场景，建议拆分:
+        - `/` 首页 / 训练选择
+        - `/session` 训练主界面（摄像头 + 实时数据）
+        - `/report` 训练结束报告
+      → Session 页面布局建议:
+        - 左侧（主区域）: 摄像头画面 + 骨架叠加
+        - 右侧（面板）: 当前动作计数、热量、MET、阶段提示
+        - 底部: 开始 / 暂停 / 结束控制
+      → 调试信息（depth、landmark 完整率等）收入 debug 模式，默认折叠或隐藏
+
+- [ ] 11.3 组件拆分
+      → 当前 PoseView.vue 2800+ 行，建议按职责拆分:
+        - `CameraCanvas.vue`: 摄像头画面 + 骨架绘制，接收 landmarks props
+        - `ActionPanel.vue`: 后端动作计数 / 热量展示，接收 backendActions props
+        - `SessionControls.vue`: 开始 / 暂停 / 结束 / 重置按钮
+        - `useBackendWs.ts`: WebSocket 连接管理 composable（当前散在 PoseView.vue 里）
+        - `usePoseDetection.ts`: MediaPipe 推理 composable
+      → 拆分后 PoseView.vue 只负责组合，控制在 200 行以内
+
+- [ ] 11.4 实现新版 Session 页面
+      → 先做静态 UI（不接后端），确认视觉效果
+      → 再接入 WebSocket（复用 useBackendWs.ts）
+      → 体重 / 身高输入移到 session 开始前的配置步骤
+      → 动作计数显示要大、清晰、实时（用户距离摄像头 1~3 米）
+      → 阶段提示（down / open / closed 等）以中文显示
+
+- [ ] 11.5 首页 / 训练选择
+      → 展示可用动作（深蹲、开合跳，灰显待解锁）
+      → 训练模式选择（自由 / 目标次数 / 计时）
+      → 用户信息输入入口
+
+- [ ] 11.6 训练报告页
+      → 总计: 完成次数、总热量、活跃时长
+      → 分项: 每个动作的次数、standard/shallow 分布、平均节奏
+      → 可选: 导出 JSON / 分享截图
+
+---
+
+## Task10 MVP 已交付（2026-06-12）
+
+### 已完成的核心链路
+
+**后端**
+- `backend/main.py`: FastAPI + uvicorn 入口，自动拉起 OpenNI depth server（硬件不在线则降级 2D）
+- `backend/action_server.py`: WebSocket 服务（端口 8766），每帧接收 landmarks 返回动作结果
+- `backend/action_engine/realtime_engine.py`: 实时特征计算 + rolling buffer 状态机
+- `backend/action_engine/action_specs/`: 5 个动作 spec（squat、jumping_jack、lunge、clap_under_knee、high_knee）
+
+**前端**
+- `/#/display`: 展示界面，左/中/右三栏，5 个动作 Tab，无操作按钮，切换 Tab 自动重置
+- `/#/pose`: 保留调试视图
+- `/#/demo`: 保留 demo 视图
+- WebSocket 地址动态取 `window.location.hostname`，支持局域网笔记本访问主机
+
+**硬件**
+- Orbbec Astra Pro 深度摄像头已接入主机（安装 liborbbec.so + udev 规则）
+- 局域网展示方案：主机跑后端+前端，笔记本浏览器接摄像头访问
+
+### 5 个动作识别方式
+
+| 动作 | 识别方式 | 主要特征 | 备注 |
+|---|---|---|---|
+| 深蹲 | 计次（cyclic） | 膝角 + 髋高 | 区分 standard/shallow |
+| 开合跳 | 计次（cyclic） | 脚距比 + 腕距比 + 手高比 | 正面视角 |
+| 弓步压腿 | 计时（hold） | 踝 z 差区分前腿 + 前腿膝角 | 左/右分计时 |
+| 胯下击掌 | 计次（左/右分） | 膝高/髋 + 膝角 + 腕距 | 左/右分计次 |
+| 高抬腿 | 计次（左/右分） | 髋角（主）+ 膝高/髋（辅） | 左/右分计次，三档质量评分 |
+
+---
+
+## Task12: 动作阈值调优与误报修复
+
+> 背景：MVP 接入实测后发现明显误报问题，例如走过摄像头前时高抬腿/深蹲计数误触发。
+> 根本原因：当前阈值全部来自少量个人自录样本（1~2人），样本多样性不足，对"走路""经过镜头"等日常动作缺乏负样本保护。
+> 原则：优先修误报（假正例），再修漏报（假负例）；调参必须量化，不凭感觉。
+
+### 已知参考阈值（来自文献/公开项目）
+
+**深蹲（来源: Cadoo AI）**
+- 膝角下蹲最低位: 110°（检测门限），90°（满分）
+- 膝角站立位: 160°（检测门限），170°（理想）
+- 髋角理想范围: 80~100°
+
+**开合跳**
+- 无公开数值，alwaysai 项目用关节间距而非角度
+- 推荐滞回双阈值（进入/退出分开）防止抖动
+
+**其他动作（高抬腿/弓步/胯下击掌）**
+- 无公开标准阈值，需自行从多人样本标定
+
+### Phase 12 任务
+
+- [ ] 12.1 建立误报/漏报量化基线
+      → 录制"走过摄像头""站立静息""慢走"等负样本视频
+      → 跑 `recognize_recorded_actions.py` 统计误报率
+      → 目标: 静息/慢走时各动作误报率 < 5%
+
+- [ ] 12.2 深蹲阈值修正
+      → 参考 Cadoo 阈值，将膝角门限从当前值收紧至 110°~140° 区间
+      → 补充"弯腰但不蹲"负样本，确认 hip_height_range 门控有效
+      → 回归: 现有正样本计数不退化
+
+- [ ] 12.3 高抬腿误报修复（优先级最高）
+      → 当前问题: 走路时髋角瞬间小于 150° 导致误计次
+      → 方案: 加入"对侧腿稳定性"条件（支撑腿膝角 > 155°）+ 最小持续帧要求（≥3帧）
+      → 可参考 min_raise_hold_frames 参数
+
+- [ ] 12.4 开合跳滞回调优
+      → 加入双阈值滞回（open_min 和 open_exit_max 分开，open_exit_max > open_min）
+      → 防止在 open 边界抖动导致重复计数
+
+- [ ] 12.5 弓步压腿 z 差噪声处理
+      → z 坐标有逐帧抖动，需加 EMA 平滑后再做左右判断
+      → 进入/退出滞回: 进入需要 z_diff 超阈值连续 3 帧，退出需要 3 帧低于阈值
+
+- [ ] 12.6 增加多人样本
+      → 目标: 每个动作正样本 ≥ 3 人，负样本（走路/静息/混淆）≥ 5 条
+      → 使用 `batch_recorded_action_eval.py` 批量回归，确保调参不引入退化
+
+- [ ] 12.7 实时日志量化
+      → 用 `summarize_realtime_logs.py` 对比调参前后:
+        - FPS、延迟、下半身特征有效率
+        - 各动作 gate 通过率和主要失败原因
+      → 每轮调参必须输出对比表，不做无量化的调参

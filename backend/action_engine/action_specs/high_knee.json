@@ -1,0 +1,110 @@
+{
+  "action_name": "high_knee",
+  "version": "0.1.0",
+  "status": "draft_from_task10_single_video",
+  "description": "高抬腿：左右腿交替抬起，以髋角为主要识别信号，膝高为辅助。计次，区分左右腿。",
+  "action_type": "cyclic",
+  "count_mode": "count",
+  "count_separate_sides": true,
+  "supported_views": ["front"],
+  "required_landmarks": [
+    "LEFT_HIP", "RIGHT_HIP",
+    "LEFT_KNEE", "RIGHT_KNEE",
+    "LEFT_ANKLE", "RIGHT_ANKLE",
+    "LEFT_SHOULDER", "RIGHT_SHOULDER"
+  ],
+
+  "detection_logic": {
+    "primary_feature": "hip_angle",
+    "description": "同侧髋角（肩-髋-膝夹角）显著减小说明大腿抬起。站立时约160-170°，抬腿时降至80-150°，标准高抬腿可达30°以下。",
+    "left_raise":  { "feature": "left_hip_angle",  "threshold": 150.0 },
+    "right_raise": { "feature": "right_hip_angle", "threshold": 150.0 },
+    "stand":       { "both_above": 155.0 },
+    "auxiliary": {
+      "feature": "knee_height_vs_hip",
+      "note": "膝高/髋 > -0.30 可作为辅助确认，但不作为必要条件（中等高度抬腿时膝高不过髋）"
+    }
+  },
+
+  "quality_scoring": {
+    "description": "基于同侧髋角评估抬腿高度。髋角越小，抬腿越高，质量分越高。支撑腿稳定性作为辅助。",
+    "height_score": {
+      "feature":      "hip_angle_at_peak",
+      "excellent_max": 80.0,
+      "good_max":     120.0,
+      "fair_max":     150.0,
+      "weight":        0.70
+    },
+    "stability_score": {
+      "feature":      "opposite_knee_angle_at_peak",
+      "excellent_min": 160.0,
+      "good_min":     145.0,
+      "weight":        0.30
+    },
+    "levels": {
+      "excellent": { "score": 1.00, "label": "优秀", "hip_angle_max":  80.0 },
+      "good":      { "score": 0.70, "label": "良好", "hip_angle_max": 120.0 },
+      "fair":      { "score": 0.40, "label": "一般", "hip_angle_max": 150.0 },
+      "invalid":   { "score": 0.00, "label": "未达标" }
+    }
+  },
+
+  "frame_state_machine": {
+    "smoothing_window_frames": 3,
+    "left_leg": {
+      "raise_threshold":  150.0,
+      "stand_threshold":  155.0,
+      "min_raise_frames":   2,
+      "min_return_frames":  3
+    },
+    "right_leg": {
+      "raise_threshold":  150.0,
+      "stand_threshold":  155.0,
+      "min_raise_frames":   2,
+      "min_return_frames":  3
+    },
+    "stages": ["stand", "left_raise", "right_raise"],
+    "count_on": "return_to_stand_after_raise"
+  },
+
+  "confusion_suppression": [
+    {
+      "name": "walking",
+      "rule": "正常行走时髋角也会减小，但幅度通常不超过150°且持续时间短。阈值150°已兼顾区分。"
+    },
+    {
+      "name": "squat",
+      "rule": "深蹲时双侧髋角同时减小，高抬腿只有单侧减小。检查对称性可区分。"
+    },
+    {
+      "name": "clap_under_knee",
+      "rule": "胯下击掌时髋角更小（< 30°）且持续帧数极短（2-5帧），高抬腿通常持续更长。"
+    }
+  ],
+
+  "sample_data": {
+    "source_video": "人物4_高抬腿_正面_正样本1.mp4",
+    "total_frames": 151,
+    "duration_sec": 5.0,
+    "fps": 30,
+    "observed_events": {
+      "method": "hip_angle < 150° 连续帧聚合",
+      "left_count":  5,
+      "right_count": 7,
+      "total":      12,
+      "avg_interval_sec": 0.40
+    },
+    "key_feature_ranges": {
+      "hip_angle_at_peak_excellent": [11.5, 30.0],
+      "hip_angle_at_peak_good":      [30.0, 120.0],
+      "hip_angle_at_peak_fair":     [120.0, 150.0],
+      "standing_hip_angle":         [155.0, 172.0],
+      "raise_duration_frames":      [2, 6]
+    },
+    "quality_distribution_observed": {
+      "excellent": 1,
+      "good":      2,
+      "fair":      9
+    }
+  }
+}

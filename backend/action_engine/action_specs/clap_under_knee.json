@@ -1,0 +1,117 @@
+{
+  "action_name": "clap_under_knee",
+  "version": "0.1.0",
+  "status": "draft_from_task10_single_video",
+  "description": "胯下击掌：单腿抬起、双手在膝盖下方击掌，左右腿交替。计次，区分左腿和右腿。约 1.5 秒一次，每次击掌约 0.3 秒。",
+  "action_type": "cyclic",
+  "count_mode": "count",
+  "count_separate_sides": true,
+  "supported_views": ["front"],
+  "required_landmarks": [
+    "LEFT_HIP", "RIGHT_HIP",
+    "LEFT_KNEE", "RIGHT_KNEE",
+    "LEFT_ANKLE", "RIGHT_ANKLE",
+    "LEFT_WRIST", "RIGHT_WRIST"
+  ],
+
+  "detection_logic": {
+    "description": "用膝盖相对髋关节的高度区分左右腿，用腕距比判断双手合拢（击掌）。不依赖 z 坐标。",
+    "left_leg_raise": {
+      "feature": "left_knee_height_vs_hip",
+      "threshold": 0.05,
+      "note": "左膝高度超过左髋关节，说明左腿抬起。正常站立时该值约 -0.6 ~ -0.5，抬腿后大于 0。"
+    },
+    "right_leg_raise": {
+      "feature": "right_knee_height_vs_hip",
+      "threshold": 0.05,
+      "note": "右膝高于右髋。"
+    },
+    "clap_condition": {
+      "feature": "wrist_spread_shoulder_ratio",
+      "threshold_low": 1.0,
+      "note": "腕距比 < 1.0 时认为双手接近（合拢/击掌）。正常站立约 2.5，击掌时降至 0.6 以下。"
+    },
+    "knee_angle_peak": {
+      "feature": "left/right_knee_angle",
+      "peak_max": 70.0,
+      "note": "击掌时支撑腿同侧膝盖大幅弯曲，角度低至 2-9°，用于确认完整击掌动作。"
+    }
+  },
+
+  "frame_state_machine": {
+    "smoothing_window_frames": 3,
+    "left_leg": {
+      "enter_stage": "left_raising",
+      "peak_stage": "left_clap",
+      "exit_stage": "left_landing",
+      "count_on": "left_clap",
+      "conditions": {
+        "knee_height_min": 0.05,
+        "knee_angle_max": 70.0,
+        "wrist_spread_max": 1.0
+      },
+      "min_peak_hold_frames": 2,
+      "min_return_frames": 3
+    },
+    "right_leg": {
+      "enter_stage": "right_raising",
+      "peak_stage": "right_clap",
+      "exit_stage": "right_landing",
+      "count_on": "right_clap",
+      "conditions": {
+        "knee_height_min": 0.05,
+        "knee_angle_max": 70.0,
+        "wrist_spread_max": 1.0
+      },
+      "min_peak_hold_frames": 2,
+      "min_return_frames": 3
+    },
+    "idle_stage": "stand",
+    "note": "左右腿独立计数，不互锁。可同时在各自的 raising 阶段。"
+  },
+
+  "quality_scoring": {
+    "description": "基于抬腿高度和膝关节弯曲角度评估击掌质量。",
+    "knee_height_score": {
+      "excellent_min": 0.20,
+      "good_min":      0.10,
+      "fair_min":      0.05
+    },
+    "knee_angle_score": {
+      "excellent_max": 30.0,
+      "good_max":      50.0,
+      "fair_max":      70.0
+    }
+  },
+
+  "confusion_suppression": [
+    {
+      "name": "high_knee_march",
+      "rule": "高抬腿行进时膝高于髋但腕距比维持较大（双手不合拢），胯下击掌时腕距比会降到 1.0 以下。"
+    },
+    {
+      "name": "squat",
+      "rule": "深蹲时两腿膝角均减小，膝盖不高于髋。胯下击掌只有一条腿抬起。"
+    }
+  ],
+
+  "sample_data": {
+    "source_video": "人物2_胯下击掌_正面_正样本.mp4",
+    "total_frames": 298,
+    "duration_sec": 9.9,
+    "fps": 30,
+    "observed_cycles": {
+      "left_clap_times_sec": [0.1, 1.63, 3.0, 4.43, 5.93, 7.43, 8.97],
+      "right_clap_times_sec": [0.9, 3.7, 5.13, 6.73, 8.23],
+      "avg_cycle_sec": 1.5,
+      "clap_duration_frames": "8-12"
+    },
+    "key_feature_ranges": {
+      "left_knee_height_vs_hip_at_peak": [0.14, 0.51],
+      "left_knee_angle_at_peak":         [2.3, 65.7],
+      "right_knee_height_vs_hip_at_peak": [0.06, 0.30],
+      "right_knee_angle_at_peak":         [3.3, 64.3],
+      "wrist_spread_at_clap":             [0.36, 1.16]
+    }
+  }
+}

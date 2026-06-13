@@ -1,0 +1,305 @@
+# Task11 热量计算精确化 — 实施清单
+
+> 背景：Task10 MVP 已跑通，后端动作识别准确，但热量计算存在三个根本性问题：
+>   1. 单位错误（现有公式结果为 cal，不是 kcal，比实际大 1000 倍）
+>   2. MET 值硬编码，与实际动作幅度/速度无关
+>   3. 时间口径不统一（全身用活跃时长，开合跳用挂钟时长）
+>
+> 目标：用每次计数事件的实际时长 + 幅度 + 质量驱动热量计算，后端输出，前端只展示。
+> 原则：不求精确（生物个体差异无法完全消除），但要准确（正比关系正确、量级合理、单位正确）。
+
+---
+
+## Phase 1: 修正现有公式和单位 ✅ 已完成（2026-06-12）
+
+- [x] 1.1 确认并修正单位错误
+      → 修正: PoseView.vue 的 fullBodyCalories 和 jumpingJackCalories 删除末尾 ×1000
+      → 修正后单位正确为 kcal
+
+- [x] 1.2 统一时间口径
+      → DisplayView.vue 删除 tickCalories 定时器（每秒固定加，与动作无关）
+      → 热量改为从后端事件驱动计算，时间口径由后端统一
+
+- [x] 1.3 删除前端两套割裂的热量计算
+      → PoseView.vue: 删除 ×1000，保留 MET 显示逻辑（调试用）
+      → DisplayView.vue: 删除 tickCalories、MET 硬编码表、caloriesPerAction ref
+      → 前端热量改为从后端 WebSocket 的 calorie_summary 字段读取
+
+---
+
+## Phase 2: 后端输出动作事件元数据 ✅ 已完成（2026-06-12）
+
+- [x] 2.1 realtime_engine.py 在计次时记录事件元数据
+      → 每次 count 增加时，记录以下字段：
+        - action: 动作名
+        - side: left / right / both（适用于高抬腿、胯下击掌）
+        - rep_duration_sec: 本次周期时长（从上一个 low_stage 到本次 low_stage）
+        - amplitude: 动作幅度
+          - 深蹲: hip_height_range（本次周期内髋部下降幅度）
+          - 开合跳: foot_spread_range（本次周期内脚距变化范围）
+          - 高抬腿: knee_height_peak（本次抬腿最高点）
+          - 胯下击掌: knee_height_peak + wrist_spread_min（击掌时最小腕距）
+        - quality: standard / shallow / unknown（深蹲专用，其他动作暂填 standard）
+        - timestamp_ms: 事件发生时间
+      → 事件列表维护在 self._count_events: list[dict] 中，随每帧响应一并输出
+
+- [x] 2.2 action_server.py WebSocket 响应新增 count_events 字段
+      → 每帧响应结构增加：
+        ```json
+        {
+          "actions": [...],
+          "count_events": [
+            {
+              "action": "squat",
+              "rep_duration_sec": 2.3,
+              "amplitude": 0.42,
+              "quality": "standard",
+              "timestamp_ms": 12345.6
+            }
+          ],
+          "features": {...},
+          "latency_ms": 3.2
+        }
+        ```
+      → count_events 只包含"本帧新增的事件"（增量），不是全量历史
+
+- [ ] 2.3 验证事件元数据准确性
+      → 用已有录制视频（人物2深蹲、人物3开合跳）离线回放，检查每次计数事件的元数据是否合理
+      → 重点检查：rep_duration_sec 是否符合实际节奏（深蹲约 2-4s，开合跳约 1-1.5s）
+
+---
+
+## Phase 3: 后端热量计算引擎 ✅ 已完成（2026-06-12）
+
+- [x] 3.1 建立动作 MET 参数表
+      → 文件: backend/calorie_engine/met_params.json
+      → 结构：
+        ```json
+        {
+          "squat": {
+            "met_base": 5.0,
+            "speed_factor": {"fast_threshold_sec": 2.0, "fast_bonus": 1.3, "slow_threshold_sec": 4.0, "slow_penalty": 0.8},
+            "depth_factor": {"standard": 1.0, "shallow": 0.7},
+            "source": "Compendium of Physical Activities 2011, code 02054"
+          },
+          "jumping_jack": {
+            "met_base": 8.0,
+            "speed_factor": {"fast_threshold_sec": 1.0, "fast_bonus": 1.2, "slow_threshold_sec": 2.0, "slow_penalty": 0.9},
+            "depth_factor": {"standard": 1.0},
+            "source": "Compendium of Physical Activities 2011, code 02046"
+          },
+          "lunge": {
+            "met_base": 4.0,
+            "speed_factor": null,
+            "depth_factor": {"excellent": 1.2, "good": 1.0, "fair": 0.8, "invalid": 0.0},
+            "source": "Estimated, similar to walking lunges (code 02049)"
+          },
+          "high_knee": {
+            "met_base": 7.0,
+            "speed_factor": {"fast_threshold_sec": 0.5, "fast_bonus": 1.2},
+            "depth_factor": {"excellent": 1.2, "good": 1.0, "fair": 0.7},
+            "source": "Estimated, similar to running in place (code 02048)"
+          },
+          "clap_under_knee": {
+            "met_base": 7.5,
+            "speed_factor": {"fast_threshold_sec": 0.8, "fast_bonus": 1.1},
+            "depth_factor": {"standard": 1.0},
+            "source": "Estimated, similar to jumping drills"
+          }
+        }
+        ```
+
+- [x] 3.2 建立 calorie_estimator.py
+      → 文件: backend/calorie_engine/calorie_estimator.py
+      → 核心函数:
+        ```python
+        def estimate_rep_kcal(
+            action: str,
+            rep_duration_sec: float,
+            amplitude: float | None,
+            quality: str,
+            weight_kg: float,
+            met_params: dict,
+        ) -> float:
+            """
+            单次动作热量估算。
+            公式: kcal = MET_eff × 3.5 × weight_kg × (rep_duration_sec / 60) / 200
+            MET_eff = met_base × speed_factor × depth_factor
+            """
+        ```
+      → 输出: kcal（正确单位，float）
+      → 边界处理: rep_duration_sec 超出合理范围（< 0.3s 或 > 10s）时使用默认值，避免异常值污染
+
+- [x] 3.3 session 累计热量维护
+      → RealtimeActionEngine 新增 self._session_kcal: dict[str, float]（按动作分项）
+      → 每次计数事件触发时，调用 calorie_estimator 计算本次增量并累加
+      → 每帧响应中新增 calorie_summary 字段：
+        ```json
+        {
+          "calorie_summary": {
+            "total_kcal": 12.4,
+            "by_action": {
+              "squat": 5.2,
+              "jumping_jack": 7.2
+            }
+          }
+        }
+        ```
+
+- [x] 3.4 用户信息传入机制
+      → WebSocket 连接建立后，前端发送一次配置消息：
+        ```json
+        {"type": "config", "weight_kg": 70, "height_cm": 175}
+        ```
+      → action_server.py 接收并存入本次连接的 engine 实例
+      → weight_kg 默认值 70，height_cm 暂时不用（预留接口）
+
+- [x] 3.5 弓步压腿热量特殊处理
+      → lunge 是计时模式（hold_duration），不是计次
+      → 热量公式: `kcal = met_base × depth_factor × 3.5 × weight_kg × hold_sec / 60 / 200`
+      → hold_sec 使用 hold_sec_left + hold_sec_right 之和
+      → 每秒增量更新（不等待整次计数），随 calorie_summary 实时推送
+
+---
+
+## Phase 4: 前端热量展示 ✅ 已完成（2026-06-12，4.4 待补充）
+
+- [x] 4.1 前端接收 calorie_summary 字段
+      → useActionWs.ts 新增 `caloricSummary` ref
+      → watch ws.actions 同时 watch calorie_summary
+      → DisplayView.vue 右侧热量区域改为显示 `calorieSummary.total_kcal`
+
+- [x] 4.2 前端传入用户体重
+      → DisplayView.vue 左侧面板（或首次打开时弹出）增加体重输入
+      → WebSocket 连接成功后立即发送 config 消息
+      → 体重变更时重新发送 config（热量从当前时刻起使用新体重）
+
+- [x] 4.3 删除前端旧热量计算代码
+      → PoseView.vue: 保留 MET 显示逻辑（调试用），删除热量 computed
+      → DisplayView.vue: 删除 tickCalories 定时器和 caloriesPerAction ref
+      → SessionView.vue: 热量数据改为从 ws.calorieSummary 读取
+
+- [ ] 4.4 热量显示格式（待补充）
+      → 小于 1 kcal 显示 "< 1"，避免显示 0.003 这类无意义精度
+      → 保留一位小数：12.4 kcal
+      → 分项展示（可折叠）：深蹲 5.2 / 开合跳 7.2
+
+- [x] 4.5 瞬时热量消耗显示（新增）
+      → 在 DisplayView.vue 右侧增加一个"瞬时功率"卡片
+      → 显示最近 0.5 秒内的热量消耗速率（kcal/min），用于直观感受当前运动强度
+      → 实现方式：在前端维护一个滑动窗口（0.5s），记录每次 count_events 的 kcal 增量，
+        除以窗口时长得到 kcal/min，每帧更新
+      → 同一卡片内显示最近一次计数事件的元数据（动作名、幅度、质量、时长）
+      → 体重输入框移至右侧面板最上方，作为可输入变量，实时影响热量计算
+
+- [x] 4.6 用户体重输入位置调整（新增）
+      → 将体重输入框从左侧底部移到右侧面板最顶部
+      → 标注"体重（kg）"，默认 70，min=30, max=200
+      → 变更后立即发送 config 消息更新后端
+
+---
+
+## Phase 5: 验证和校准
+
+- [ ] 5.1 单次热量合理性检验
+      → 体重 70kg 做 1 个标准深蹲（约 3 秒）→ 期望约 0.06 kcal
+      → 体重 70kg 做 1 个开合跳（约 1.2 秒）→ 期望约 0.04 kcal
+      → 体重 70kg 连续做 10 个深蹲（约 30 秒）→ 期望约 0.6 kcal
+      → 如果结果量级差一个数量级，检查公式单位换算
+
+- [ ] 5.2 会话热量参考值对比
+      → 参考值: 70kg 成年人做 10 分钟中等强度有氧运动约消耗 60-80 kcal
+      → 10 分钟高强度（开合跳不间断）约消耗 80-100 kcal
+      → 用实际录制视频跑完整 session，对比计算结果与参考值的偏差
+
+- [ ] 5.3 记录标定系数
+      → 如果系统性偏高或偏低（如实测结果比参考值低 30%），记录一个全局标定系数
+      → 不改公式本身，在 met_params.json 的全局字段里加 `global_calibration_factor`
+      → 说明标定依据和测试条件（体重、动作、时长、参考来源）
+
+---
+
+## Phase 6: 热量计算与动作识别解耦（motion_energy 连续积分）✅ 已完成（2026-06-13）
+
+> 背景：Phase 1-4 的热量计算依赖"计次事件"触发，导致：
+>   - 在深蹲 tab 里做开合跳 → 无热量
+>   - 随意活动 → 无热量
+>   - 热量和"当前选中的动作 tab"强耦合
+>
+> 目标：热量反映"人在动多少"，与识别出哪个动作无关。
+> 方案：用每帧的 motion_energy 特征持续积分，独立于计次事件。
+
+- [x] 6.1 后端增加逐帧热量积分
+      → realtime_engine.py 新增 self._motion_kcal: float = 0.0
+      → 每帧 push_frame 时，用两个信号加权计算运动强度：
+        ```python
+        # 双信号加权（重心做功优先，肢体动能辅助）
+        delta_hip = abs(cur_hip_height - prev_hip_height)  # Δhip_height_above_ankles_torso
+        motion_e  = features.get("motion_energy") or 0.0
+
+        intensity = 3.0 * delta_hip + 1.0 * motion_e
+
+        # intensity → 等效 MET 分档
+        if intensity < 0.005:  met = 1.5   # 静止站立
+        elif intensity < 0.02: met = 2.5   # 微动（挥手）
+        elif intensity < 0.05: met = 5.0   # 中等（深蹲）
+        elif intensity < 0.10: met = 7.5   # 较激烈（跳跃、开合跳）
+        else:                  met = 10.0  # 极高强度
+
+        kcal_per_frame = met * 3.5 * weight_kg / 200 / fps_estimate
+        ```
+      → 仅在有有效 pose（core_visible_ratio >= 0.7）时积分，避免无人时累加
+      → calorie_summary 新增字段 `motion_kcal`，与 `event_kcal` 分开展示
+      → 设计依据：hip_height 变化反映对抗重力做功（俯卧撑/深蹲优于挥手），
+        motion_energy 补充肢体动能（高抬腿手臂无大位移时仍有贡献）
+
+- [x] 6.2 调整 calorie_summary 结构
+      → 后端输出：
+        ```json
+        {
+          "calorie_summary": {
+            "motion_kcal": 3.2,
+            "event_kcal": 1.1,
+            "total_kcal": 4.3,
+            "by_action": {"squat": 1.1}
+          }
+        }
+        ```
+      → motion_kcal: 基于 motion_energy 积分的连续热量（与动作识别无关）
+      → event_kcal: 基于计次事件估算的热量（原有逻辑，保留作对比）
+      → total_kcal: 两者取其大（避免重复计算），或仅用 motion_kcal 作主值
+      → 前端 DisplayView.vue 热量显示改为 motion_kcal（或 total_kcal）
+
+- [x] 6.3 fps 估算
+      → motion_energy 积分需要知道当前帧率
+      → 后端 RealtimeActionEngine 用相邻两帧的 timestamp_ms 差动态估算 fps
+      → 用滑动均值（最近 30 帧）平滑，避免单帧异常值影响积分
+
+- [x] 6.4 前端展示调整
+      → DisplayView.vue 热量显示分两部分：
+        - 总热量（小字体）：motion_kcal，单位 kcal，保留 2 位小数
+        - 瞬时消耗（大字体 data-hero）：0.5s 滑动窗口计算 cal/s，每 200ms 刷新
+      → 瞬时消耗公式：`(newest_kcal - oldest_kcal) / dt_min * 1000 / 60` = cal/s
+      → 移除旧的 lastCountEvent 计次事件展示（改为纯 motion 驱动）
+
+- [x] 6.5 修复深蹲/开合跳计次事件缺失
+      → realtime_engine.py 第 876-883 行，squat/jumping_jack 计次时增加 _make_count_event() 调用
+      → 修复后瞬时消耗卡片可以展示单次元数据（虽然当前 UI 已改为速率展示）
+
+- [x] 6.6 后端 action_server.py config 消息处理修正
+      → 改用 engine.set_user_config() 方法而非直接赋值 engine.weight_kg / height_cm
+      → 修复 AttributeError: 'RealtimeActionEngine' object has no attribute 'height_cm'
+
+- [ ] 6.7 校准（待实测）
+      → 用已有录制视频测试：70kg 做 5 分钟开合跳 → motion_kcal 期望约 40-50 kcal
+      → 如偏差超过 50%，调整分档 MET 阈值或加全局标定系数
+      → 记录标定结论到 met_params.json 的 `motion_energy_met_table` 字段
+
+---
+
+## 附: 不在本 task 范围内
+
+- 多人同时训练的热量隔离（task10 WebSocket 已天然支持，但前端 UI 未做）
+- 瑜伽/静态体式的热量计算（等动作识别支持后再加 MET 参数）
+- 历史数据存储（每次 session JSON 导出，需要数据库或文件系统方案）
+- 精确到克的能量消耗（需要心率数据，不在当前技术栈范围内）

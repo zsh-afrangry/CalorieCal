@@ -21,3 +21,6 @@ __pycache__/
 /task10-后端算法层快速验证/datasets/pose/
 /task10-后端算法层快速验证/models/*.task
 /数据集/*
+/Orbbec_OpenNI_v2.3.0.86-beta6_linux_release
+
+/datasets/*

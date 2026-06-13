@@ -1,6 +1,6 @@
 {
   "action_name": "squat",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "status": "draft_from_task10_asset_audit",
   "source_report": "task10-后端算法层快速验证/datasets/pose/reports/asset_audit.csv",
   "description": "Initial summary-level squat spec derived from self-recorded Task10 samples. This is not the final frame-level state machine.",
@@ -44,8 +44,8 @@
         {
           "feature": "mean_knee_angle_min",
           "op": "<=",
-          "value": 120.0,
-          "reason": "Front squat positives reached about 75-117 deg; front bend-only confusion was about 125 deg."
+          "value": 140.0,
+          "reason": "Front mixed-video squats include shallow reps around 128-140 deg; keep hip motion and knee range gates to suppress bend-over confusions."
         },
         {
           "feature": "mean_knee_angle_range",
@@ -70,8 +70,8 @@
         {
           "feature": "mean_knee_angle_min",
           "op": ">",
-          "value": 125.0,
-          "reason": "Reject bend-over cases without enough knee flexion."
+          "value": 150.0,
+          "reason": "Reject cases without meaningful knee flexion while allowing shallow-but-valid front squats."
         }
       ]
     },
@@ -124,7 +124,7 @@
     "smoothing_window_frames": 5,
     "stage_thresholds": {
       "stand_max": 0.20,
-      "down_min": 0.75
+      "down_min": 0.70
     },
     "count_pattern": ["stand", "down", "stand"],
     "min_down_hold_frames": 2,

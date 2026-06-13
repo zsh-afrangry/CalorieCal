@@ -1,6 +1,6 @@
 {
   "action_name": "jumping_jack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "status": "draft_from_task10_asset_audit",
   "source_report": "task10-后端算法层快速验证/datasets/pose/reports/asset_audit.csv",
   "description": "Initial summary-level jumping-jack spec derived from self-recorded Task10 samples. Front view is supported first; side view is kept as experimental.",
@@ -87,7 +87,7 @@
     "smoothing_window_frames": 5,
     "stage_thresholds": {
       "closed_max": 0.25,
-      "open_min": 0.70
+      "open_min": 0.65
     },
     "count_pattern": ["closed", "open", "closed"],
     "min_open_hold_frames": 1,

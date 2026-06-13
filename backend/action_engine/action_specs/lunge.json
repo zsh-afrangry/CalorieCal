@@ -1,0 +1,104 @@
+{
+  "action_name": "lunge",
+  "version": "0.1.0",
+  "status": "draft_from_task10_single_video",
+  "description": "弓步压腿：记录左腿前压和右腿前压的有效保持时长，以计时而非计次为核心逻辑。区分左右腿依靠 MediaPipe z 坐标差（不依赖 RGB-D 硬件）。",
+  "action_type": "static_hold",
+  "count_mode": "duration",
+  "supported_views": ["front"],
+  "required_landmarks": [
+    "LEFT_KNEE", "RIGHT_KNEE",
+    "LEFT_ANKLE", "RIGHT_ANKLE",
+    "LEFT_HIP", "RIGHT_HIP"
+  ],
+
+  "side_detection": {
+    "method": "ankle_z_diff",
+    "description": "用左右踝关节 z 坐标差判断哪条腿在前。MediaPipe z < 0 表示更靠近摄像头（即在前）。",
+    "left_leg_forward_threshold": -0.30,
+    "right_leg_forward_threshold":  0.30,
+    "transition_band": [-0.30, 0.30],
+    "note": "左踝z - 右踝z < -0.30 → 左腿在前；> +0.30 → 右腿在前；中间段视为过渡/无效"
+  },
+
+  "quality_scoring": {
+    "description": "基于前腿膝角评估压腿深度。前腿膝角越小，压腿越深，质量分越高。",
+    "feature": "front_knee_angle",
+    "levels": {
+      "excellent": {"max_angle": 120, "score": 1.0, "label": "优秀"},
+      "good":      {"min_angle": 120, "max_angle": 135, "score": 0.75, "label": "良好"},
+      "fair":      {"min_angle": 135, "max_angle": 150, "score": 0.50, "label": "一般"},
+      "invalid":   {"min_angle": 150, "label": "未达标"}
+    },
+    "note": "前腿角 < 150° 才计入有效时长"
+  },
+
+  "hold_state_machine": {
+    "description": "基于 z 差和前腿膝角判断当前状态，累计有效帧数转换为时长。",
+    "states": ["idle", "left_hold", "right_hold", "transition"],
+    "enter_hold_frames": 3,
+    "exit_hold_frames": 5,
+    "valid_hold_conditions": {
+      "z_diff_left_max": -0.30,
+      "z_diff_right_min":  0.30,
+      "front_knee_angle_max": 150.0
+    },
+    "smoothing_window_frames": 5
+  },
+
+  "display": {
+    "left_label":  "左腿前压",
+    "right_label": "右腿前压",
+    "unit": "秒",
+    "show_quality_realtime": true
+  },
+
+  "summary_rules": {
+    "front": {
+      "enabled": true,
+      "quality_gates": {
+        "detected_ratio_min": 0.90,
+        "mean_visibility_min": 0.80
+      },
+      "accept_any": [
+        {
+          "feature": "left_knee_angle_min",
+          "op": "<=",
+          "value": 150.0,
+          "reason": "视频中有至少一段左腿前压有效深度"
+        },
+        {
+          "feature": "right_knee_angle_min",
+          "op": "<=",
+          "value": 150.0,
+          "reason": "视频中有至少一段右腿前压有效深度"
+        }
+      ]
+    }
+  },
+
+  "confusion_suppression": [
+    {
+      "name": "squat",
+      "rule": "弓步压腿时两腿膝角不对称（差值 > 30°），深蹲时两腿对称。用膝角差可区分。"
+    },
+    {
+      "name": "standing",
+      "rule": "站立时两腿膝角均接近 180°，压腿时前腿膝角 < 150°。"
+    }
+  ],
+
+  "sample_data": {
+    "source_video": "人物2_弓步压腿_正面_正样本.mp4",
+    "left_leg_forward_sec": [0, 6],
+    "right_leg_forward_sec": [7, 21],
+    "transition_sec": [5, 7],
+    "deep_lunge_sec": [11, 13],
+    "observed": {
+      "left_hold_right_knee_angle_range": [110, 136],
+      "right_hold_left_knee_angle_range": [97, 125],
+      "ankle_z_diff_left_forward_range": [-1.2, -0.5],
+      "ankle_z_diff_right_forward_range": [0.5, 1.1]
+    }
+  }
+}

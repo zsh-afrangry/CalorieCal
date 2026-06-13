@@ -54,9 +54,13 @@ class OpenNI:
 
         self._dll_dir_cookie = None
         if hasattr(os, "add_dll_directory"):
+            # Windows only — no-op on Linux
             self._dll_dir_cookie = os.add_dll_directory(str(dll_dir))
 
-        self.dll = ctypes.WinDLL(str(dll_path))
+        if os.name == "nt":
+            self.dll = ctypes.WinDLL(str(dll_path))
+        else:
+            self.dll = ctypes.CDLL(str(dll_path))
         self._configure_functions()
 
     def _configure_functions(self) -> None:
@@ -158,6 +162,9 @@ def try_enable_registration(openni: OpenNI, device: OniDeviceHandle) -> None:
 
 
 def find_openni_dll(path: Path) -> Path:
+    if os.name != "nt":
+        return _find_openni_so(path)
+
     if path.is_file() and path.name.lower() == "openni2.dll":
         return path.resolve()
 
@@ -183,6 +190,48 @@ def find_openni_dll(path: Path) -> Path:
     raise FileNotFoundError(
         "OpenNI2.dll not found. Pass the OpenNI root directory, "
         "the Redist directory, or the exact OpenNI2.dll path.",
+    )
+
+
+def _find_openni_so(path: Path) -> Path:
+    """Locate libOpenNI2.so on Linux/macOS.
+
+    Priority:
+    1. Explicit file path passed by the caller
+    2. System-installed library (most portable, avoids arch mismatches)
+    3. Project-bundled redist directory (linux/x64 subdirectory only)
+    """
+    import ctypes.util
+
+    # 1. Explicit file path
+    if path.is_file() and "openni2" in path.name.lower():
+        return path.resolve()
+
+    # 2. System-installed library
+    for name in ("libOpenNI2.so.0", "libOpenNI2.so"):
+        for prefix in (
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/usr/lib",
+            "/usr/local/lib",
+        ):
+            candidate = Path(prefix) / name
+            if candidate.exists():
+                return candidate.resolve()
+    found = ctypes.util.find_library("OpenNI2")
+    if found and Path(found).exists():
+        return Path(found).resolve()
+
+    # 3. Project-bundled: only accept linux/x64 to avoid arm/x86 mismatches
+    if path.is_dir():
+        for so in path.rglob("libOpenNI2.so"):
+            parts = str(so).lower().replace("\\", "/")
+            if "linux" in parts and ("x64" in parts or "x86_64" in parts):
+                return so.resolve()
+
+    raise FileNotFoundError(
+        "libOpenNI2.so not found. Install with: sudo apt install libopenni2-0 "
+        "or pass the directory containing libOpenNI2.so as --openni-redist.",
     )
 
 

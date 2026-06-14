@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, shallowRef } from "vue";
+import { useRoute } from "vue-router";
 import "../session-ui.css";
 import { useMediaPipe } from "../composables/useMediaPipe";
 import { useActionWs }  from "../composables/useActionWs";
@@ -164,7 +165,7 @@ async function startDebugRecording() {
   beginFrontendDebugDiagnostics();
 
   try {
-    const result = await ws.startDebugRecording(true);
+    const result = await ws.startDebugRecording(true, sessionId.value ?? undefined);
     const frontendDiagnostics = buildFrontendDebugDiagnostics(performance.now());
     const backendDiagnostics = buildBackendDebugDiagnostics(result);
     const combined = {
@@ -203,6 +204,20 @@ async function startDebugRecording() {
 
 const mp = useMediaPipe();
 const ws = useActionWs();
+const route = useRoute();
+const sessionId = computed(() => {
+  const raw = route.query.session;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+});
+const isRemoteDisplay = computed(() => sessionId.value !== null);
+const remoteCameraLinks = computed(() => {
+  const sid = encodeURIComponent(sessionId.value ?? "default");
+  const base = typeof window !== "undefined" ? window.location.origin : "";
+  return {
+    front: `${base}/#/camera?session=${sid}&view=front`,
+    side: `${base}/#/camera?session=${sid}&view=side`,
+  };
+});
 
 // ---- Helpers ---------------------------------------------------------------
 
@@ -470,12 +485,17 @@ watch(ws.calorieSummary, (summary) => {
 
 // Send weight config whenever it changes (debounced via watch)
 watch(weightKg, (w) => {
-  ws.sendConfig(w);
+  ws.sendConfig(w, undefined, sessionId.value ?? undefined);
 }, { immediate: false });
 
 // Send config when WS connects
 watch(ws.status, (s) => {
-  if (s === "connected") ws.sendConfig(weightKg.value);
+  if (s === "connected") {
+    ws.sendConfig(weightKg.value, undefined, sessionId.value ?? undefined);
+    if (isRemoteDisplay.value && sessionId.value) {
+      ws.subscribeSession(sessionId.value);
+    }
+  }
 });
 
 // ---- Tab switching — reset right-side state --------------------------------
@@ -487,6 +507,7 @@ function switchTab(key: string) {
   actionStates.value[key] = key === "lunge"
     ? { stage: "idle", score: null, holdSecLeft: 0, holdSecRight: 0 }
     : { count: 0, stage: "unknown", score: null, standardCount: 0, shallowCount: 0, lastAdvice: "" };
+  if (isRemoteDisplay.value) return;
   ws.disconnect();
   setTimeout(() => ws.connect(), 200);
 }
@@ -851,6 +872,8 @@ onMounted(async () => {
     elapsedMs.value = Date.now() - sessionStart.value;
   }, 500);
 
+  if (isRemoteDisplay.value) return;
+
   // Enumerate camera devices for dual camera mode
   await enumerateDevices();
 
@@ -941,16 +964,16 @@ watch(sideDeviceId, (val) => {
       <!-- Status dots at bottom of left panel -->
       <div class="left-status">
         <div class="left-status-row">
-          <span class="cc-dot" :class="mp.cameraStatus.value === 'ready' ? '' : 'cc-dot--yellow'" />
-          <span>摄像头</span>
+          <span class="cc-dot" :class="isRemoteDisplay || mp.cameraStatus.value === 'ready' ? '' : 'cc-dot--yellow'" />
+          <span>{{ isRemoteDisplay ? "远程采集" : "摄像头" }}</span>
         </div>
         <div class="left-status-row">
           <span class="cc-dot" :class="ws.status.value === 'connected' ? '' : 'cc-dot--yellow'" />
           <span>后端</span>
         </div>
         <div class="left-status-row">
-          <span class="cc-dot" :class="mp.modelStatus.value === 'ready' ? '' : 'cc-dot--yellow'" />
-          <span>姿态模型</span>
+          <span class="cc-dot" :class="isRemoteDisplay || mp.modelStatus.value === 'ready' ? '' : 'cc-dot--yellow'" />
+          <span>{{ isRemoteDisplay ? "会话订阅" : "姿态模型" }}</span>
         </div>
       </div>
     </nav>
@@ -958,15 +981,32 @@ watch(sideDeviceId, (val) => {
     <!-- CENTER: camera -->
     <main class="display-center">
       <div class="display-camera-wrap">
+        <template v-if="isRemoteDisplay">
+          <div class="remote-display-panel">
+            <p class="remote-display-label">远程双摄显示</p>
+            <h1 class="remote-display-session cc-mono">{{ sessionId }}</h1>
+            <p class="remote-display-note">当前窗口只展示结果，不打开摄像头</p>
+            <div class="remote-display-links">
+              <a class="cc-mono" :href="remoteCameraLinks.front" target="_blank" rel="noreferrer">
+                {{ remoteCameraLinks.front }}
+              </a>
+              <a class="cc-mono" :href="remoteCameraLinks.side" target="_blank" rel="noreferrer">
+                {{ remoteCameraLinks.side }}
+              </a>
+            </div>
+          </div>
+        </template>
+
         <!-- Front camera video and canvas -->
-        <video ref="videoRef" class="display-video" playsinline muted aria-hidden="true" />
-        <canvas ref="canvasRef" class="display-canvas" aria-hidden="true" />
+        <video v-else ref="videoRef" class="display-video" playsinline muted aria-hidden="true" />
+        <canvas v-if="!isRemoteDisplay" ref="canvasRef" class="display-canvas" aria-hidden="true" />
 
         <!-- Side camera video and canvas (hidden by default) -->
         <video
           ref="videoRefSide"
           class="display-video display-video--side"
           :style="{ display: showSideVideo ? 'block' : 'none' }"
+          v-if="!isRemoteDisplay"
           playsinline
           muted
           aria-hidden="true"
@@ -975,6 +1015,7 @@ watch(sideDeviceId, (val) => {
           ref="canvasRefSide"
           class="display-canvas display-canvas--side"
           :style="{ display: showSideVideo ? 'block' : 'none' }"
+          v-if="!isRemoteDisplay"
           aria-hidden="true"
         />
 
@@ -991,18 +1032,18 @@ watch(sideDeviceId, (val) => {
         </div>
 
         <!-- No pose hint -->
-        <div v-if="mp.poseStatus.value === 'missing'" class="cam-pose-hint">
+        <div v-if="!isRemoteDisplay && mp.poseStatus.value === 'missing'" class="cam-pose-hint">
           请站入画面，确保全身可见
         </div>
       </div>
 
       <!-- Debug bar -->
       <div class="display-debug">
-        <span>{{ mp.inferenceFps.value }} FPS</span>
+        <span>{{ isRemoteDisplay ? `session ${sessionId}` : `${mp.inferenceFps.value} FPS` }}</span>
         <span>·</span>
-        <span>姿态 {{ mp.completeness.value }}%</span>
+        <span>{{ isRemoteDisplay ? "异步双摄" : `姿态 ${mp.completeness.value}%` }}</span>
         <span>·</span>
-        <span>手 {{ mp.handCount.value }}</span>
+        <span>{{ isRemoteDisplay ? "display 只展示" : `手 ${mp.handCount.value}` }}</span>
         <span>·</span>
         <span>{{ ws.latencyMs.value != null ? `后端 ${ws.latencyMs.value.toFixed(1)}ms` : '等待后端' }}</span>
       </div>
@@ -1030,7 +1071,7 @@ watch(sideDeviceId, (val) => {
       <div class="data-divider" />
 
       <!-- Dual camera settings -->
-      <div class="data-section data-section--dual-camera">
+      <div v-if="!isRemoteDisplay" class="data-section data-section--dual-camera">
         <p class="data-section__label">双摄像头设置</p>
 
         <!-- Side camera enabled toggle -->
@@ -1483,6 +1524,54 @@ watch(sideDeviceId, (val) => {
   border-radius: 20px;
   white-space: nowrap;
   pointer-events: none;
+}
+
+.remote-display-panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 32px;
+  text-align: center;
+}
+
+.remote-display-label {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #22c55e;
+}
+
+.remote-display-session {
+  margin: 0;
+  font-size: 48px;
+  line-height: 1;
+}
+
+.remote-display-note {
+  margin: -8px 0 0;
+  color: #d1d5db;
+  font-size: 13px;
+}
+
+.remote-display-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.remote-display-links a {
+  color: #9ca3af;
+  text-decoration: none;
+}
+
+.remote-display-links a:hover {
+  color: #f3f4f6;
 }
 
 .display-debug {

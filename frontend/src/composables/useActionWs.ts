@@ -57,6 +57,8 @@ export type ViewInfo = {
 };
 
 export type BackendFrame = {
+  type?: string;
+  session_id?: string;
   frame_index?: number;
   actions: ActionResult[];
   latency_ms?: number;
@@ -64,6 +66,7 @@ export type BackendFrame = {
   count_events?: CountEvent[];
   calorie_summary?: CalorieSummary;
   view_info?: ViewInfo;
+  async_view_status?: Record<string, unknown>;
 };
 
 export type LandmarkPoint = {
@@ -131,11 +134,21 @@ export function useActionWs() {
     viewInfo.value = null;
   }
 
-  function sendConfig(weightKg: number, heightCm?: number) {
+  function sendConfig(weightKg: number, heightCm?: number, sessionId?: string) {
     _pendingConfig = { weight_kg: weightKg, height_cm: heightCm };
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "config", weight_kg: weightKg, height_cm: heightCm }));
+      ws.send(JSON.stringify({
+        type: "config",
+        weight_kg: weightKg,
+        height_cm: heightCm,
+        session_id: sessionId,
+      }));
     }
+  }
+
+  function subscribeSession(sessionId: string) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "subscribe_session", session_id: sessionId }));
   }
 
   function sendLandmarks(
@@ -159,7 +172,25 @@ export function useActionWs() {
     }));
   }
 
-  function startDebugRecording(reset = false): Promise<any> {
+  function sendViewFrame(
+    sessionId: string,
+    view: "front" | "side",
+    named: Record<string, { x: number; y: number; z: number; visibility: number }>,
+    timestampMs: number,
+    perfTimestampMs: number,
+  ) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({
+      type: "view_frame",
+      session_id: sessionId,
+      view,
+      timestamp_ms: timestampMs,
+      perf_timestamp_ms: perfTimestampMs,
+      landmarks: named,
+    }));
+  }
+
+  function startDebugRecording(reset = false, sessionId?: string): Promise<any> {
     return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         reject(new Error("WebSocket not connected"));
@@ -175,12 +206,12 @@ export function useActionWs() {
       };
 
       ws.addEventListener("message", handler);
-      ws.send(JSON.stringify({ type: "debug_start", reset }));
+      ws.send(JSON.stringify({ type: "debug_start", reset, session_id: sessionId }));
 
       // Auto-stop after 10 seconds
       setTimeout(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "debug_stop" }));
+          ws.send(JSON.stringify({ type: "debug_stop", session_id: sessionId }));
         }
       }, 10000);
     });
@@ -190,6 +221,7 @@ export function useActionWs() {
 
   return {
     status, actions, latencyMs, calorieSummary, countEvents, viewInfo,
-    connect, disconnect, sendConfig, sendLandmarks, sendDualFrame, startDebugRecording
+    connect, disconnect, sendConfig, subscribeSession,
+    sendLandmarks, sendDualFrame, sendViewFrame, startDebugRecording
   };
 }

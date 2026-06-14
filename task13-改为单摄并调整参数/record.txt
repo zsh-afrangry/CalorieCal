@@ -110,3 +110,42 @@ Task13：单摄参数调整与双摄架构拆分
 2. 后端 action_server.py 新增 view_frame 协议和 session registry。
 3. RealtimeActionEngine 保留 push_frame / push_dual_frame，同时新增或包装异步双路输入入口。
 4. 用单摄页面分别打开 front / side，记录 10 秒 debug，确认两路 FPS 是否都回到单摄水平。
+
+任务二本次已实施：
+1. backend/action_server.py
+   - 新增 session registry，按 session_id 管理独立 RealtimeActionEngine。
+   - 新增 subscribe_session 消息，display 页面可订阅指定 session 的识别结果。
+   - 新增 view_frame 消息，支持 front / side 两路独立 WebSocket 发送 landmarks。
+   - side view_frame 只更新缓存；front view_frame 驱动 engine.push_dual_frame，并使用 150ms 内的最新 side 帧做异步融合。
+   - debug_start / debug_stop 支持 session_id，可对指定 session 记录后端日志。
+
+2. frontend/src/views/CameraCaptureView.vue
+   - 新增轻量采集页 /#/camera?session=<id>&view=front|side。
+   - 单页只打开一个摄像头、一个 PoseLandmarker、一路 view_frame 发送。
+   - 页面显示前端 FPS、单帧推理耗时、发送帧数、摄像头状态、模型状态和后端连接状态。
+
+3. frontend/src/router.ts
+   - 新增 /camera 路由，fullscreen 模式。
+
+4. frontend/src/composables/useActionWs.ts
+   - 新增 sendViewFrame(sessionId, view, landmarks, timestampMs, perfTimestampMs)。
+   - 新增 subscribeSession(sessionId)。
+   - sendConfig / startDebugRecording 支持 sessionId。
+
+5. frontend/src/views/DisplayView.vue
+   - /#/display?session=<id> 进入远程显示模式。
+   - 远程显示模式下不启动本地摄像头、不加载本地 PoseLandmarker，只订阅指定 session 的后端结果。
+   - 无 session 参数时保留原有单页 display 行为。
+
+任务二验证：
+1. npm run build 通过。
+2. python3 -m py_compile backend/action_server.py backend/action_engine/realtime_engine.py 通过。
+3. git diff --check 通过。
+4. 当前 Codex shell 缺少 fastapi / conda，未能用 TestClient 做 WebSocket 协议 smoke test；需要在 CalorieCalPose 环境中联调验证。
+
+任务二联调方式：
+1. 启动后端。
+2. 打开 /#/camera?session=test1&view=front，选择正面摄像头。
+3. 打开 /#/camera?session=test1&view=side，选择侧面摄像头。
+4. 打开 /#/display?session=test1 查看融合后的动作结果。
+5. 对比两个 camera 页面的前端 FPS，确认是否回到接近单摄水平。

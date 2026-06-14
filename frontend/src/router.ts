@@ -6,6 +6,7 @@ import HomeView from "./views/HomeView.vue";
 import SessionView from "./views/SessionView.vue";
 import ReportView from "./views/ReportView.vue";
 import DisplayView from "./views/DisplayView.vue";
+import CameraCaptureView from "./views/CameraCaptureView.vue";
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -15,6 +16,7 @@ const router = createRouter({
 
     // Fitness UI routes (fullscreen, no sidebar)
     { path: "/display", name: "display", component: DisplayView, meta: { fullscreen: true } },
+    { path: "/camera",  name: "camera",  component: CameraCaptureView, meta: { fullscreen: true } },
     { path: "/home",    name: "home",    component: HomeView,    meta: { fullscreen: true } },
     { path: "/session", name: "session", component: SessionView, meta: { fullscreen: true } },
     { path: "/report",  name: "report",  component: ReportView,  meta: { fullscreen: true } },
